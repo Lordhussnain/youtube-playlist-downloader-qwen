@@ -19,7 +19,7 @@ target/
 .env.local
 *.env.*
 
-# Editors
+# IDE files
 .vscode/
 .idea/
 ```
