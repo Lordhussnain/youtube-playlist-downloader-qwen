@@ -1,1 +1,102 @@
-# youtube-playlist-downloader-qwen
+# YT Playlist Downloader
+
+Batch YouTube playlist downloader and converter, built with Bun + TypeScript.
+Feed it a list of playlist or video links and it handles fetching, format
+selection, subtitle/thumbnail/description extraction, and conversion — with
+a terminal UI to watch it all happen.
+
+## Features
+
+- **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
+- **Concurrent worker pools** for downloading, metadata fetching, and format conversion
+- **Automatic retries** with exponential backoff on failed downloads
+- **Disk space precheck** before starting a batch
+- **Graceful shutdown** — safely stops in-flight downloads on exit
+- **CLI argument support** for one-off overrides without editing the config file
+- **Terminal UI (TUI)** with live progress across all workers
+- Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
+- **YouTube signature challenge solving** via an embedded Deno JS runtime
+- Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
+
+## Tech Stack
+
+- [Bun](https://bun.sh) + TypeScript — runtime and application logic
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
+- [aria2c](https://aria2.github.io) — multi-connection downloading
+- [ffmpeg](https://ffmpeg.org) — format conversion
+- [Deno](https://deno.land) — sandboxed JS runtime for YouTube signature decoding
+
+## Requirements
+
+- Bun ≥ 1.0
+- `yt-dlp`, `aria2c`, and `ffmpeg` available on `PATH`
+- Deno (used for signature-challenge solving)
+- Tested on Windows 11
+
+Dependencies are checked automatically on startup; the app exits with a clear
+error if anything required is missing.
+
+## Installation
+
+```bash
+git clone https://github.com/<your-username>/<repo-name>.git
+cd <repo-name>
+bun install
+```
+
+## Configuration
+
+Define your batch in `config.json`:
+
+```json
+{
+  "output_directory": "D:/Downloads/YT",
+  "target_format": "mp4",
+  "download": {
+    "subtitles": true,
+    "thumbnail": true,
+    "description": false
+  },
+  "links": [
+    "https://www.youtube.com/playlist?list=...",
+    "https://www.youtube.com/watch?v=..."
+  ]
+}
+```
+
+Per-link overrides (format, output folder, subtitle/thumbnail flags) are
+supported alongside these global defaults.
+
+## Usage
+
+```bash
+bun run start
+```
+
+With CLI overrides:
+
+```bash
+bun run start --config ./my-config.json --format mkv
+```
+
+The TUI shows live status for every video across all active workers.
+
+## How It Works
+
+1. **Startup** — checks dependencies, then loads and parses `config.json`
+2. **Download workers** — pull videos into the configured output directory, retrying on failure with exponential backoff
+3. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
+4. **Converter workers** — convert completed downloads into the target format
+
+## Roadmap
+
+- [ ] Central SQLite job database — persist per-video status (`pending` →
+      `downloading` → `downloaded` → `converted`) so downloads survive
+      crashes and restarts, and workers claim jobs atomically instead of
+      relying on in-memory state
+- [ ] Resume interrupted downloads from exactly where they left off
+- [ ] Fully independent, parallel metadata and conversion pipelines
+
+## License
+
+MIT — replace with your preferred license.
