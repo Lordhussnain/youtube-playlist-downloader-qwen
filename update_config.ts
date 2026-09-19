@@ -1,56 +1,58 @@
-// update_config.ts (V3)
+// update_config.ts (V5 - Proxy-Free, Zod-Validated)
 // Interactive configuration manager for the YouTube Archival Engine
 // Run with: bun run update_config.ts
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { z } from "zod";
 
 const CONFIG_PATH = "./config.json";
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-// ---- Types & Defaults (MUST match batch_playlist_downloader.ts) ------------
-interface Config {
-  playlists: string[];
-  channels: string[];
-  channelPlaylists: string[];
-  maxConcurrentDownloads: number;
-  maxConcurrentConverts: number;
-  maxDownloadWorkers: number;
-  minDownloadWorkers: number;
-  maxBandwidthKBps: number;
-  autoscaleEnabled: boolean;
-  useProxies: boolean;
-  webshareApiKey: string;
-  maxProxyCount: number;
-  proxyFile: string;
-  denoPath: string;
-  validateCookiesOnStart: boolean;
-  outputRoot: string;
-  archiveFile: string;
-  cookiesFile: string;
-  deleteSourceAfterConvert: boolean;
-  videoQuality: "highest" | "1080p" | "720p" | "480p" | "audio";
-  downloadSubtitles: boolean;
-  embedMetadata: boolean;
-  writeInfoJson: boolean;
-  writeDescription: boolean;
-  writeThumbnail: boolean;
-  archiveLiveStreams: boolean;
-  verifyIntegrity: boolean;
-  skipShorts: boolean;
-  downloadShorts: boolean;
-  maxRetryAttempts: number;
-  maxFailures: number;
-  maxFailuresPerVideo: number;
-  minFreeSpaceGB: number;
-  secondaryStoragePath: string;
-  daemonMode: boolean;
-  webPort: number;
-  rssEnabled: boolean;
-  rssPollIntervalMinutes: number;
-  rescanIntervalHours: number;
-}
+// ==========================================
+// 1. ZOD SCHEMA & TYPES (Single Source of Truth)
+// ==========================================
+const ConfigSchema = z.object({
+  playlists: z.array(z.string()),
+  channels: z.array(z.string()),
+  channelPlaylists: z.array(z.string()),
+  maxConcurrentDownloads: z.number().min(1).max(20),
+  maxConcurrentConverts: z.number().min(1).max(10),
+  maxDownloadWorkers: z.number().min(1).max(20),
+  minDownloadWorkers: z.number().min(1).max(20),
+  maxBandwidthKBps: z.number().min(0),
+  autoscaleEnabled: z.boolean(),
+  denoPath: z.string(),
+  validateCookiesOnStart: z.boolean(),
+  outputRoot: z.string(),
+  archiveFile: z.string(),
+  cookiesFile: z.string(),
+  deleteSourceAfterConvert: z.boolean(),
+  videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+  downloadSubtitles: z.boolean(),
+  embedMetadata: z.boolean(),
+  writeInfoJson: z.boolean(),
+  writeDescription: z.boolean(),
+  writeThumbnail: z.boolean(),
+  archiveLiveStreams: z.boolean(),
+  verifyIntegrity: z.boolean(),
+  skipShorts: z.boolean(),
+  downloadShorts: z.boolean(),
+  maxRetryAttempts: z.number().min(1),
+  maxFailures: z.number().min(1),
+  maxFailuresPerVideo: z.number().min(1),
+  minFreeSpaceGB: z.number().min(1),
+  secondaryStoragePath: z.string(),
+  daemonMode: z.boolean(),
+  webPort: z.number().min(1).max(65535),
+  rssEnabled: z.boolean(),
+  rssPollIntervalMinutes: z.number().min(1),
+  rescanIntervalHours: z.number().min(0),
+});
+
+// Infer the TypeScript type directly from Zod (No manual interface needed!)
+type Config = z.infer<typeof ConfigSchema>;
 
 const DEFAULT_CONFIG: Config = {
   playlists: [],
@@ -62,11 +64,7 @@ const DEFAULT_CONFIG: Config = {
   minDownloadWorkers: 1,
   maxBandwidthKBps: 0,
   autoscaleEnabled: true,
-  useProxies: true,
-  webshareApiKey: "YOUR_NEW_API_KEY_HERE",
-  maxProxyCount: 0,
-  proxyFile: "proxies.txt",
-  denoPath: "C:\\Users\\shahh\\.deno\\bin",
+  denoPath: "deno",
   validateCookiesOnStart: true,
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
@@ -94,18 +92,29 @@ const DEFAULT_CONFIG: Config = {
   rescanIntervalHours: 24,
 };
 
-// ---- Load / Save -----------------------------------------------------------
+// ==========================================
+// 2. LOAD / SAVE WITH ZOD VALIDATION
+// ==========================================
 async function loadConfig(): Promise<Config> {
   if (!existsSync(CONFIG_PATH)) return { ...DEFAULT_CONFIG };
   try {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(await readFile(CONFIG_PATH, "utf-8")) };
-  } catch {
+    const raw = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
+    // Merge with defaults to fill any missing new keys, then validate
+    const merged = { ...DEFAULT_CONFIG, ...raw };
+    return ConfigSchema.parse(merged); 
+  } catch (err: any) {
+    if (err.name === 'ZodError') {
+      console.error("❌ config.json is invalid or corrupted:", err.errors);
+      console.log("Falling back to default configuration.");
+    }
     return { ...DEFAULT_CONFIG };
   }
 }
 
 async function saveConfig(config: Config) {
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
+  // Final safety check before writing to disk
+  const validated = ConfigSchema.parse(config);
+  await writeFile(CONFIG_PATH, JSON.stringify(validated, null, 2));
 }
 
 // ---- Prompt Helpers --------------------------------------------------------
@@ -248,16 +257,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   if (config.maxBandwidthKBps > 0) {
     console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap`);
   }
-  
-  // Proxies
-  console.log("\n— Proxies (Webshare API) —");
-  config.useProxies = await askYesNo("Use Webshare API-driven proxies?", config.useProxies);
-  if (config.useProxies) {
-    console.log("   ℹ️  Get an API key at https://www.webshare.io (Proxy > API).");
-    const apiKeyAns = await ask(`   Webshare API key [current: ${config.webshareApiKey}]: `);
-    if (apiKeyAns.trim()) config.webshareApiKey = apiKeyAns.trim();
-  }
-  
+
   // Storage Management
   console.log("\n— Storage Management —");
   config.minFreeSpaceGB = await askNumber("Min free space (GB) before pausing", config.minFreeSpaceGB, 1);
@@ -266,7 +266,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   
   // Web UI & Daemon
   console.log("\n— Web UI & Headless Daemon —");
-  config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from the Web UI)?", config.daemonMode);
+  config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from Web UI)?", config.daemonMode);
   config.webPort = await askNumber("Web UI port", config.webPort, 1, 65535);
   if (config.daemonMode) {
     config.rssEnabled = await askYesNo("Watch RSS feeds (subscribe to new uploads, cheap, ~15 min latency)?", config.rssEnabled);
@@ -317,12 +317,12 @@ async function mainMenu() {
   while (true) {
     console.clear();
     console.log("=======================================");
-    console.log("  🎬 Archiver V3 Config Manager ");
+    console.log("  🎬 Archiver V5 Config Manager      ");
     console.log("=======================================\n");
     console.log("  1. Manage Standard Playlists");
     console.log("  2. Manage Channels (all uploads)");
     console.log("  3. Manage Channel Playlists");
-    console.log("  4. Change Download Settings (Quality, Concurrency, Autoscale, Bandwidth, Proxies, Storage, Web UI/daemon)");
+    console.log("  4. Change Download Settings (Quality, Concurrency, Autoscale, Storage, Web UI)");
     console.log("  5. Change Feature Toggles (Subs, Metadata, Shorts, Integrity)");
     console.log("  6. View Current Configuration");
     console.log("  7. Save and Exit");
@@ -338,8 +338,12 @@ async function mainMenu() {
       case "5": config = await changeFeatureToggles(config); break;
       case "6": await viewConfig(config); break;
       case "7":
-        await saveConfig(config);
-        console.log("\n✅ Configuration saved to " + CONFIG_PATH);
+        try {
+          await saveConfig(config);
+          console.log("\n✅ Configuration saved to " + CONFIG_PATH);
+        } catch (e: any) {
+          console.error("\n❌ Failed to save config:", e.message);
+        }
         rl.close();
         return;
       case "8":
