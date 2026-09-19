@@ -13,40 +13,17 @@ __pycache__/
 *.pyo
 *.pyd
 *.py.class
-.Python
-env/
+*.py.obj
+*.py.out
+*.py.dll
+*.py.so
+*.py.a
+
+# Virtual environments
 venv/
 .venv/
+env/
 .ENV
-.python-version
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.pytest_cache/
-.mypy_cache/
-.hypothesis/
-
-# Compiled and binary files
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
-*.class
-*.jar
-*.war
-*.ear
-*.swp
-*.swo
 
 # Logs
 *.log
@@ -55,22 +32,28 @@ coverage.xml
 .env
 .env.local
 .env.*
+!.env.example
 
-# Editors
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
+*.tmp
 
-# OS generated files
+# OS files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-desktop.ini
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# MyPy cache
+.mypy_cache/
+# Pytest cache
+.pytest_cache/
 
 # Compressed files
 *.zip
@@ -95,14 +78,4 @@ desktop.ini
 *.tar.bz2
 *.tar.xz
 *.tar.zst
-
-# Coverage reports
-coverage/
-htmlcov/
-.coverage*
-
-# Temporary files
-*.tmp
-*.temp
-*~
 ```

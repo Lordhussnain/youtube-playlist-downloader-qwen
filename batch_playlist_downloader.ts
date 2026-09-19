@@ -66,6 +66,7 @@ function initDatabase() {
   // Keep auxiliary tables for Playlist Indexing and History
   db.run(`CREATE TABLE IF NOT EXISTS playlist_state (folder TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS run_history (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, ended_at TEXT, duration_seconds REAL, downloaded INTEGER, skipped INTEGER, failed INTEGER, total_queued INTEGER)`);
+  db.run(`CREATE TABLE IF NOT EXISTS job_queue (id TEXT PRIMARY KEY, url TEXT, folder TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'pending', fail_count INTEGER DEFAULT 0, last_error TEXT)`);
 }
 
 // 🛡️ CRASH RECOVERY: Reset interrupted jobs to paused/pending so they resume
@@ -610,9 +611,503 @@ function resetTerminal() {
   process.stdout.write(`\x1b[1;${rows}r\x1b[${rows};1H`);
 }
 
-// (Web UI HTML omitted for brevity, use the exact HTML string from your V2 file)
-const WEB_UI_HTML = `<!DOCTYPE html><html><body><h1>Archival Engine V3</h1><p>Check /api/status</p></body></html>`;
+// ==========================================
+// 7. WEB UI DASHBOARD
+// ==========================================
+const WEB_UI_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🚀 YouTube Archive Engine</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: #334155;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --accent: #3b82f6;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --paused: #8b5cf6;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    header {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 30px; padding: 20px; background: var(--bg-secondary);
+      border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    h1 { font-size: 1.8rem; background: linear-gradient(135deg, var(--accent), var(--paused)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 20px; margin-bottom: 30px;
+    }
+    .stat-card {
+      background: var(--bg-secondary); padding: 20px; border-radius: 12px;
+      text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+      transition: transform 0.2s;
+    }
+    .stat-card:hover { transform: translateY(-2px); }
+    .stat-value { font-size: 2.5rem; font-weight: bold; margin-bottom: 5px; }
+    .stat-label { color: var(--text-secondary); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; }
+    .stat-card.download .stat-value { color: var(--accent); }
+    .stat-card.success .stat-value { color: var(--success); }
+    .stat-card.failed .stat-value { color: var(--danger); }
+    .stat-card.total .stat-value { color: var(--text-primary); }
+    .speed-display {
+      grid-column: 1 / -1; background: linear-gradient(135deg, var(--bg-secondary), var(--bg-card));
+      padding: 25px; border-radius: 12px; text-align: center;
+    }
+    .speed-value { font-size: 3rem; font-weight: bold; color: var(--success); }
+    .speed-label { color: var(--text-secondary); margin-top: 5px; }
+    .controls { display: flex; gap: 15px; margin-bottom: 30px; }
+    .btn {
+      padding: 12px 24px; border: none; border-radius: 8px; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; font-size: 0.95rem;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+    .btn-pause { background: var(--warning); color: #000; }
+    .btn-resume { background: var(--success); color: #fff; }
+    .btn-retry { background: var(--accent); color: #fff; padding: 6px 12px; font-size: 0.85rem; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .paused-banner {
+      background: linear-gradient(135deg, var(--paused), #7c3aed);
+      padding: 15px 20px; border-radius: 8px; margin-bottom: 20px;
+      display: none; align-items: center; gap: 10px;
+    }
+    .paused-banner.active { display: flex; }
+    .section {
+      background: var(--bg-secondary); border-radius: 12px; padding: 20px;
+      margin-bottom: 30px; box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+    }
+    .section-title { font-size: 1.3rem; margin-bottom: 15px; color: var(--text-primary); display: flex; align-items: center; gap: 10px; }
+    .workers-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
+    .worker-card {
+      background: var(--bg-card); padding: 15px; border-radius: 8px;
+      border-left: 4px solid var(--text-secondary);
+    }
+    .worker-card.active { border-left-color: var(--success); }
+    .worker-card.busy { border-left-color: var(--accent); }
+    .worker-id { font-weight: bold; margin-bottom: 8px; color: var(--text-secondary); }
+    .worker-status { font-size: 0.9rem; word-break: break-word; }
+    .jobs-table { width: 100%; border-collapse: collapse; }
+    .jobs-table th, .jobs-table td { padding: 12px; text-align: left; border-bottom: 1px solid var(--bg-card); }
+    .jobs-table th { background: var(--bg-card); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; font-size: 0.85rem; }
+    .jobs-table tr:hover { background: var(--bg-card); }
+    .status-badge {
+      padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600;
+      text-transform: uppercase;
+    }
+    .status-pending { background: #475569; color: #cbd5e1; }
+    .status-downloading { background: var(--accent); color: #fff; }
+    .status-paused { background: var(--paused); color: #fff; }
+    .status-downloaded { background: var(--success); color: #fff; }
+    .status-failed { background: var(--danger); color: #fff; }
+    .status-in_progress { background: var(--warning); color: #000; }
+    .status-not_needed { background: #64748b; color: #cbd5e1; }
+    .progress-bar { width: 100%; height: 8px; background: var(--bg-primary); border-radius: 4px; overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--success)); transition: width 0.3s; }
+    .error-text { color: var(--danger); font-size: 0.85rem; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+    .tab { padding: 10px 20px; background: var(--bg-card); border: none; color: var(--text-secondary); cursor: pointer; border-radius: 8px 8px 0 0; font-weight: 600; }
+    .tab.active { background: var(--accent); color: #fff; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .live-indicator { width: 10px; height: 10px; background: var(--success); border-radius: 50%; display: inline-block; animation: pulse 2s infinite; margin-right: 8px; }
+    .proxy-status { font-size: 0.9rem; color: var(--text-secondary); }
+    .filter-controls { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
+    .filter-select { padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--bg-primary); color: var(--text-primary); border-radius: 6px; }
+    .search-input { flex: 1; min-width: 200px; padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--bg-primary); color: var(--text-primary); border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🚀 YouTube Archive Engine</h1>
+      <div style="display: flex; align-items: center; gap: 15px;">
+        <span class="proxy-status">🌐 <span id="proxyCount">0/0</span> Proxies</span>
+        <span><span class="live-indicator"></span>Live</span>
+      </div>
+    </header>
 
+    <div class="paused-banner" id="pausedBanner">
+      <span>⏸️</span>
+      <span>System Paused - <strong id="pauseReason">Manual Pause</strong></span>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card download">
+        <div class="stat-value" id="statDownloading">0</div>
+        <div class="stat-label">Downloading</div>
+      </div>
+      <div class="stat-card success">
+        <div class="stat-value" id="statDownloaded">0</div>
+        <div class="stat-label">Completed</div>
+      </div>
+      <div class="stat-card failed">
+        <div class="stat-value" id="statFailed">0</div>
+        <div class="stat-label">Failed</div>
+      </div>
+      <div class="stat-card total">
+        <div class="stat-value" id="statTotal">0</div>
+        <div class="stat-label">Total Jobs</div>
+      </div>
+      <div class="speed-display">
+        <div class="speed-value" id="aggregateSpeed">0 B/s</div>
+        <div class="speed-label">📊 Aggregate Download Speed</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="btn btn-pause" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
+      <button class="btn btn-resume" id="resumeBtn" onclick="toggleResume()" style="display:none;">▶️ Resume</button>
+      <button class="btn" style="background: var(--bg-card); color: var(--text-primary);" onclick="refreshData()">🔄 Refresh</button>
+      <button class="btn" style="background: var(--danger); color: #fff;" onclick="purgeQueue()">🗑️ Purge Queue</button>
+    </div>
+
+    <div class="section">
+      <div class="section-title">👷 Active Workers</div>
+      <div class="workers-grid" id="workersGrid"></div>
+    </div>
+
+    <div class="section">
+      <div class="tabs">
+        <button class="tab active" onclick="switchTab('all')">📋 All Jobs</button>
+        <button class="tab" onclick="switchTab('downloading')">⬇️ Active</button>
+        <button class="tab" onclick="switchTab('pending')">⏳ Pending</button>
+        <button class="tab" onclick="switchTab('failed')">❌ Failed</button>
+        <button class="tab" onclick="switchTab('completed')">✅ Completed</button>
+        <button class="tab" onclick="switchTab('history')">📜 History</button>
+        <button class="tab" onclick="switchTab('logs')">📝 Logs</button>
+      </div>
+      
+      <div class="filter-controls">
+        <input type="text" class="search-input" id="searchInput" placeholder="🔍 Search by title or URL..." oninput="filterJobs()">
+        <select class="filter-select" id="statusFilter" onchange="filterJobs()">
+          <option value="">All Statuses</option>
+          <option value="pending">Pending</option>
+          <option value="downloading">Downloading</option>
+          <option value="paused">Paused</option>
+          <option value="downloaded">Downloaded</option>
+          <option value="failed">Failed</option>
+        </select>
+      </div>
+
+      <div class="tab-content active" id="jobsTableContainer">
+        <table class="jobs-table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Folder</th>
+              <th>DL Status</th>
+              <th>Metadata</th>
+              <th>Convert</th>
+              <th>Retry</th>
+              <th>Error</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="jobsTableBody"></tbody>
+        </table>
+      </div>
+      
+      <div class="tab-content" id="historyContainer">
+        <table class="jobs-table">
+          <thead>
+            <tr>
+              <th>Started</th>
+              <th>Ended</th>
+              <th>Duration</th>
+              <th>Downloaded</th>
+              <th>Skipped</th>
+              <th>Failed</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody"></tbody>
+        </table>
+      </div>
+      
+      <div class="tab-content" id="logsContainer">
+        <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+          <select class="filter-select" id="logType" onchange="loadLogs()">
+            <option value="error">Error Log</option>
+            <option value="report">Report Log</option>
+            <option value="stream">Stream Log</option>
+          </select>
+          <button class="btn btn-retry" onclick="loadLogs()">🔄 Refresh Logs</button>
+        </div>
+        <pre id="logsContent" style="background: var(--bg-primary); padding: 15px; border-radius: 8px; max-height: 500px; overflow-y: auto; font-size: 0.85rem; white-space: pre-wrap;"></pre>
+      </div>
+      
+      <div class="tab-content" id="failedContainer" style="display: none;">
+        <h3 style="margin-bottom: 15px;">❌ Failed Items</h3>
+        <table class="jobs-table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Folder</th>
+              <th>Retries</th>
+              <th>Last Error</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="failedTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    
+    <div class="section">
+      <div class="section-title">➕ Add New Playlist/URL</div>
+      <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+        <input type="text" id="scanUrl" placeholder="Enter YouTube URL..." style="flex: 1; min-width: 300px; padding: 10px; background: var(--bg-card); border: 1px solid var(--bg-primary); color: var(--text-primary); border-radius: 6px;">
+        <input type="text" id="scanFolder" placeholder="Optional folder name" style="width: 200px; padding: 10px; background: var(--bg-card); border: 1px solid var(--bg-primary); color: var(--text-primary); border-radius: 6px;">
+        <button class="btn btn-resume" onclick="scanUrl()">📥 Scan & Add</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentTab = 'all';
+    let allJobs = [];
+    let isPaused = false;
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        
+        document.getElementById('statDownloading').textContent = data.stats.totalQueued || 0;
+        document.getElementById('statDownloaded').textContent = data.stats.downloaded || 0;
+        document.getElementById('statFailed').textContent = data.stats.failed || 0;
+        document.getElementById('statTotal').textContent = data.stats.total || 0;
+        document.getElementById('aggregateSpeed').textContent = data.aggregateSpeed || '0 B/s';
+        document.getElementById('proxyCount').textContent = \`\${data.proxyHealth?.active || 0}/\${data.proxyHealth?.total || 0}\`;
+        
+        isPaused = data.isPaused;
+        document.getElementById('pauseBtn').style.display = isPaused ? 'none' : 'inline-block';
+        document.getElementById('resumeBtn').style.display = isPaused ? 'inline-block' : 'none';
+        document.getElementById('pausedBanner').classList.toggle('active', isPaused);
+        document.getElementById('pauseReason').textContent = data.pauseReason || 'Manual Pause';
+        
+        const workersHtml = (data.workers || []).map(w => \`
+          <div class="worker-card \${w.status === 'Idle' ? '' : w.status.includes('⬇️') ? 'busy' : 'active'}">
+            <div class="worker-id">\${w.id} [\${w.type}]</div>
+            <div class="worker-status">\${w.status || 'Idle'}</div>
+          </div>
+        \`).join('');
+        document.getElementById('workersGrid').innerHTML = workersHtml;
+        
+      } catch (e) { console.error('Failed to fetch status:', e); }
+    }
+
+    async function fetchJobs() {
+      try {
+        const res = await fetch('/api/jobs');
+        const data = await res.json();
+        allJobs = data.jobs || [];
+        renderJobs();
+      } catch (e) { console.error('Failed to fetch jobs:', e); }
+    }
+
+    function renderJobs() {
+      let filtered = allJobs;
+      
+      if (currentTab !== 'all') {
+        if (currentTab === 'downloading') filtered = allJobs.filter(j => j.download_status === 'downloading');
+        else if (currentTab === 'pending') filtered = allJobs.filter(j => j.download_status === 'pending' || j.download_status === 'paused');
+        else if (currentTab === 'failed') filtered = allJobs.filter(j => j.download_status === 'failed' || j.conversion_status === 'failed');
+        else if (currentTab === 'completed') filtered = allJobs.filter(j => j.download_status === 'downloaded' && (j.metadata_status === 'done' || j.metadata_status === 'not_needed') && (j.conversion_status === 'done' || j.conversion_status === 'not_needed'));
+      }
+      
+      const search = document.getElementById('searchInput').value.toLowerCase();
+      if (search) filtered = filtered.filter(j => j.title.toLowerCase().includes(search) || j.url.toLowerCase().includes(search));
+      
+      const statusFilter = document.getElementById('statusFilter').value;
+      if (statusFilter) filtered = filtered.filter(j => j.download_status === statusFilter);
+      
+      const html = filtered.map(job => \`
+        <tr>
+          <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">\${escapeHtml(job.title)}</td>
+          <td>\${job.folder || '-'}</td>
+          <td><span class="status-badge status-\${job.download_status}">\${job.download_status}</span></td>
+          <td><span class="status-badge status-\${job.metadata_status}">\${job.metadata_status}</span></td>
+          <td><span class="status-badge status-\${job.conversion_status}">\${job.conversion_status}</span></td>
+          <td>\${job.retry_count || 0}</td>
+          <td class="error-text" title="\${escapeHtml(job.last_error || '')}">\${escapeHtml(job.last_error || '-')}</td>
+          <td>\${job.download_status === 'failed' || job.conversion_status === 'failed' ? \`<button class="btn btn-retry" onclick="retryJob('\${job.id}')">🔄 Retry</button>\` : '-'}</td>
+        </tr>
+      \`).join('');
+      
+      document.getElementById('jobsTableBody').innerHTML = html || '<tr><td colspan="8" style="text-align: center; color: var(--text-secondary);">No jobs found</td></tr>';
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text || '';
+      return div.innerHTML;
+    }
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      event.target.classList.add('active');
+      
+      // Hide all tab contents
+      document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+      
+      // Show appropriate content based on tab
+      if (tab === 'all' || tab === 'downloading' || tab === 'pending' || tab === 'completed') {
+        document.getElementById('jobsTableContainer').style.display = 'block';
+        renderJobs();
+      } else if (tab === 'failed') {
+        document.getElementById('failedContainer').style.display = 'block';
+        loadFailedItems();
+      } else if (tab === 'history') {
+        document.getElementById('historyContainer').style.display = 'block';
+        loadHistory();
+      } else if (tab === 'logs') {
+        document.getElementById('logsContainer').style.display = 'block';
+        loadLogs();
+      }
+    }
+
+    function filterJobs() {
+      renderJobs();
+    }
+
+    async function togglePause() {
+      await fetch('/api/pause', { method: 'POST' });
+      refreshData();
+    }
+
+    async function toggleResume() {
+      await fetch('/api/resume', { method: 'POST' });
+      refreshData();
+    }
+
+    async function retryJob(id) {
+      await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+      refreshData();
+    }
+    
+    async function resetFailCount(id) {
+      await fetch(`/api/failcount/reset/${encodeURIComponent(id)}`, { method: 'POST' });
+      refreshData();
+    }
+    
+    async function purgeQueue() {
+      if (!confirm('Are you sure you want to purge all pending, paused, and failed jobs?')) return;
+      await fetch('/api/queue/purge', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+      refreshData();
+    }
+    
+    async function scanUrl() {
+      const url = document.getElementById('scanUrl').value.trim();
+      const folder = document.getElementById('scanFolder').value.trim();
+      if (!url) { alert('Please enter a URL'); return; }
+      
+      try {
+        const res = await fetch('/api/scan', { 
+          method: 'POST', 
+          headers: { 'Content-Type': 'application/json' }, 
+          body: JSON.stringify({ url, folder }) 
+        });
+        const data = await res.json();
+        if (data.ok) {
+          alert(data.message);
+          document.getElementById('scanUrl').value = '';
+          document.getElementById('scanFolder').value = '';
+          refreshData();
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (e) {
+        alert('Scan failed: ' + e.message);
+      }
+    }
+    
+    async function loadFailedItems() {
+      try {
+        const res = await fetch('/api/failed');
+        const data = await res.json();
+        const failed = data.failed || [];
+        
+        const html = failed.map(job => `
+          <tr>
+            <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(job.title)}</td>
+            <td>${job.folder || '-'}</td>
+            <td>${job.retry_count || 0}</td>
+            <td class="error-text" title="${escapeHtml(job.last_error || '')}">${escapeHtml(job.last_error || '-')}</td>
+            <td>
+              <button class="btn btn-retry" onclick="retryJob('${job.id}')">🔄 Retry</button>
+              <button class="btn btn-retry" style="background: var(--bg-card);" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
+            </td>
+          </tr>
+        `).join('');
+        
+        document.getElementById('failedTableBody').innerHTML = html || '<tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">No failed items</td></tr>';
+      } catch (e) { console.error('Failed to load failed items:', e); }
+    }
+    
+    async function loadHistory() {
+      try {
+        const res = await fetch('/api/history?limit=20');
+        const data = await res.json();
+        const history = data.history || [];
+        
+        const html = history.map(run => `
+          <tr>
+            <td>${run.started_at || '-'}</td>
+            <td>${run.ended_at || '-'}</td>
+            <td>${run.duration_seconds ? Math.round(run.duration_seconds) + 's' : '-'}</td>
+            <td style="color: var(--success);">${run.downloaded || 0}</td>
+            <td style="color: var(--text-secondary);">${run.skipped || 0}</td>
+            <td style="color: var(--danger);">${run.failed || 0}</td>
+            <td>${run.total_queued || 0}</td>
+          </tr>
+        `).join('');
+        
+        document.getElementById('historyTableBody').innerHTML = html || '<tr><td colspan="7" style="text-align: center; color: var(--text-secondary);">No run history yet</td></tr>';
+      } catch (e) { console.error('Failed to load history:', e); }
+    }
+    
+    async function loadLogs() {
+      try {
+        const logType = document.getElementById('logType').value;
+        const res = await fetch(`/api/logs?type=${logType}&limit=100`);
+        const data = await res.json();
+        const logs = data.logs || [];
+        
+        document.getElementById('logsContent').textContent = logs.join('\n') || 'No logs available';
+      } catch (e) { 
+        document.getElementById('logsContent').textContent = 'Error loading logs: ' + e.message;
+      }
+    }
+
+    function refreshData() {
+      fetchStatus();
+      fetchJobs();
+    }
+
+    // Initial load and auto-refresh every 2 seconds
+    refreshData();
+    setInterval(refreshData, 2000);
+  </script>
+</body>
+</html>`;
+</html>`;
 function startWebServer(port: number) {
   return Bun.serve({
     port, hostname: "0.0.0.0",
@@ -643,6 +1138,44 @@ function startWebServer(port: number) {
         });
       }
       
+      if (url.pathname === "/api/jobs" && req.method === "GET") {
+        const rows = db.query("SELECT id, url, title, folder, download_status, metadata_status, conversion_status, retry_count, last_error FROM jobs ORDER BY created_at DESC LIMIT 500").all();
+        return Response.json({ ok: true, jobs: rows });
+      }
+      
+      // P3-1: Queue & history management endpoints
+      if (url.pathname === "/api/scan" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const { url: scanUrl, folder } = body;
+        if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
+        try {
+          await scanAndIngest(scanUrl, globalConfig, folder);
+          return Response.json({ ok: true, message: `Scanned ${scanUrl}` });
+        } catch (e: any) {
+          return Response.json({ ok: false, error: e.message || "Scan failed" }, { status: 500 });
+        }
+      }
+      
+      if (url.pathname === "/api/queue/purge" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const { status: purgeStatus } = body;
+        let stmt;
+        if (purgeStatus) {
+          stmt = db.prepare("DELETE FROM jobs WHERE download_status = ?");
+          stmt.run(purgeStatus);
+        } else {
+          stmt = db.prepare("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'failed')");
+          stmt.run();
+        }
+        return Response.json({ ok: true, deleted: stmt.changes });
+      }
+      
+      if (url.pathname.startsWith("/api/failcount/reset/") && req.method === "POST") {
+        const id = decodeURIComponent(url.pathname.replace("/api/failcount/reset/", ""));
+        db.run("UPDATE jobs SET retry_count = 0, last_error = NULL WHERE id = ?", [id]);
+        return Response.json({ ok: true });
+      }
+
       if (url.pathname === "/api/pause" && req.method === "POST") { globalIsPaused = true; pauseReason = "MANUAL_WEB_UI"; return Response.json({ success: true }); }
       if (url.pathname === "/api/resume" && req.method === "POST") { globalIsPaused = false; pauseReason = null; return Response.json({ success: true }); }
       
@@ -653,12 +1186,41 @@ function startWebServer(port: number) {
 
       if (url.pathname.startsWith("/api/retry/") && req.method === "POST") {
         const id = decodeURIComponent(url.pathname.replace("/api/retry/", ""));
-        db.run("UPDATE jobs SET download_status = 'pending', conversion_status = 'pending', retry_count = 0, last_error = NULL WHERE id = ?", [id]);
+        db.run("UPDATE jobs SET download_status = 'pending', conversion_status = 'pending', metadata_status = CASE WHEN want_subtitles OR want_thumbnail OR want_description THEN 'pending' ELSE 'not_needed' END, retry_count = 0, last_error = NULL WHERE id = ?", [id]);
         return Response.json({ ok: true });
       }
 
+      // P3-2: Log viewer endpoint
+      if (url.pathname === "/api/logs" && req.method === "GET") {
+        const logType = url.searchParams.get("type") || "error";
+        const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+        let logs: string[] = [];
+        
+        try {
+          if (logType === "error" && existsSync("error.log")) {
+            const content = readFileSync("error.log", "utf-8");
+            logs = content.split("\n").filter(l => l.trim()).slice(-limit);
+          } else if (logType === "report" && existsSync("report.json")) {
+            const content = readFileSync("report.json", "utf-8");
+            logs = content.split("\n").filter(l => l.trim()).slice(-limit);
+          } else if (logType === "stream") {
+            logs = ["Log streaming not implemented yet"];
+          }
+        } catch (e: any) {
+          logs = [`Error reading logs: ${e.message}`];
+        }
+        
+        return Response.json({ ok: true, logs, type: logType, count: logs.length });
+      }
+
+      // P3-3: Run history endpoint
+      if (url.pathname === "/api/history" && req.method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+        const rows = db.query("SELECT * FROM run_history ORDER BY ended_at DESC LIMIT ?").all(limit);
+        return Response.json({ ok: true, history: rows });
+      }
+
       return new Response("Not Found", { status: 404 });
-    }
   });
 }
 
