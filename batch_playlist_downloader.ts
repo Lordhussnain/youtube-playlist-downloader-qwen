@@ -1,8 +1,8 @@
-// batch_playlist_downloader.ts (V3 - Central DB Pipeline)
+// batch_playlist_downloader.ts (V4 - Central DB Pipeline with Separate Metadata Worker)
 // Run with: bun run batch_playlist_downloader.ts
 import { mkdir, unlink, readFile, writeFile, statfs, rm, stat, appendFile, readdir, cp, rename } from "node:fs/promises";
 import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join, basename, resolve } from "node:path";
+import { join, basename, resolve, dirname } from "node:path";
 import { networkInterfaces } from "node:os";
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -14,11 +14,14 @@ let db: Database;
 
 interface Job {
   id: string; url: string; title: string; output_directory: string; target_format: string;
-  want_subtitles: number; want_thumbnail: number; want_description: number; want_info_json: number;
+  want_subtitles: number; want_thumbnail: number; want_description: number;
   download_status: string; metadata_status: string; conversion_status: string;
-  download_claimed_by: string | null; conversion_claimed_by: string | null;
+  download_claimed_by: string | null; download_claimed_at: string | null;
+  metadata_claimed_by: string | null; metadata_claimed_at: string | null;
+  conversion_claimed_by: string | null; conversion_claimed_at: string | null;
   partial_file_path: string | null; retry_count: number; last_error: string | null;
   folder: string; index: number; file_path: string | null; file_size: number; integrity: string | null;
+  created_at: string; updated_at: string;
 }
 
 function initDatabase() {
@@ -36,13 +39,13 @@ function initDatabase() {
       want_subtitles INTEGER DEFAULT 0,
       want_thumbnail INTEGER DEFAULT 0,
       want_description INTEGER DEFAULT 0,
-      want_info_json INTEGER DEFAULT 1,
       
       download_status TEXT DEFAULT 'pending',   -- pending, downloading, paused, downloaded, failed
-      metadata_status TEXT DEFAULT 'done',      -- done, not_needed (handled by download worker)
-      conversion_status TEXT DEFAULT 'pending', -- pending, in_progress, done, failed, not_needed
+      metadata_status TEXT DEFAULT 'pending',   -- not_needed, pending, in_progress, done, failed
+      conversion_status TEXT DEFAULT 'pending', -- not_needed, pending, in_progress, done, failed
       
       download_claimed_by TEXT, download_claimed_at TEXT,
+      metadata_claimed_by TEXT, metadata_claimed_at TEXT,
       conversion_claimed_by TEXT, conversion_claimed_at TEXT,
       
       partial_file_path TEXT,
@@ -54,46 +57,82 @@ function initDatabase() {
       file_path TEXT,
       file_size INTEGER DEFAULT 0,
       integrity TEXT,
-      playlist_count INTEGER DEFAULT 1,
       
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
-  // Keep auxiliary tables for RSS, Playlist Indexing, and History
+  // Keep auxiliary tables for Playlist Indexing and History
   db.run(`CREATE TABLE IF NOT EXISTS playlist_state (folder TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS rss_state (source TEXT PRIMARY KEY, channel_id TEXT, channel TEXT, last_poll TEXT, last_error TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS discovered_playlists (channel_id TEXT NOT NULL, playlist_id TEXT NOT NULL, title TEXT, updated_at TEXT, PRIMARY KEY (channel_id, playlist_id))`);
   db.run(`CREATE TABLE IF NOT EXISTS run_history (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, ended_at TEXT, duration_seconds REAL, downloaded INTEGER, skipped INTEGER, failed INTEGER, total_queued INTEGER)`);
 }
 
 // 🛡️ CRASH RECOVERY: Reset interrupted jobs to paused/pending so they resume
+// This handles ungraceful exits where no shutdown handler could run
 function reconcileCrashedJobs() {
   const stmt = db.run(`
     UPDATE jobs SET 
       download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
+      metadata_status = CASE WHEN metadata_status = 'in_progress' THEN 'pending' ELSE metadata_status END,
       conversion_status = CASE WHEN conversion_status = 'in_progress' THEN 'pending' ELSE conversion_status END,
-      download_claimed_by = NULL, conversion_claimed_by = NULL,
+      download_claimed_by = NULL, download_claimed_at = NULL,
+      metadata_claimed_by = NULL, metadata_claimed_at = NULL,
+      conversion_claimed_by = NULL, conversion_claimed_at = NULL,
       updated_at = CURRENT_TIMESTAMP
-    WHERE download_status = 'downloading' OR conversion_status = 'in_progress'
+    WHERE download_status = 'downloading' OR metadata_status = 'in_progress' OR conversion_status = 'in_progress'
   `);
   if (stmt.changes > 0) console.log(`🔄 Reconciled ${stmt.changes} crashed job(s) back to paused/pending.`);
 }
 
-// 🌟 ATOMIC CLAIMING: Prevents two workers from grabbing the same job
+// 🌟 ATOMIC CLAIMING: Single UPDATE-with-subquery prevents race conditions
+// Two workers cannot grab the same row because the UPDATE itself does the SELECT
 const claimDownloadJob = db.transaction((workerId: string) => {
-  const row = db.query(`SELECT id FROM jobs WHERE download_status IN ('pending', 'paused') ORDER BY created_at LIMIT 1`).get() as { id: string } | null;
-  if (!row) return null;
-  db.run(`UPDATE jobs SET download_status = 'downloading', download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [workerId, row.id]);
-  return db.query(`SELECT * FROM jobs WHERE id = ?`).get(row.id) as Job;
+  const row = db.query(`
+    UPDATE jobs SET 
+      download_status = 'downloading', 
+      download_claimed_by = ?, 
+      download_claimed_at = CURRENT_TIMESTAMP, 
+      updated_at = CURRENT_TIMESTAMP 
+    WHERE id = (
+      SELECT id FROM jobs 
+      WHERE download_status IN ('pending', 'paused') 
+      ORDER BY created_at LIMIT 1
+    ) RETURNING *
+  `).get(workerId) as Job | null;
+  return row;
+});
+
+const claimMetadataJob = db.transaction((workerId: string) => {
+  const row = db.query(`
+    UPDATE jobs SET 
+      metadata_status = 'in_progress', 
+      metadata_claimed_by = ?, 
+      metadata_claimed_at = CURRENT_TIMESTAMP, 
+      updated_at = CURRENT_TIMESTAMP 
+    WHERE id = (
+      SELECT id FROM jobs 
+      WHERE download_status = 'downloaded' AND metadata_status = 'pending' 
+      ORDER BY created_at LIMIT 1
+    ) RETURNING *
+  `).get(workerId) as Job | null;
+  return row;
 });
 
 const claimConvertJob = db.transaction((workerId: string) => {
-  const row = db.query(`SELECT id FROM jobs WHERE download_status = 'downloaded' AND conversion_status = 'pending' ORDER BY created_at LIMIT 1`).get() as { id: string } | null;
-  if (!row) return null;
-  db.run(`UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [workerId, row.id]);
-  return db.query(`SELECT * FROM jobs WHERE id = ?`).get(row.id) as Job;
+  const row = db.query(`
+    UPDATE jobs SET 
+      conversion_status = 'in_progress', 
+      conversion_claimed_by = ?, 
+      conversion_claimed_at = CURRENT_TIMESTAMP, 
+      updated_at = CURRENT_TIMESTAMP 
+    WHERE id = (
+      SELECT id FROM jobs 
+      WHERE download_status = 'downloaded' AND conversion_status = 'pending' 
+      ORDER BY created_at LIMIT 1
+    ) RETURNING *
+  `).get(workerId) as Job | null;
+  return row;
 });
 
 function isVideoInDb(videoId: string): boolean {
@@ -189,7 +228,18 @@ function formatBytes(bytes: number): string {
   return `${v.toFixed(1)}${units[i]}`;
 }
 function formatBytesPerSec(bps: number): string { return bps <= 0 ? "0 B/s" : `${formatBytes(bps)}/s`; }
+function parseSpeedToBytesPerSec(speedStr: string): number {
+  if (!speedStr || speedStr.trim() === "" || speedStr === "NA") return 0;
+  const s = speedStr.trim().toLowerCase();
+  const match = s.match(/([\d.]+)\s*([kmgt]?b)?\/?s/i);
+  if (!match) return 0;
+  const val = parseFloat(match[1]);
+  const unit = (match[2] || "b").toLowerCase();
+  const multipliers: Record<string, number> = { b: 1, kb: 1024, mb: 1024**2, gb: 1024**3, tb: 1024**4 };
+  return val * (multipliers[unit] || 1);
+}
 function sanitizeFolderName(name: string): string { return name.replace(/[\/:*?"<>|]/g, "_").trim() || "playlist"; }
+function sanitizeFileName(name: string): string { return name.replace(/[\\/:*?"<>|]/g, "_").trim() || "video"; }
 
 // ==========================================
 // 4. PROXY & COOKIE MANAGEMENT
@@ -256,18 +306,22 @@ async function scanAndIngest(url: string, config: Config, overrideFolderName?: s
   const wantSubs = config.downloadSubtitles ? 1 : 0;
   const wantThumb = config.writeThumbnail ? 1 : 0;
   const wantDesc = config.writeDescription ? 1 : 0;
-  const wantInfo = config.writeInfoJson ? 1 : 0;
+
+  // Determine initial metadata status based on flags
+  const metadataStatus = (wantSubs || wantThumb || wantDesc) ? 'pending' : 'not_needed';
+  // Determine initial conversion status based on format
+  const conversionStatus = (config.videoQuality === 'audio' || targetFormat !== 'mp4') ? 'pending' : 'not_needed';
 
   const insertStmt = db.prepare(`
     INSERT OR IGNORE INTO jobs 
-    (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, want_info_json, folder, index, download_status, conversion_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')
+    (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, index, download_status, metadata_status, conversion_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
   `);
 
   for (const item of items) {
     if (isVideoInDb(item.id)) continue;
     const index = getNextIndex(folder);
-    insertStmt.run(item.id, `https://www.youtube.com/watch?v=${item.id}`, item.title, outputDir, targetFormat, wantSubs, wantThumb, wantDesc, wantInfo, folder, index);
+    insertStmt.run(item.id, `https://www.youtube.com/watch?v=${item.id}`, item.title, outputDir, targetFormat, wantSubs, wantThumb, wantDesc, folder, index, metadataStatus, conversionStatus);
   }
 }
 
@@ -285,36 +339,89 @@ async function downloadWorker(id: number, config: Config) {
     try {
       updateWorkerLine(id, `⬇️ Starting... | ${job.title}`, config);
       const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
-      const outTemplate = join(job.output_directory, `${String(job.index).padStart(3, "0")} - %(title)s.%(ext)s`);
+      // Deterministic output path for resume capability
+      const baseFilename = `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
+      const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
       
       const args = [
         "yt-dlp", job.url, ...cookiesArgs(config), "--format", format,
         "--concurrent-fragments", "16", "-o", outTemplate,
         "--progress", "--progress-template", "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-        "--socket-timeout", "30", "--retries", "5"
+        "--socket-timeout", "30", "--retries", "5",
+        "--continue"  // Resume partial downloads
       ];
 
-      // 🌟 FETCH METADATA NATIVELY (Saves a whole network pass!)
-      if (job.want_subtitles) args.push("--write-subs", "--write-auto-subs", "--sub-langs", "all", "--embed-subs");
-      if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
-      if (job.want_description) args.push("--write-description");
-      if (job.want_info_json) args.push("--write-info-json");
-      if (config.embedMetadata) args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
+      // Note: Metadata (subtitles, thumbnail, description) is handled by separate metadata worker
+      // Download worker only fetches the video/audio file
 
       const proxy = config.useProxies ? proxyManager.getProxy() : null;
       if (proxy) args.push("--proxy", proxy.url);
 
       const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-      const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      let lastProgressUpdate = 0;
+      
+      // Stream stdout for real-time progress updates
+      const reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalFilePath = "";
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        
+        for (const line of lines) {
+          if (line.startsWith("PROGRESS:")) {
+            const parts = line.replace("PROGRESS:", "").split("|");
+            const percent = parts[0];
+            const speed = parts[1];
+            const eta = parts[2];
+            const size = parts[3];
+            const downloaded = parts[4];
+
+            const bps = parseSpeedToBytesPerSec(speed);
+            if (bps > 0) autoscaler.recordSpeed(id, bps);
+            
+            const sizeNum = parseInt(size, 10);
+            const dlNum = parseInt(downloaded, 10);
+            let pctNum = parseFloat(percent);
+            
+            // Fragmented downloads (m3u8/dash) report percent=NA — derive it from bytes.
+            if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
+            
+            if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
+              const sizeTxt = Number.isFinite(sizeNum) && sizeNum > 0 ? formatBytes(sizeNum) : "Calculating...";
+              
+              // 🌟 FIX: Show "Calculating..." instead of "0 B/s" or "NA" when yt-dlp hasn't computed speed yet
+              const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating..."; 
+              
+              const etaNum = parseFloat(eta);
+              const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+              
+              updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% of ${sizeTxt} @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+              lastProgressUpdate = Date.now();
+            }
+          } else if (line.trim() && existsSync(line.trim())) {
+            finalFilePath = line.trim();
+          }
+        }
+      }
+      
+      const [, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
 
       if (code === 0) {
-        const filePath = stdout.split("\n").reverse().find(l => l && existsSync(l)) || "";
+        const filePath = finalFilePath || buffer.split("\n").reverse().find(l => l.trim() && existsSync(l.trim()))?.trim() || "";
         const fileSize = filePath ? (await stat(filePath)).size : 0;
         
-        db.run(`UPDATE jobs SET download_status = 'downloaded', metadata_status = 'done', file_path = ?, file_size = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, job.id]);
+        // Update partial_file_path for potential resume, mark as downloaded
+        db.run(`UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, filePath, job.id]);
         updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
       } else {
-        throw new Error(stderr.split('\n').slice(-3).join(' '));
+        throw new Error(buffer.split('\n').slice(-3).join(' '));
       }
     } catch (err: any) {
       const retryCount = job.retry_count + 1;
@@ -323,6 +430,60 @@ async function downloadWorker(id: number, config: Config) {
       updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
     } finally {
       autoscaler.clearWorker(id);
+    }
+  }
+}
+
+// 📝 METADATA WORKER: Handles subtitles, thumbnails, descriptions independently
+async function metadataWorker(id: number, config: Config) {
+  const workerId = `md-${id}`;
+  while (!abortController.signal.aborted) {
+    const job = claimMetadataJob(workerId);
+    if (!job) { await Bun.sleep(2000); continue; }
+
+    try {
+      updateMetadataWorkerLine(id, `📝 Fetching metadata | ${job.title}`, config);
+      const sourcePath = job.file_path;
+      if (!sourcePath || !existsSync(sourcePath)) throw new Error("Source file missing for metadata extraction");
+
+      const args = ["yt-dlp", job.url, ...cookiesArgs(config), "--skip-download"];
+
+      // Subtitles
+      if (job.want_subtitles) {
+        args.push("--write-subs", "--write-auto-subs", "--sub-langs", "all.*", "--embed-subs");
+      }
+      // Thumbnail
+      if (job.want_thumbnail) {
+        args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
+      }
+      // Description
+      if (job.want_description) {
+        args.push("--write-description");
+      }
+      // Embed metadata into the video file
+      if (config.embedMetadata) {
+        args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
+      }
+
+      // Output to same directory with same base name
+      const baseFilename = `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
+      args.push("-o", join(job.output_directory, `${baseFilename}.%(ext)s`));
+
+      const proxy = config.useProxies ? proxyManager.getProxy() : null;
+      if (proxy) args.push("--proxy", proxy.url);
+
+      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+      const [, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+
+      if (code === 0) {
+        db.run(`UPDATE jobs SET metadata_status = 'done', metadata_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateMetadataWorkerLine(id, `✅ Metadata done | ${job.title}`, config);
+      } else {
+        throw new Error(stderr.split('\n').slice(-3).join(' '));
+      }
+    } catch (err: any) {
+      db.run(`UPDATE jobs SET metadata_status = 'failed', last_error = ?, metadata_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [String(err).slice(0, 500), job.id]);
+      updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
     }
   }
 }
@@ -377,13 +538,76 @@ async function converterWorker(id: number, config: Config) {
 // ==========================================
 // 7. TUI & WEB UI
 // ==========================================
+// ---- Terminal UI (TUI) Dashboard --------------------------------------------
+function initDashboard(config: Config) {
+  if (!isTTY) return;
+  const cols = process.stdout.columns || 80;
+  const rows = process.stdout.rows || 50;
+  const dashboardLines = 2 + config.maxDownloadWorkers + config.maxConcurrentConverts;
+  
+  // 🛡️ SAFETY NET: If terminal is too narrow or short, disable TUI to prevent overlapping text
+  if (rows <= dashboardLines + 5 || cols < 60) { 
+    isTTY = false; 
+    console.log("⚠️ Terminal too small for TUI dashboard. Falling back to standard logs.");
+    return; 
+  }
+  
+  process.stdout.write("\x1b[2J\x1b[1;1H"); // Clear screen
+  // Set scrolling region so standard console.log doesn't overwrite the TUI
+  process.stdout.write(`\x1b[${dashboardLines + 1};${rows}r\x1b[${dashboardLines + 1};1H`);
+  
+  for (let i = 1; i <= dashboardLines; i++) process.stdout.write(`\x1b[${i};1H\x1b[2K`);
+  for (let i = 1; i <= config.maxDownloadWorkers; i++) updateWorkerLine(i, "— idle slot —", config);
+  for (let i = 1; i <= config.maxConcurrentConverts; i++) updateConvertWorkerLine(i, "💤 Idle", config);
+}
+
+function updateAbsoluteLine(row: number, text: string) {
+  if (!isTTY) return;
+  const cols = process.stdout.columns || 80;
+  
+  // 1. Truncate to prevent line wrapping (which destroys the TUI grid)
+  let safeText = text.length > cols - 1 ? text.slice(0, cols - 4) + '...' : text;
+  
+  // 2. Pad with spaces to overwrite any leftover characters from previous longer strings
+  // (This is a failsafe in case \x1b[2K isn't fully supported by the user's terminal)
+  safeText = safeText.padEnd(cols - 1, ' ');
+  
+  // \x1b7 = Save cursor, \x1b8 = Restore cursor (more compatible than \x1b[s / \x1b[u)
+  // \x1b[${row};1H = Move to row
+  // \x1b[2K = Clear entire line
+  process.stdout.write(`\x1b7\x1b[${row};1H\x1b[2K${safeText}\x1b8`);
+}
+
 function updateWorkerLine(id: number, text: string, config: Config) {
   workerStatuses.set(`DL${id}`, text);
-  if (isTTY) process.stdout.write(`\x1b[s\x1b[${2 + id};1H\x1b[2K[DL${id}] ${text}\x1b[u`);
+  updateAbsoluteLine(2 + id, `[DL${id}] ${text}`);
 }
+
+function updateMetadataWorkerLine(id: number, text: string, config: Config) {
+  workerStatuses.set(`MD${id}`, text);
+  updateAbsoluteLine(2 + config.maxDownloadWorkers + id, `[MD${id}] ${text}`);
+}
+
 function updateConvertWorkerLine(id: number, text: string, config: Config) {
   workerStatuses.set(`CV${id}`, text);
-  if (isTTY) process.stdout.write(`\x1b[s\x1b[${2 + config.maxDownloadWorkers + id};1H\x1b[2K[CV${id}] ${text}\x1b[u`);
+  updateAbsoluteLine(2 + config.maxDownloadWorkers + id, `[CV${id}] ${text}`);
+}
+
+function renderDashboard() {
+  if (!isTTY) return;
+  const agg = formatBytesPerSec(autoscaler.getAggregateSpeed());
+  const cap = autoscaler.maxBandwidthKBps > 0 ? `/${formatBytesPerSec(autoscaler.maxBandwidthKBps * 1024)}` : "";
+  const proxyTotal = proxyManager.getTotalCount();
+  const proxyStr = proxyTotal > 0 ? `| 🌐 ${proxyManager.getActiveCount()}/${proxyTotal} IPs` : "";
+  updateAbsoluteLine(1, `🚀 DL:${aliveDownloadWorkers.size}/${autoscaler.targetWorkers} | ${agg}${cap} | Done:${stats.downloaded} Skip:${stats.skipped} Fail:${stats.failed} Tot:${stats.totalQueued}${proxyStr}`);
+  const plStrs = Array.from(playlistStates.entries()).map(([n, s]) => `${n}: ${s.downloaded + s.skipped}/${s.total}`);
+  updateAbsoluteLine(2, `📂 ${plStrs.join(' | ')}`);
+}
+
+function resetTerminal() {
+  if (!isTTY) return;
+  const rows = process.stdout.rows || 50;
+  process.stdout.write(`\x1b[1;${rows}r\x1b[${rows};1H`);
 }
 
 // (Web UI HTML omitted for brevity, use the exact HTML string from your V2 file)
@@ -443,8 +667,10 @@ function startWebServer(port: number) {
 // ==========================================
 async function handleShutdown(sig: string) {
   console.log(`\n🛑 ${sig} received. Pausing active jobs...`);
-  db.run(`UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL WHERE download_status = 'downloading'`);
-  db.run(`UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL WHERE conversion_status = 'in_progress'`);
+  // Graceful shutdown: mark claimed jobs as paused so they can resume
+  db.run(`UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, download_claimed_at = NULL WHERE download_status = 'downloading'`);
+  db.run(`UPDATE jobs SET metadata_status = 'pending', metadata_claimed_by = NULL, metadata_claimed_at = NULL WHERE metadata_status = 'in_progress'`);
+  db.run(`UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, conversion_claimed_at = NULL WHERE conversion_status = 'in_progress'`);
   abortController.abort();
   webServer?.stop(true);
   process.exit(0);
@@ -456,7 +682,7 @@ async function main() {
 
   globalConfig = await loadConfig();
   initDatabase();
-  reconcileCrashedJobs(); // 🌟 Safety net for crashes
+  reconcileCrashedJobs(); // 🌟 Safety net for crashes (handles ungraceful exits)
   
   await proxyManager.init(globalConfig.webshareApiKey);
   autoscaler.init(globalConfig);
@@ -468,10 +694,14 @@ async function main() {
   webServer = startWebServer(globalConfig.webPort);
   console.log(`🌐 Web UI: http://127.0.0.1:${globalConfig.webPort}`);
 
-  // Start Workers
+  // Start Workers - Download, Metadata, and Converter run independently
   for (let i = 1; i <= globalConfig.maxConcurrentDownloads; i++) {
     aliveDownloadWorkers.add(i);
     downloadWorker(i, globalConfig).finally(() => aliveDownloadWorkers.delete(i));
+  }
+  // Start metadata workers (same count as download workers for parallel processing)
+  for (let i = 1; i <= globalConfig.maxConcurrentDownloads; i++) {
+    metadataWorker(i, globalConfig);
   }
   for (let i = 1; i <= globalConfig.maxConcurrentConverts; i++) {
     converterWorker(i, globalConfig);
