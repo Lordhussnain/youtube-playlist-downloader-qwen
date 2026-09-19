@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🎬 YouTube Archive Engine V5</title>
+  <style>
+    :root {
+      --bg-primary: #0f0f0f;
+      --bg-secondary: #1a1a1a;
+      --bg-card: #252525;
+      --text-primary: #ffffff;
+      --text-secondary: #aaaaaa;
+      --accent: #3b82f6;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --border: #333333;
+    }
+    
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      padding: 20px;
+      line-height: 1.6;
+    }
+    
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 30px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+      gap: 15px;
+    }
+    
+    h1 { font-size: 1.8rem; font-weight: 700; color: var(--accent); }
+    
+    .network-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: 20px;
+      background: var(--bg-card);
+      font-size: 0.9rem;
+    }
+    
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--success);
+      animation: pulse 2s infinite;
+    }
+    
+    .status-dot.disconnected { background: var(--danger); animation: none; }
+    .status-dot.degraded { background: var(--warning); animation: none; }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 15px;
+      margin-bottom: 30px;
+    }
+    
+    .stat-card {
+      background: var(--bg-card);
+      padding: 20px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+    
+    .stat-card h3 {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    .stat-value {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    
+    .stat-sub {
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+      margin-top: 5px;
+    }
+    
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: var(--bg-secondary);
+      border-radius: 3px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+    
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #60a5fa);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+    
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+    
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-size: 0.9rem;
+    }
+    
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    
+    .btn-primary:hover { background: #2563eb; }
+    
+    .btn-success {
+      background: var(--success);
+      color: white;
+    }
+    
+    .btn-success:hover { background: #16a34a; }
+    
+    .btn-danger {
+      background: var(--danger);
+      color: white;
+    }
+    
+    .btn-danger:hover { background: #dc2626; }
+    
+    .btn-warning {
+      background: var(--warning);
+      color: white;
+    }
+    
+    .btn-warning:hover { background: #d97706; }
+    
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+    
+    .btn-secondary:hover { background: var(--bg-secondary); }
+    
+    .tabs {
+      display: flex;
+      gap: 5px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+    }
+    
+    .tab {
+      padding: 10px 20px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 600;
+      border-radius: 8px 8px 0 0;
+      transition: all 0.2s;
+    }
+    
+    .tab:hover { background: var(--bg-card); color: var(--text-primary); }
+    .tab.active { background: var(--accent); color: white; }
+    
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    
+    .jobs-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg-card);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    
+    .jobs-table th,
+    .jobs-table td {
+      padding: 15px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    
+    .jobs-table th {
+      background: var(--bg-secondary);
+      font-weight: 600;
+      color: var(--text-secondary);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    .jobs-table tr:hover { background: var(--bg-secondary); }
+    
+    .status-badge {
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    
+    .status-pending { background: #6b7280; color: white; }
+    .status-downloading { background: var(--accent); color: white; }
+    .status-paused { background: var(--warning); color: white; }
+    .status-downloaded { background: var(--success); color: white; }
+    .status-failed { background: var(--danger); color: white; }
+    .status-converting { background: #8b5cf6; color: white; }
+    .status-done { background: var(--success); color: white; }
+    
+    .search-box {
+      padding: 10px 15px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-size: 0.9rem;
+      width: 300px;
+    }
+    
+    .search-box:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    
+    .bulk-actions {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 15px;
+      background: var(--bg-card);
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    
+    .notification-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 1000;
+      max-width: 400px;
+    }
+    
+    .notification {
+      background: var(--bg-card);
+      padding: 15px 20px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      animation: slideIn 0.3s ease-out;
+      border-left: 4px solid var(--accent);
+    }
+    
+    .notification.success { border-left-color: var(--success); }
+    .notification.error { border-left-color: var(--danger); }
+    .notification.warning { border-left-color: var(--warning); }
+    
+    @keyframes slideIn {
+      from { transform: translateX(400px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+    
+    .add-url-section {
+      background: var(--bg-card);
+      padding: 20px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+    }
+    
+    .add-url-section input {
+      padding: 10px 15px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-size: 0.9rem;
+      width: 100%;
+      margin-bottom: 10px;
+    }
+    
+    .add-url-section input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    
+    .log-viewer {
+      background: var(--bg-secondary);
+      padding: 15px;
+      border-radius: 8px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.85rem;
+      max-height: 500px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    
+    .history-item {
+      background: var(--bg-card);
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      border: 1px solid var(--border);
+    }
+    
+    .history-item h4 {
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    
+    .history-meta {
+      display: flex;
+      gap: 20px;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+    
+    @media (max-width: 768px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .controls { flex-direction: column; }
+      .btn { width: 100%; }
+      .jobs-table { font-size: 0.85rem; }
+      .jobs-table th, .jobs-table td { padding: 8px; }
+      header { flex-direction: column; gap: 15px; }
+      h1 { font-size: 1.4rem; }
+      .search-box { width: 100%; }
+    }
+    
+    @media (max-width: 480px) {
+      .stats-grid { grid-template-columns: 1fr; }
+      body { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎬 YouTube Archive Engine V5</h1>
+    <div class="network-status">
+      <div class="status-dot" id="networkDot"></div>
+      <span id="networkText">Connected</span>
+      <span id="networkLatency" style="color: var(--text-secondary); font-size: 0.8em;"></span>
+    </div>
+  </header>
+  
+  <div class="stats-grid">
+    <div class="stat-card">
+      <h3>Downloading</h3>
+      <div class="stat-value" id="downloadingCount">0</div>
+      <div class="stat-sub" id="aggregateSpeed">0 B/s</div>
+    </div>
+    <div class="stat-card">
+      <h3>Completed</h3>
+      <div class="stat-value" id="completedCount">0</div>
+      <div class="stat-sub" id="completedSub">Total jobs</div>
+    </div>
+    <div class="stat-card">
+      <h3>Failed</h3>
+      <div class="stat-value" id="failedCount">0</div>
+      <div class="stat-sub">Requires attention</div>
+    </div>
+    <div class="stat-card">
+      <h3>Free Disk Space</h3>
+      <div class="stat-value" id="diskFree">--</div>
+      <div class="progress-bar"><div class="progress-fill" id="diskBar" style="width: 100%;"></div></div>
+    </div>
+    <div class="stat-card">
+      <h3>Queue Position</h3>
+      <div class="stat-value" id="queuePosition">--</div>
+      <div class="stat-sub" id="globalETA">ETA: --</div>
+    </div>
+    <div class="stat-card">
+      <h3>System Resources</h3>
+      <div class="stat-value" id="activeWorkers">0</div>
+      <div class="stat-sub">Active workers</div>
+    </div>
+  </div>
+  
+  <div class="add-url-section">
+    <h3 style="margin-bottom: 10px;">➕ Add New Playlist/Channel</h3>
+    <input type="text" id="newUrlInput" placeholder="Paste YouTube playlist or channel URL here..." />
+    <input type="text" id="folderOverride" placeholder="Optional: Custom folder name" />
+    <button class="btn btn-primary" onclick="scanUrl()">📡 Scan & Add to Queue</button>
+  </div>
+  
+  <div class="controls">
+    <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
+    <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
+    <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
+    <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search jobs... (Press / to focus)" onkeyup="filterJobs()" />
+  </div>
+  
+  <div class="bulk-actions" id="bulkActions">
+    <span id="selectedCount">0 selected</span>
+    <button class="btn btn-success" onclick="bulkRetry()">🔄 Retry Selected</button>
+    <button class="btn btn-warning" onclick="bulkPause()">⏸️ Pause Selected</button>
+    <button class="btn btn-danger" onclick="bulkDelete()">🗑️ Delete Selected</button>
+  </div>
+  
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('jobs')">📋 Jobs</button>
+    <button class="tab" onclick="switchTab('failed')">❌ Failed</button>
+    <button class="tab" onclick="switchTab('history')">📜 History</button>
+    <button class="tab" onclick="switchTab('logs')">📝 Logs</button>
+  </div>
+  
+  <div id="jobsTab" class="tab-content active">
+    <table class="jobs-table">
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" /></th>
+          <th>Title</th>
+          <th>Progress</th>
+          <th>Speed</th>
+          <th>ETA</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="jobsTableBody"></tbody>
+    </table>
+  </div>
+  
+  <div id="failedTab" class="tab-content">
+    <div id="failedItems"></div>
+  </div>
+  
+  <div id="historyTab" class="tab-content">
+    <div id="historyItems"></div>
+  </div>
+  
+  <div id="logsTab" class="tab-content">
+    <div style="margin-bottom: 15px;">
+      <select id="logType" class="search-box" style="width: 200px; margin-right: 10px;">
+        <option value="error">Error Log</option>
+        <option value="report">Report Log</option>
+      </select>
+      <button class="btn btn-secondary" onclick="loadLogs()">🔄 Refresh Logs</button>
+    </div>
+    <div class="log-viewer" id="logViewer">Loading logs...</div>
+  </div>
+  
+  <div class="notification-container" id="notifications"></div>
+  
+  <script>
+    let selectedJobs = new Set();
+    let lastFailedCount = 0;
+    let wasPaused = false;
+    
+    // Network status monitoring
+    async function checkNetworkStatus() {
+      const start = Date.now();
+      try {
+        await fetch('/api/ping', { method: 'HEAD', cache: 'no-cache' });
+        const latency = Date.now() - start;
+        document.getElementById('networkText').textContent = 'Connected';
+        document.getElementById('networkLatency').textContent = `${latency}ms`;
+        document.querySelector('.status-dot').className = 'status-dot';
+      } catch {
+        document.getElementById('networkText').textContent = 'Disconnected';
+        document.getElementById('networkLatency').textContent = '';
+        document.querySelector('.status-dot').className = 'status-dot disconnected';
+      }
+    }
+    
+    setInterval(checkNetworkStatus, 5000);
+    
+    // Notifications
+    function showNotification(message, type = 'info', duration = 5000) {
+      const container = document.getElementById('notifications');
+      const notif = document.createElement('div');
+      notif.className = `notification ${type}`;
+      notif.textContent = message;
+      container.appendChild(notif);
+      
+      setTimeout(() => {
+        notif.style.animation = 'slideIn 0.3s ease-out reverse';
+        setTimeout(() => notif.remove(), 300);
+      }, duration);
+    }
+    
+    // Tab switching
+    function switchTab(tabName) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      
+      event.target.classList.add('active');
+      document.getElementById(`${tabName}Tab`).classList.add('active');
+      
+      if (tabName === 'failed') loadFailedItems();
+      if (tabName === 'history') loadHistory();
+      if (tabName === 'logs') loadLogs();
+    }
+    
+    // Selection management
+    function toggleSelectAll() {
+      const checkboxes = document.querySelectorAll('.job-checkbox');
+      const selectAll = document.getElementById('selectAll').checked;
+      checkboxes.forEach(cb => {
+        cb.checked = selectAll;
+        if (selectAll) selectedJobs.add(cb.dataset.id);
+        else selectedJobs.delete(cb.dataset.id);
+      });
+      updateBulkActions();
+    }
+    
+    function toggleJobSelection(id) {
+      if (selectedJobs.has(id)) selectedJobs.delete(id);
+      else selectedJobs.add(id);
+      updateBulkActions();
+    }
+    
+    function updateBulkActions() {
+      const bar = document.getElementById('bulkActions');
+      bar.style.display = selectedJobs.size > 0 ? 'flex' : 'none';
+      document.getElementById('selectedCount').textContent = `${selectedJobs.size} selected`;
+    }
+    
+    // Bulk actions
+    async function bulkRetry() {
+      if (!confirm(`Retry ${selectedJobs.size} failed jobs?`)) return;
+      for (const id of selectedJobs) {
+        await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+      }
+      selectedJobs.clear();
+      refreshData();
+      showNotification(`Retrying ${selectedJobs.size} jobs`, 'success');
+    }
+    
+    async function bulkPause() {
+      if (!confirm(`Pause ${selectedJobs.size} jobs?`)) return;
+      // Implementation would require backend endpoint for bulk pause
+      showNotification('Bulk pause not yet implemented', 'warning');
+    }
+    
+    async function bulkDelete() {
+      if (!confirm(`Delete ${selectedJobs.size} jobs permanently?`)) return;
+      // Implementation would require backend endpoint for bulk delete
+      showNotification('Bulk delete not yet implemented', 'warning');
+    }
+    
+    // Main data fetching
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        
+        document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
+        document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
+        document.getElementById('failedCount').textContent = data.stats?.failed || 0;
+        
+        const speed = data.speed || 0;
+        document.getElementById('aggregateSpeed').textContent = formatBytesPerSec(speed);
+        
+        if (data.diskSpace) {
+          document.getElementById('diskFree').textContent = `${data.diskSpace.free} GB`;
+          const percent = data.diskSpace.percent || 100;
+          document.getElementById('diskBar').style.width = `${percent}%`;
+        }
+        
+        document.getElementById('queuePosition').textContent = data.queuePosition || '--';
+        document.getElementById('globalETA').textContent = data.globalETA || '--';
+        document.getElementById('activeWorkers').textContent = data.activeWorkers || 0;
+        
+        if (data.isPaused && !wasPaused) {
+          showNotification('⏸️ Downloads paused', 'warning');
+        }
+        if ((data.stats?.failed || 0) > lastFailedCount) {
+          showNotification(`❌ ${(data.stats?.failed || 0) - lastFailedCount} download(s) failed`, 'error');
+        }
+        
+        lastFailedCount = data.stats?.failed || 0;
+        wasPaused = data.isPaused || false;
+        
+        renderJobs(data.jobs || []);
+      } catch (err) {
+        console.error('Failed to fetch status:', err);
+      }
+    }
+    
+    async function refreshData() {
+      await fetchStatus();
+      showNotification('🔄 Dashboard refreshed', 'success', 2000);
+    }
+    
+    function renderJobs(jobs) {
+      const tbody = document.getElementById('jobsTableBody');
+      const search = document.getElementById('searchInput').value.toLowerCase();
+      
+      const filtered = jobs.filter(job => 
+        job.title?.toLowerCase().includes(search) || 
+        job.folder?.toLowerCase().includes(search)
+      );
+      
+      tbody.innerHTML = filtered.map(job => {
+        const progress = job.progress || 0;
+        const statusClass = `status-${job.download_status}`;
+        
+        return `
+          <tr data-job-id="${job.id}">
+            <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" onchange="toggleJobSelection('${job.id}')" /></td>
+            <td>${escapeHtml(job.title || 'Unknown')}</td>
+            <td>
+              ${job.download_status === 'downloading' ? `
+                <div class="progress-bar" style="width: 150px;">
+                  <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+                <small>${progress.toFixed(1)}%</small>
+              ` : '-'}
+            </td>
+            <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
+            <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
+            <td><span class="status-badge ${statusClass}">${job.download_status}</span></td>
+            <td>
+              ${job.download_status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+    
+    async function retryJob(id) {
+      await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+      showNotification('🔄 Job queued for retry', 'success');
+      refreshData();
+    }
+    
+    async function togglePause() {
+      const btn = document.getElementById('pauseBtn');
+      if (wasPaused) {
+        await fetch('/api/resume', { method: 'POST' });
+        btn.textContent = '⏸️ Pause All';
+        btn.classList.replace('btn-success', 'btn-warning');
+        showNotification('▶️ Resumed downloads', 'success');
+      } else {
+        await fetch('/api/pause', { method: 'POST' });
+        btn.textContent = '▶️ Resume All';
+        btn.classList.replace('btn-warning', 'btn-success');
+        showNotification('⏸️ Paused downloads', 'warning');
+      }
+      wasPaused = !wasPaused;
+    }
+    
+    async function scanUrl() {
+      const url = document.getElementById('newUrlInput').value.trim();
+      const folder = document.getElementById('folderOverride').value.trim();
+      
+      if (!url) {
+        showNotification('⚠️ Please enter a URL', 'warning');
+        return;
+      }
+      
+      try {
+        const res = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, folder: folder || undefined })
+        });
+        const data = await res.json();
+        
+        if (data.ok) {
+          showNotification('✅ URL scanned and added to queue', 'success');
+          document.getElementById('newUrlInput').value = '';
+          document.getElementById('folderOverride').value = '';
+          refreshData();
+        } else {
+          showNotification(`❌ ${data.error}`, 'error');
+        }
+      } catch (err) {
+        showNotification('❌ Failed to scan URL', 'error');
+      }
+    }
+    
+    async function purgeQueue() {
+      if (!confirm('⚠️ This will delete all pending, paused, and failed jobs. Continue?')) return;
+      
+      try {
+        const res = await fetch('/api/queue/purge', { method: 'POST' });
+        const data = await res.json();
+        showNotification(`🗑️ Purged ${data.deleted} jobs`, 'success');
+        refreshData();
+      } catch (err) {
+        showNotification('❌ Failed to purge queue', 'error');
+      }
+    }
+    
+    async function loadFailedItems() {
+      try {
+        const res = await fetch('/api/failed');
+        const data = await res.json();
+        
+        const container = document.getElementById('failedItems');
+        if (data.failed.length === 0) {
+          container.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No failed jobs</p>';
+          return;
+        }
+        
+        container.innerHTML = data.failed.map(job => `
+          <div class="history-item">
+            <h4>${escapeHtml(job.title)}</h4>
+            <p style="color: var(--danger); margin: 10px 0;">${escapeHtml(job.last_error || 'Unknown error')}</p>
+            <div class="history-meta">
+              <span>Folder: ${escapeHtml(job.folder)}</span>
+              <span>Retries: ${job.retry_count || 0}</span>
+              <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>
+              <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
+            </div>
+          </div>
+        `).join('');
+      } catch (err) {
+        document.getElementById('failedItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load failed items</p>';
+      }
+    }
+    
+    async function resetFailCount(id) {
+      await fetch(`/api/failcount/reset/${encodeURIComponent(id)}`, { method: 'POST' });
+      showNotification('🔢 Fail count reset', 'success');
+      loadFailedItems();
+    }
+    
+    async function loadHistory() {
+      try {
+        const res = await fetch('/api/history?limit=20');
+        const data = await res.json();
+        
+        const container = document.getElementById('historyItems');
+        if (data.history.length === 0) {
+          container.innerHTML = '<p style="padding: 20px; text-align: center; color: var(--text-secondary);">No run history available</p>';
+          return;
+        }
+        
+        container.innerHTML = data.history.map(run => {
+          const duration = run.duration_seconds ? `${Math.round(run.duration_seconds)}s` : '--';
+          return `
+            <div class="history-item">
+              <h4>Run #${run.id}</h4>
+              <div class="history-meta">
+                <span>Started: ${new Date(run.started_at).toLocaleString()}</span>
+                <span>Duration: ${duration}</span>
+                <span style="color: var(--success);">✅ ${run.downloaded || 0}</span>
+                <span style="color: var(--text-secondary);">⊘ ${run.skipped || 0}</span>
+                <span style="color: var(--danger);">❌ ${run.failed || 0}</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (err) {
+        document.getElementById('historyItems').innerHTML = '<p style="padding: 20px; color: var(--danger);">Failed to load history</p>';
+      }
+    }
+    
+    async function loadLogs() {
+      const logType = document.getElementById('logType').value;
+      try {
+        const res = await fetch(`/api/logs?type=${logType}&limit=100`);
+        const data = await res.json();
+        
+        const viewer = document.getElementById('logViewer');
+        if (data.logs && data.logs.length > 0) {
+          viewer.textContent = data.logs.join('\n');
+        } else {
+          viewer.textContent = 'No logs available';
+        }
+      } catch (err) {
+        document.getElementById('logViewer').textContent = 'Failed to load logs';
+      }
+    }
+    
+    // Utilities
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return "0 B";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0, v = bytes;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return `${v.toFixed(1)} ${units[i]}`;
+    }
+    
+    function formatBytesPerSec(bps) {
+      return bps <= 0 ? "0 B/s" : `${formatBytes(bps)}/s`;
+    }
+    
+    function formatETA(seconds) {
+      if (!seconds || seconds <= 0) return '--';
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+    
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.toString()
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+    
+    function filterJobs() {
+      fetchStatus();
+    }
+    
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      
+      switch(e.key) {
+        case 'p':
+          if (e.ctrlKey) { e.preventDefault(); togglePause(); }
+          break;
+        case 'r':
+          if (e.ctrlKey) { e.preventDefault(); refreshData(); }
+          break;
+        case '/':
+          e.preventDefault();
+          document.getElementById('searchInput').focus();
+          break;
+        case 'Escape':
+          document.getElementById('searchInput').blur();
+          break;
+      }
+    });
+    
+    // Initial load
+    refreshData();
+    setInterval(refreshData, 5000);
+  </script>
+</body>
+</html>

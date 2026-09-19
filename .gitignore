@@ -1,25 +1,59 @@
 ```
 # Dependencies
 node_modules/
-.bun/
-*.lock
+
+# Dependency files
+deno.lock
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db
 
 # Build outputs
 dist/
 build/
 target/
 
-# Logs and temp files
-*.log
-*.tmp
-*.swp
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+*.so
 
-# Environment
-.env
-.env.local
-*.env.*
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
 
-# IDE files
-.vscode/
-.idea/
+# Testing
+.mypy_cache/
+.pytest_cache/
+
+# Node.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 ```
