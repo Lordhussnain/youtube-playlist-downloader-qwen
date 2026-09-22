@@ -143,7 +143,51 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 - If `statfs` is unavailable, free space falls back to PowerShell
   (`Get-PSDrive`); if that also fails the engine runs in degraded mode
   instead of pausing forever
+What was added
+1. 📦 Standalone .exe (no Bun needed on Windows)
+PowerShell
 
+bun run build:win        # → dist\youtube-archive.exe  (86 MB, verified cross-compile)
+bun run build:win:all    # also builds archive-config.exe
+2. 🚀 start-archive.bat (double-click launcher, CRLF-encoded)
+chcp 65001 → emoji/UTF-8 render correctly even in old conhost
+Puts the app folder first on PATH → a yt-dlp.exe/ffmpeg.exe sitting next to the app "just works"
+Prefers archive.exe if present, falls back to bun run, pauses on error so messages don't vanish
+3. ⚙️ Auto-start via Task Scheduler — install-task.ps1
+PowerShell
+
+powershell -ExecutionPolicy Bypass -File .\install-task.ps1           # install (runs at logon)
+powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall # remove
+Battery-safe, restarts on failure (3×), no execution time limit, correct working directory.
+
+4. 🔎 Windows-aware tool auto-detection
+Search order: ytDlpPath/ffmpegPath in config.json → PATH → app folder → next to the compiled exe → winget/Scoop/Chocolatey shims. Startup prints exactly where each tool was found:
+
+text
+
+✅ yt-dlp: 2026.01.01  [C:\tools\yt-dlp.exe]
+✅ ffmpeg: 6.0         [PATH]
+New config keys editable via bun run config (blank = auto).
+
+5. 🛡️ Windows filename hardening (all verified live)
+Reserved device names: CON → 010 - _CON.mp4
+Trailing dots/spaces stripped: "Trailing dots... " → 012 - Trailing dots.mp4
+MAX_PATH protection: a 300-char title was truncated to 011 - LLL…L [vidLONG].mp4 — stays under 260 with sidecars, no registry long-path tweak needed
+6. 💾 Run-history heartbeat
+Row inserted at startup, flushed at 10s then every 60s. Tested with kill -9: history row survived with correct duration. Closing the window / taskkill /F no longer loses history. Added SIGBREAK handling for Ctrl+Break.
+
+7. 💿 Disk-check fallback
+statfs → if it fails on Windows → PowerShell Get-PSDrive → if that also fails, one warning + degraded mode (never permanently pauses the engine over a failed probe).
+
+Your Windows 11 quick start
+PowerShell
+
+git clone <repo> && cd <repo>
+bun run build:win                    # once
+copy dist\youtube-archive.exe .\
+# put yt-dlp.exe & ffmpeg.exe next to it (or winget install yt-dlp ffmpeg)
+bun run config                       # set links + paths
+start-archive.bat                    # run — or install-task.ps1 for auto-start
 ## License
 
 MIT — replace with your preferred license.
