@@ -8,6 +8,13 @@ deno.lock
 # Logs
 *.log
 
+# Runtime artifacts (database, generated config, downloads)
+archive.db
+archive.db-wal
+archive.db-shm
+config.json
+downloads/
+
 # Environment variables
 .env
 .env.local

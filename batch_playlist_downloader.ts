@@ -1,7 +1,7 @@
 // batch_playlist_downloader.ts (V5 - Resilient, Autonomous, Proxy-Free)
 // Run with: bun run batch_playlist_downloader.ts
 import { mkdir, unlink, readFile, writeFile, statfs, rm, stat, appendFile, readdir, cp, rename } from "node:fs/promises";
-import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from "node:fs";
 import { join, basename, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
@@ -50,7 +50,7 @@ function initDatabase() {
       retry_count INTEGER DEFAULT 0,
       last_error TEXT,
       folder TEXT,
-      index INTEGER,
+      "index" INTEGER,
       file_path TEXT,
       file_size INTEGER DEFAULT 0,
       integrity TEXT,
@@ -63,38 +63,47 @@ function initDatabase() {
   );
   db.run(`CREATE TABLE IF NOT EXISTS playlist_state (folder TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)`);
   db.run(`CREATE TABLE IF NOT EXISTS run_history (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, ended_at TEXT, duration_seconds REAL, downloaded INTEGER, skipped INTEGER, failed INTEGER, total_queued INTEGER)`);
+
+  // Claim transactions MUST be created here, after `db` is initialized.
+  // Defining them at module top-level would evaluate `db.transaction` while
+  // `db` is still undefined and crash the process on startup.
+  // Only 'pending' jobs are claimable: 'paused' jobs are held until a resume
+  // (global or bulk) re-queues them back to 'pending'.
+  claimDownloadJob = db.transaction((workerId: string) => {
+    const row = db.query(
+      `UPDATE jobs SET download_status = 'downloading', download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = (SELECT id FROM jobs WHERE download_status = 'pending' ORDER BY created_at, rowid LIMIT 1)
+      RETURNING *`
+    ).get(workerId) as Job | null;
+    return row;
+  });
+
+  claimConvertJob = db.transaction((workerId: string) => {
+    const row = db.query(
+      `UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = (SELECT id FROM jobs WHERE download_status = 'downloaded' AND conversion_status = 'pending' ORDER BY created_at, rowid LIMIT 1)
+      RETURNING *`
+    ).get(workerId) as Job | null;
+    return row;
+  });
 }
+
+type ClaimJobFn = (workerId: string) => Job | null;
+let claimDownloadJob: ClaimJobFn;
+let claimConvertJob: ClaimJobFn;
 
 function reconcileCrashedJobs() {
   const stmt = db.run(
     `UPDATE jobs SET 
-      download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
+      download_status = CASE WHEN download_status IN ('downloading', 'paused') THEN 'pending' ELSE download_status END,
       conversion_status = CASE WHEN conversion_status = 'in_progress' THEN 'pending' ELSE conversion_status END,
       download_claimed_by = NULL, download_claimed_at = NULL,
       conversion_claimed_by = NULL, conversion_claimed_at = NULL,
       updated_at = CURRENT_TIMESTAMP
-    WHERE download_status = 'downloading' OR conversion_status = 'in_progress'`
+    WHERE download_status IN ('downloading', 'paused') OR conversion_status = 'in_progress'`
   );
-  if (stmt.changes > 0) console.log(`🔄 Reconciled ${stmt.changes} crashed job(s) back to paused/pending.`);
+  if (stmt.changes > 0) console.log(`🔄 Reconciled ${stmt.changes} interrupted job(s) back to pending.`);
 }
-
-const claimDownloadJob = db.transaction((workerId: string) => {
-  const row = db.query(
-    `UPDATE jobs SET download_status = 'downloading', download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-    WHERE id = (SELECT id FROM jobs WHERE download_status IN ('pending', 'paused') ORDER BY created_at LIMIT 1)
-    RETURNING *`
-  ).get(workerId) as Job | null;
-  return row;
-});
-
-const claimConvertJob = db.transaction((workerId: string) => {
-  const row = db.query(
-    `UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-    WHERE id = (SELECT id FROM jobs WHERE download_status = 'downloaded' AND conversion_status = 'pending' ORDER BY created_at LIMIT 1)
-    RETURNING *`
-  ).get(workerId) as Job | null;
-  return row;
-});
 
 function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
@@ -166,19 +175,32 @@ const DEFAULT_CONFIG: Config = {
 let globalConfig: Config = { ...DEFAULT_CONFIG };
 
 async function loadConfig(): Promise<Config> {
+  let raw: string;
   try {
-    const raw = await readFile("./config.json", "utf-8");
+    raw = await readFile("./config.json", "utf-8");
+  } catch (err: any) {
+    // Only create a default config when the file genuinely does not exist —
+    // never overwrite an existing file because of a parse/validation error.
+    if (err?.code === "ENOENT") {
+      console.log("⚠️ config.json not found. Creating default...");
+      await writeFile("./config.json", JSON.stringify(DEFAULT_CONFIG, null, 2));
+      return { ...DEFAULT_CONFIG };
+    }
+    console.error("❌ Failed to read config.json:", err?.message || err);
+    process.exit(1);
+  }
+  try {
     const parsed = JSON.parse(raw);
     const merged = { ...DEFAULT_CONFIG, ...parsed };
     return ConfigSchema.parse(merged);
   } catch (err: any) {
-    if (err.name === 'ZodError') {
-      console.error("❌ Invalid config.json:", err.errors);
-      process.exit(1);
+    if (err?.name === "ZodError") {
+      // Zod v4 exposes validation problems via `issues` (not `errors`).
+      console.error("❌ Invalid config.json:", JSON.stringify(err.issues ?? [], null, 2));
+    } else {
+      console.error("❌ config.json contains invalid JSON:", err?.message || err);
     }
-    console.log("⚠️ config.json not found. Creating default...");
-    await writeFile("./config.json", JSON.stringify(DEFAULT_CONFIG, null, 2));
-    return DEFAULT_CONFIG;
+    process.exit(1);
   }
 }
 
@@ -245,6 +267,41 @@ function parseSpeedToBytesPerSec(speedStr: string): number {
 function sanitizeFolderName(name: string): string { return name.replace(/[/:*?"<>|]/g, " ").trim() || "playlist"; }
 function sanitizeFileName(name: string): string { return name.replace(/[\/:*?"<>|]/g, " ").trim() || "video"; }
 
+function logError(scope: string, message: string) {
+  try {
+    appendFileSync("error.log", `[${new Date().toISOString()}] [${scope}] ${message}\n`);
+    if (existsSync("error.log") && statSync("error.log").size > 1_000_000) {
+      const lines = readFileSync("error.log", "utf-8").split("\n");
+      writeFileSync("error.log", lines.slice(-400).join("\n"));
+    }
+  } catch {}
+}
+
+const MEDIA_EXTENSIONS = new Set([
+  "mp4", "mkv", "webm", "mov", "flv", "avi", "ts", "m4v",
+  "mp3", "m4a", "opus", "ogg", "flac", "wav", "aac", "ac3", "eac3", "3gp", "amr",
+]);
+
+// Fallback used when yt-dlp's `--print after_move:filepath` output was not
+// captured: locate the media file we expect from the output template.
+async function findDownloadedFile(dir: string, baseFilename: string): Promise<string> {
+  try {
+    const files = await readdir(dir);
+    const matches: { path: string; mtime: number }[] = [];
+    for (const f of files) {
+      if (!f.startsWith(baseFilename + ".")) continue;
+      const ext = f.split(".").pop()?.toLowerCase() || "";
+      if (!MEDIA_EXTENSIONS.has(ext)) continue;
+      const s = await stat(join(dir, f)).catch(() => null);
+      if (s?.isFile()) matches.push({ path: join(dir, f), mtime: s.mtimeMs });
+    }
+    matches.sort((a, b) => b.mtime - a.mtime);
+    return matches[0]?.path || "";
+  } catch {
+    return "";
+  }
+}
+
 function formatDuration(seconds: number): string {
   if (!seconds || seconds <= 0) return '--';
   if (seconds < 60) return `${Math.round(seconds)}s`;
@@ -285,6 +342,15 @@ function triggerPause(reason: string) {
 function triggerResume() {
   globalIsPaused = false;
   pauseReason = null;
+  try {
+    // Re-queue globally paused jobs. Jobs still holding a claim (actively
+    // downloading) are left alone — their worker will finish them naturally.
+    const stmt = db.run(
+      `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE download_status = 'paused' AND download_claimed_by IS NULL`
+    );
+    if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
+  } catch {}
 }
 
 async function checkInternet(): Promise<boolean> {
@@ -372,18 +438,23 @@ async function checkDiskSpace(path: string, minGB: number): Promise<{ free: numb
 // 6. SCANNING & INGESTION (BATCH)
 // ==========================================
 async function getPlaylistItems(url: string, config: Config) {
-  const proc = Bun.spawn(["yt-dlp", ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s", url], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["yt-dlp", ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s", url], { stdout: "pipe", stderr: "pipe" });
   const [out, , code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) return [];
   return out.split("\n").filter(l => l.trim()).map(line => {
-    const [playlist, id, title] = line.split("|||");
-    return { title: (title || "video").trim(), id: (id || "").trim(), playlist: (playlist || "playlist").trim() };
+    const [playlist, id, title, duration] = line.split("|||");
+    return {
+      title: (title || "video").trim(),
+      id: (id || "").trim(),
+      playlist: (playlist || "playlist").trim(),
+      duration: parseFloat(duration),
+    };
   }).filter(i => i.id);
 }
 
-async function scanAndIngest(url: string, config: Config, overrideFolderName?: string) {
+async function scanAndIngest(url: string, config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
   const items = await getPlaylistItems(url, config);
-  if (items.length === 0) return;
+  if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
@@ -393,15 +464,25 @@ async function scanAndIngest(url: string, config: Config, overrideFolderName?: s
   const wantDesc = config.writeDescription ? 1 : 0;
   const conversionStatus = (config.videoQuality === 'audio' || targetFormat !== 'mp4') ? 'pending' : 'not_needed';
 
+  let added = 0;
+  let skipped = 0;
   const insertTransaction = db.transaction((items: any[]) => {
-    const stmt = db.prepare(`INSERT OR IGNORE INTO jobs (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, index, download_status, conversion_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`);
+    const stmt = db.prepare(`INSERT OR IGNORE INTO jobs (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", download_status, conversion_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`);
     for (const item of items) {
-      if (isVideoInDb(item.id)) continue;
+      if (isVideoInDb(item.id)) { skipped++; stats.skipped++; continue; }
+      if (config.skipShorts && !config.downloadShorts && Number.isFinite(item.duration) && item.duration > 0 && item.duration < 60) {
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
       const index = getNextIndex(folder);
       stmt.run(item.id, `https://www.youtube.com/watch?v=${item.id}`, item.title, outputDir, targetFormat, wantSubs, wantThumb, wantDesc, folder, index, conversionStatus);
+      added++;
+      stats.totalQueued++;
     }
   });
   insertTransaction(items);
+  return { found: items.length, added, skipped };
 }
 
 // ==========================================
@@ -432,8 +513,13 @@ async function downloadWorker(id: number, config: Config) {
       const args = [
         "yt-dlp", job.url, ...cookiesArgs(config), "--format", format,
         "--concurrent-fragments", "16", "-o", outTemplate,
-        "--progress", "--progress-template", "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-        "--socket-timeout", "15", "--retries", "10", "--retry-sleep", "5", 
+        // --newline/--no-colors keep progress lines parseable from a pipe.
+        "--progress", "--newline", "--no-colors",
+        "--progress-template", "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
+        // Print the final path after all post-processing so we can record it.
+        // --print implies --simulate, so --no-simulate is required to actually write files.
+        "--print", "after_move:%(filepath)s", "--no-simulate",
+        "--socket-timeout", "15", "--retries", "10", "--retry-sleep", "5",
         "--fragment-retries", "10", "--extractor-retries", "5",
         "--continue", "--no-overwrites"
       ];
@@ -443,8 +529,14 @@ async function downloadWorker(id: number, config: Config) {
       if (job.want_description) args.push("--write-description");
       if (config.embedMetadata) args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
 
-      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+      // 15-minute watchdog: abort hung downloads instead of blocking a worker forever.
+      let timedOut = false;
+      const downloadCtl = new AbortController();
+      const downloadTimer = setTimeout(() => { timedOut = true; downloadCtl.abort(); }, 15 * 60 * 1000);
+      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal });
       activeProcs.set(id, proc);
+      // Drain stderr immediately so a chatty yt-dlp cannot deadlock on a full pipe buffer.
+      const stderrPromise = new Response(proc.stderr).text();
 
       let buffer = "";
       let finalFilePath: string | null = null;
@@ -457,7 +549,7 @@ async function downloadWorker(id: number, config: Config) {
         buffer += new TextDecoder().decode(value);
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-        
+
         for (const line of lines) {
           if (line.startsWith("PROGRESS:")) {
             const parts = line.replace("PROGRESS:", "").split("|");
@@ -468,20 +560,30 @@ async function downloadWorker(id: number, config: Config) {
             let pctNum = parseFloat(parts[0]);
             if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
             if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
-              db.run(`UPDATE jobs SET progress = ?, speed = ?, eta = ? WHERE id = ?`, [pctNum, bps, parseFloat(parts[2]) || 0, job.id]);
+              // Backfill file_size from progress so the global ETA has a total to work with.
+              const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
+              db.run(`UPDATE jobs SET progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size) WHERE id = ?`, [pctNum, bps, parseFloat(parts[2]) || 0, totalBytes, job.id]);
               const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
               const etaNum = parseFloat(parts[2]);
               const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
               updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
               lastProgressUpdate = Date.now();
             }
-          } else if (line.trim() && existsSync(line.trim())) {
-            finalFilePath = line.trim();
+          } else {
+            const trimmed = line.trim();
+            if (trimmed && existsSync(trimmed)) {
+              finalFilePath = trimmed;
+            } else {
+              // Capture paths embedded in yt-dlp status lines (merger output, etc.).
+              const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
+              if (m && existsSync(m[1])) finalFilePath = m[1];
+            }
           }
         }
       }
 
-      const [, code, signal] = await Promise.all([new Response(proc.stderr).text(), proc.exited, new Promise(r => setTimeout(r, 100))]);
+      const [stderrText, code] = await Promise.all([stderrPromise, proc.exited]);
+      clearTimeout(downloadTimer);
       activeProcs.delete(id);
 
       if (globalIsPaused) {
@@ -490,15 +592,22 @@ async function downloadWorker(id: number, config: Config) {
         continue;
       }
 
-      if (signal === "SIGABRT") throw new Error("Process timed out (15m)");
+      if (timedOut) throw new Error("Process timed out (15m)");
 
       if (code === 0) {
-        const filePath = finalFilePath || buffer.split("\n").reverse().find(l => l.trim() && existsSync(l.trim()))?.trim() || "";
-        const fileSize = filePath ? (await stat(filePath)).size : 0;
+        let filePath = finalFilePath || buffer.split("\n").reverse().find(l => l.trim() && existsSync(l.trim()))?.trim() || "";
+        if (!filePath) filePath = await findDownloadedFile(job.output_directory, baseFilename);
+        if (!filePath) {
+          logError("download", `${job.id} exited 0 but the output file could not be located: ${job.title}`);
+          throw new Error("Download finished but output file could not be located");
+        }
+        const fileSize = (await stat(filePath)).size;
         db.run(`UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = ?, progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, filePath, job.id]);
+        stats.downloaded++;
         updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
       } else {
-        throw new Error(buffer.split('\n').slice(-3).join(' '));
+        const tail = [stderrText, buffer].filter(Boolean).join("\n").split("\n").filter(l => l.trim()).slice(-4).join(" ");
+        throw new Error(tail || `yt-dlp exited with code ${code}`);
       }
     } catch (err: any) {
       if (globalIsPaused) {
@@ -538,11 +647,16 @@ async function downloadWorker(id: number, config: Config) {
       const retryCount = job.retry_count + 1;
       const newStatus = retryCount >= config.maxRetryAttempts ? 'failed' : 'pending';
       db.run(`UPDATE jobs SET download_status = ?, retry_count = ?, last_error = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [newStatus, retryCount, errMsg.slice(0, 500), job.id]);
+      if (newStatus === 'failed') {
+        stats.failed++;
+        logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+      }
       updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
     } finally {
       activeProcs.delete(id);
       autoscaler.clearWorker(id);
-      aliveDownloadWorkers.delete(id);
+      // NOTE: the worker stays alive across jobs — it is only removed from
+      // `aliveDownloadWorkers` when the while-loop exits (see main()).
     }
   }
 }
@@ -560,11 +674,21 @@ async function converterWorker(id: number, config: Config) {
       const sourcePath = job.file_path!;
       if (!sourcePath || !existsSync(sourcePath)) throw new Error("Source file missing");
       let finalPath = sourcePath;
-      if (!sourcePath.endsWith(".mp4") && config.videoQuality !== 'audio') {
+      const wantsMp3 = job.target_format === "mp3" || config.videoQuality === "audio";
+      if (wantsMp3 && !sourcePath.endsWith(".mp3")) {
+        // Audio archive: encode to the target .mp3 instead of leaving the
+        // source container (webm/m4a) untouched.
+        const mp3Path = sourcePath.replace(/\.[^.]+$/, ".mp3");
+        const proc = Bun.spawn(["ffmpeg", "-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", mp3Path], { stdout: "ignore", stderr: "pipe" });
+        const [ffErr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+        if (code !== 0) throw new Error(`FFmpeg mp3 encode failed: ${ffErr.split("\n").filter(l => l.trim()).slice(-2).join(" ")}`);
+        if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
+        finalPath = mp3Path;
+      } else if (!wantsMp3 && !sourcePath.endsWith(".mp4")) {
         const mp4Path = sourcePath.replace(/\.[^.]+$/, ".mp4");
         const proc = Bun.spawn(["ffmpeg", "-y", "-i", sourcePath, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", mp4Path], { stdout: "ignore", stderr: "pipe" });
-        const [, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-        if (code !== 0) throw new Error("FFmpeg remux failed");
+        const [ffErr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+        if (code !== 0) throw new Error(`FFmpeg remux failed: ${ffErr.split("\n").filter(l => l.trim()).slice(-2).join(" ")}`);
         if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
         finalPath = mp4Path;
       }
@@ -582,7 +706,10 @@ async function converterWorker(id: number, config: Config) {
       db.run(`UPDATE jobs SET conversion_status = 'done', file_path = ?, integrity = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [finalPath, integrity, job.id]);
       updateConvertWorkerLine(id, `✅ Done | ${job.title}`, config);
     } catch (err: any) {
-      db.run(`UPDATE jobs SET conversion_status = 'failed', last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [String(err).slice(0, 500), job.id]);
+      const errMsg = String(err).slice(0, 500);
+      db.run(`UPDATE jobs SET conversion_status = 'failed', last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [errMsg, job.id]);
+      stats.failed++;
+      logError("conversion", `${job.id} ${job.title}: ${errMsg}`);
       updateConvertWorkerLine(id, `❌ Failed | ${job.title}`, config);
     }
   }
@@ -650,6 +777,50 @@ function resetTerminal() {
 // ==========================================
 // 10. WEB UI SERVER
 // ==========================================
+function buildRunReport(): string[] {
+  try {
+    const totals = db.query(
+      `SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN download_status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN download_status = 'paused' THEN 1 ELSE 0 END) as paused,
+        SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
+        SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
+        SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN conversion_status = 'pending' THEN 1 ELSE 0 END) as conv_pending,
+        SUM(CASE WHEN conversion_status = 'in_progress' THEN 1 ELSE 0 END) as conv_active,
+        SUM(CASE WHEN conversion_status = 'done' THEN 1 ELSE 0 END) as conv_done,
+        SUM(CASE WHEN conversion_status = 'failed' THEN 1 ELSE 0 END) as conv_failed
+      FROM jobs`
+    ).get() as any;
+    const failures = db.query(
+      `SELECT id, title, retry_count, last_error FROM jobs
+       WHERE download_status = 'failed' OR conversion_status = 'failed'
+       ORDER BY updated_at DESC LIMIT 10`
+    ).all() as any[];
+    const lines: string[] = [];
+    lines.push(`=== Archive Engine Report — ${new Date().toISOString()} ===`);
+    lines.push(`Uptime: ${formatDuration(process.uptime())} | Engine: ${globalIsPaused ? `PAUSED (${pauseReason || "unknown"})` : "RUNNING"}`);
+    lines.push(`Workers: ${aliveDownloadWorkers.size}/${autoscaler.targetWorkers} download | Speed: ${formatBytesPerSec(autoscaler.getAggregateSpeed())}`);
+    lines.push(`Jobs — total: ${totals.total || 0}, pending: ${totals.pending || 0}, paused: ${totals.paused || 0}, downloading: ${totals.downloading || 0}, downloaded: ${totals.downloaded || 0}, failed: ${totals.failed || 0}`);
+    lines.push(`Conversion — pending: ${totals.conv_pending || 0}, in progress: ${totals.conv_active || 0}, done: ${totals.conv_done || 0}, failed: ${totals.conv_failed || 0}`);
+    lines.push(`This run — queued: ${stats.totalQueued}, downloaded: ${stats.downloaded}, skipped: ${stats.skipped}, failed: ${stats.failed}`);
+    if (failures.length > 0) {
+      lines.push("");
+      lines.push("Recent failures:");
+      for (const f of failures) {
+        lines.push(`  ✗ [${f.id}] ${f.title} (retries: ${f.retry_count || 0}) — ${f.last_error || "no error recorded"}`);
+      }
+    } else {
+      lines.push("");
+      lines.push("No failed jobs. All clear. ✅");
+    }
+    return lines;
+  } catch (e: any) {
+    return [`Failed to build report: ${e?.message || e}`];
+  }
+}
+
 function startWebServer(port: number) {
   return Bun.serve({
     port, hostname: "0.0.0.0",
@@ -671,6 +842,7 @@ function startWebServer(port: number) {
         const statsData = db.query(
           `SELECT 
             SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
+            SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
             SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
             SUM(CASE WHEN download_status = 'failed' OR conversion_status = 'failed' THEN 1 ELSE 0 END) as failed,
             COUNT(*) as total
@@ -708,10 +880,13 @@ function startWebServer(port: number) {
         return Response.json({
           stats: {
             totalQueued: statsData.queued || 0,
+            downloading: statsData.downloading || 0,
             downloaded: statsData.downloaded || 0,
             failed: statsData.failed || 0,
             total: statsData.total || 0
           },
+          queuePosition: statsData.queued || 0,
+          speed: avgSpeed,
           aggregateSpeed: formatBytesPerSec(avgSpeed),
           activeWorkers: aliveDownloadWorkers.size,
           targetWorkers: autoscaler.targetWorkers,
@@ -739,21 +914,24 @@ function startWebServer(port: number) {
       }
 
       if (url.pathname === "/api/scan" && req.method === "POST") {
-        const body = await req.json();
-        const { url: scanUrl, folder } = body;
+        const body = await req.json().catch(() => ({}));
+        const { url: scanUrl, folder } = body || {};
         if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
         try {
-          await scanAndIngest(scanUrl, globalConfig, folder);
-          return Response.json({ ok: true, message: `Scanned ${scanUrl}` });
+          const result = await scanAndIngest(scanUrl, globalConfig, folder);
+          const message = result.found === 0
+            ? `No videos found at ${scanUrl} (check the URL, network, or cookies)`
+            : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
+          return Response.json({ ok: true, message, ...result });
         } catch (e: any) {
+          logError("scan", `${scanUrl}: ${e?.message || e}`);
           return Response.json({ ok: false, error: e.message || "Scan failed" }, { status: 500 });
         }
       }
 
       if (url.pathname === "/api/queue/purge" && req.method === "POST") {
-        const stmt = db.prepare("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'failed')");
-        stmt.run();
-        return Response.json({ ok: true, deleted: stmt.changes });
+        const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'failed')");
+        return Response.json({ ok: true, deleted: result.changes });
       }
 
       if (url.pathname === "/api/pause" && req.method === "POST") { 
@@ -767,8 +945,41 @@ function startWebServer(port: number) {
 
       if (url.pathname.startsWith("/api/retry/") && req.method === "POST") {
         const id = decodeURIComponent(url.pathname.replace("/api/retry/", ""));
-        db.run(`UPDATE jobs SET download_status = 'pending', conversion_status = 'pending', retry_count = 0, last_error = NULL, progress = 0 WHERE id = ?`, [id]);
+        // Preserve 'not_needed' conversions — only re-queue real conversions.
+        db.run(`UPDATE jobs SET download_status = 'pending', conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END, retry_count = 0, last_error = NULL, progress = 0, download_claimed_by = NULL, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [id]);
         return Response.json({ ok: true });
+      }
+
+      if (url.pathname.startsWith("/api/failcount/reset/") && req.method === "POST") {
+        const id = decodeURIComponent(url.pathname.replace("/api/failcount/reset/", ""));
+        if (id) {
+          db.run(`UPDATE jobs SET retry_count = 0, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [id]);
+        }
+        return Response.json({ ok: true });
+      }
+
+      if (url.pathname === "/api/jobs/pause" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const ids = Array.isArray(body?.ids) ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500) : [];
+        if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
+        const placeholders = ids.map(() => "?").join(",");
+        const result = db.run(
+          `UPDATE jobs SET download_status = 'paused',
+             download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
+             updated_at = CURRENT_TIMESTAMP
+           WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
+          ids
+        );
+        return Response.json({ ok: true, paused: result.changes });
+      }
+
+      if (url.pathname === "/api/jobs/delete" && req.method === "POST") {
+        const body = await req.json().catch(() => ({}));
+        const ids = Array.isArray(body?.ids) ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500) : [];
+        if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
+        const placeholders = ids.map(() => "?").join(",");
+        const result = db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
+        return Response.json({ ok: true, deleted: result.changes });
       }
 
       if (url.pathname.startsWith("/api/jobs/") && req.method === "DELETE") {
@@ -793,7 +1004,9 @@ function startWebServer(port: number) {
         const limit = parseInt(url.searchParams.get("limit") || "100", 10);
         let logs: string[] = [];
         try {
-          if (logType === "error" && existsSync("error.log")) {
+          if (logType === "report") {
+            logs = buildRunReport();
+          } else if (existsSync("error.log")) {
             logs = readFileSync("error.log", "utf-8").split("\n").filter(l => l.trim()).slice(-limit);
           } else {
             logs = ["No logs available"];
@@ -825,11 +1038,23 @@ async function startAutonomousPolling(config: Config) {
 // ==========================================
 // 12. MAIN EXECUTION
 // ==========================================
+let isShuttingDown = false;
+
 async function handleShutdown(sig: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log(`\n🛑 ${sig} received. Gracefully stopping active downloads...`);
   triggerPause("SHUTDOWN_REQUESTED");
   await Bun.sleep(3000);
   abortController.abort();
+  try {
+    // Record this run so the History tab has something to show.
+    const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
+    db.run(
+      `INSERT INTO run_history (started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [fmt(startTime), fmt(Date.now()), (Date.now() - startTime) / 1000, stats.downloaded, stats.skipped, stats.failed, stats.totalQueued]
+    );
+  } catch {}
   webServer?.stop(true);
   resetTerminal();
   process.exit(0);
@@ -842,6 +1067,9 @@ async function main() {
   globalConfig = await loadConfig();
   initDatabase();
   reconcileCrashedJobs();
+  // Ensure the output root exists — otherwise statfs fails, the disk check
+  // reports 0 GB free, and the engine falsely pauses with LOW_DISK_SPACE.
+  await mkdir(globalConfig.outputRoot, { recursive: true });
   await cleanOrphanedFiles(globalConfig.outputRoot);
   autoscaler.init(globalConfig);
   
@@ -853,6 +1081,7 @@ async function main() {
 
   for (const url of globalConfig.playlists) await scanAndIngest(url, globalConfig);
   for (const url of globalConfig.channels) await scanAndIngest(url, globalConfig);
+  for (const url of globalConfig.channelPlaylists) await scanAndIngest(url, globalConfig);
 
   initDashboard(globalConfig);
   webServer = startWebServer(globalConfig.webPort);

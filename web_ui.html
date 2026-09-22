@@ -426,10 +426,10 @@
   </div>
   
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('jobs')">📋 Jobs</button>
-    <button class="tab" onclick="switchTab('failed')">❌ Failed</button>
-    <button class="tab" onclick="switchTab('history')">📜 History</button>
-    <button class="tab" onclick="switchTab('logs')">📝 Logs</button>
+    <button class="tab active" onclick="switchTab('jobs', this)">📋 Jobs</button>
+    <button class="tab" onclick="switchTab('failed', this)">❌ Failed</button>
+    <button class="tab" onclick="switchTab('history', this)">📜 History</button>
+    <button class="tab" onclick="switchTab('logs', this)">📝 Logs</button>
   </div>
   
   <div id="jobsTab" class="tab-content active">
@@ -507,14 +507,14 @@
       }, duration);
     }
     
-    // Tab switching
-    function switchTab(tabName) {
+    // Tab switching (btn is the clicked tab element, passed from the onclick handler)
+    function switchTab(tabName, btn) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      
-      event.target.classList.add('active');
+
+      if (btn) btn.classList.add('active');
       document.getElementById(`${tabName}Tab`).classList.add('active');
-      
+
       if (tabName === 'failed') loadFailedItems();
       if (tabName === 'history') loadHistory();
       if (tabName === 'logs') loadLogs();
@@ -546,61 +546,122 @@
     
     // Bulk actions
     async function bulkRetry() {
-      if (!confirm(`Retry ${selectedJobs.size} failed jobs?`)) return;
-      for (const id of selectedJobs) {
-        await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
-      }
+      const ids = [...selectedJobs];
+      if (ids.length === 0) return;
+      if (!confirm(`Retry ${ids.length} job(s)?`)) return;
       selectedJobs.clear();
+      updateBulkActions();
+      let okCount = 0;
+      for (const id of ids) {
+        try {
+          const res = await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+          if (res.ok) okCount++;
+        } catch {}
+      }
+      showNotification(`🔄 Queued ${okCount} job(s) for retry`, 'success');
       refreshData();
-      showNotification(`Retrying ${selectedJobs.size} jobs`, 'success');
     }
-    
+
     async function bulkPause() {
-      if (!confirm(`Pause ${selectedJobs.size} jobs?`)) return;
-      // Implementation would require backend endpoint for bulk pause
-      showNotification('Bulk pause not yet implemented', 'warning');
+      const ids = [...selectedJobs];
+      if (ids.length === 0) return;
+      if (!confirm(`Pause ${ids.length} job(s)?`)) return;
+      try {
+        const res = await fetch('/api/jobs/pause', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showNotification(`⏸️ Paused ${data.paused} job(s)`, 'success');
+          selectedJobs.clear();
+          updateBulkActions();
+          refreshData();
+        } else {
+          showNotification(`❌ ${data.error || 'Pause failed'}`, 'error');
+        }
+      } catch {
+        showNotification('❌ Failed to pause jobs', 'error');
+      }
     }
-    
+
     async function bulkDelete() {
-      if (!confirm(`Delete ${selectedJobs.size} jobs permanently?`)) return;
-      // Implementation would require backend endpoint for bulk delete
-      showNotification('Bulk delete not yet implemented', 'warning');
+      const ids = [...selectedJobs];
+      if (ids.length === 0) return;
+      if (!confirm(`Delete ${ids.length} job(s) permanently?`)) return;
+      try {
+        const res = await fetch('/api/jobs/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showNotification(`🗑️ Deleted ${data.deleted} job(s)`, 'success');
+          selectedJobs.clear();
+          updateBulkActions();
+          refreshData();
+        } else {
+          showNotification(`❌ ${data.error || 'Delete failed'}`, 'error');
+        }
+      } catch {
+        showNotification('❌ Failed to delete jobs', 'error');
+      }
     }
     
-    // Main data fetching
+    // Main data fetching — status stats and the jobs table come from two endpoints.
     async function fetchStatus() {
       try {
-        const res = await fetch('/api/status');
+        const [res, jobsRes] = await Promise.all([
+          fetch('/api/status'),
+          fetch('/api/jobs')
+        ]);
         const data = await res.json();
-        
+        const jobsData = jobsRes.ok ? await jobsRes.json() : { jobs: [] };
+
         document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
         document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
         document.getElementById('failedCount').textContent = data.stats?.failed || 0;
-        
-        const speed = data.speed || 0;
+        document.getElementById('completedSub').textContent = `${data.stats?.total || 0} total jobs`;
+
+        const speed = typeof data.speed === 'number' ? data.speed : 0;
         document.getElementById('aggregateSpeed').textContent = formatBytesPerSec(speed);
-        
+
         if (data.diskSpace) {
-          document.getElementById('diskFree').textContent = `${data.diskSpace.free} GB`;
+          // Backend already returns "X GB / Y GB" — do not append another unit.
+          document.getElementById('diskFree').textContent = data.diskSpace.free || '--';
           const percent = data.diskSpace.percent || 100;
           document.getElementById('diskBar').style.width = `${percent}%`;
         }
-        
-        document.getElementById('queuePosition').textContent = data.queuePosition || '--';
-        document.getElementById('globalETA').textContent = data.globalETA || '--';
+
+        document.getElementById('queuePosition').textContent = data.queuePosition ?? '--';
+        document.getElementById('globalETA').textContent = `ETA: ${data.globalETA || '--'}`;
         document.getElementById('activeWorkers').textContent = data.activeWorkers || 0;
-        
+
+        // Keep the pause button in sync with the server state.
+        const pauseBtn = document.getElementById('pauseBtn');
+        if (data.isPaused) {
+          pauseBtn.textContent = '▶️ Resume All';
+          pauseBtn.classList.remove('btn-warning');
+          pauseBtn.classList.add('btn-success');
+        } else {
+          pauseBtn.textContent = '⏸️ Pause All';
+          pauseBtn.classList.remove('btn-success');
+          pauseBtn.classList.add('btn-warning');
+        }
+
         if (data.isPaused && !wasPaused) {
-          showNotification('⏸️ Downloads paused', 'warning');
+          showNotification(`⏸️ Downloads paused${data.pauseReason ? ` (${data.pauseReason})` : ''}`, 'warning');
         }
         if ((data.stats?.failed || 0) > lastFailedCount) {
           showNotification(`❌ ${(data.stats?.failed || 0) - lastFailedCount} download(s) failed`, 'error');
         }
-        
+
         lastFailedCount = data.stats?.failed || 0;
         wasPaused = data.isPaused || false;
-        
-        renderJobs(data.jobs || []);
+
+        renderJobs(jobsData.jobs || []);
       } catch (err) {
         console.error('Failed to fetch status:', err);
       }
@@ -614,19 +675,32 @@
     function renderJobs(jobs) {
       const tbody = document.getElementById('jobsTableBody');
       const search = document.getElementById('searchInput').value.toLowerCase();
-      
-      const filtered = jobs.filter(job => 
-        job.title?.toLowerCase().includes(search) || 
+
+      const filtered = jobs.filter(job =>
+        job.title?.toLowerCase().includes(search) ||
         job.folder?.toLowerCase().includes(search)
       );
-      
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary);">${search ? 'No jobs match your search' : 'No jobs yet — add a playlist URL above'}</td></tr>`;
+        return;
+      }
+
       tbody.innerHTML = filtered.map(job => {
-        const progress = job.progress || 0;
-        const statusClass = `status-${job.download_status}`;
-        
+        const progress = Number(job.progress) || 0;
+        // Reflect conversion state once the download itself is complete.
+        let status = job.download_status;
+        if (status === 'downloaded') {
+          if (job.conversion_status === 'in_progress') status = 'converting';
+          else if (job.conversion_status === 'done') status = 'done';
+          else if (job.conversion_status === 'failed') status = 'failed';
+        }
+        const statusClass = `status-${status}`;
+        const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
+
         return `
           <tr data-job-id="${job.id}">
-            <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" onchange="toggleJobSelection('${job.id}')" /></td>
+            <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" ${isChecked} onchange="toggleJobSelection('${job.id}')" /></td>
             <td>${escapeHtml(job.title || 'Unknown')}</td>
             <td>
               ${job.download_status === 'downloading' ? `
@@ -638,9 +712,9 @@
             </td>
             <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
             <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
-            <td><span class="status-badge ${statusClass}">${job.download_status}</span></td>
+            <td><span class="status-badge ${statusClass}">${status}</span></td>
             <td>
-              ${job.download_status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
+              ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
             </td>
           </tr>
         `;
@@ -655,18 +729,24 @@
     
     async function togglePause() {
       const btn = document.getElementById('pauseBtn');
-      if (wasPaused) {
-        await fetch('/api/resume', { method: 'POST' });
-        btn.textContent = '⏸️ Pause All';
-        btn.classList.replace('btn-success', 'btn-warning');
-        showNotification('▶️ Resumed downloads', 'success');
-      } else {
-        await fetch('/api/pause', { method: 'POST' });
-        btn.textContent = '▶️ Resume All';
-        btn.classList.replace('btn-warning', 'btn-success');
-        showNotification('⏸️ Paused downloads', 'warning');
+      try {
+        if (wasPaused) {
+          await fetch('/api/resume', { method: 'POST' });
+          wasPaused = false;
+          btn.textContent = '⏸️ Pause All';
+          btn.classList.replace('btn-success', 'btn-warning');
+          showNotification('▶️ Resumed downloads', 'success');
+        } else {
+          await fetch('/api/pause', { method: 'POST' });
+          wasPaused = true;
+          btn.textContent = '▶️ Resume All';
+          btn.classList.replace('btn-warning', 'btn-success');
+          showNotification('⏸️ Paused downloads', 'warning');
+        }
+      } catch {
+        showNotification('❌ Failed to change pause state', 'error');
       }
-      wasPaused = !wasPaused;
+      // fetchStatus() keeps the button in sync with the server from here on.
     }
     
     async function scanUrl() {
@@ -685,9 +765,9 @@
           body: JSON.stringify({ url, folder: folder || undefined })
         });
         const data = await res.json();
-        
+
         if (data.ok) {
-          showNotification('✅ URL scanned and added to queue', 'success');
+          showNotification(`✅ ${data.message || 'URL scanned and added to queue'}`, 'success');
           document.getElementById('newUrlInput').value = '';
           document.getElementById('folderOverride').value = '';
           refreshData();

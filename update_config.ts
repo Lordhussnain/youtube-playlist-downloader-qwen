@@ -104,7 +104,11 @@ async function loadConfig(): Promise<Config> {
     return ConfigSchema.parse(merged); 
   } catch (err: any) {
     if (err.name === 'ZodError') {
-      console.error("❌ config.json is invalid or corrupted:", err.errors);
+      // Zod v4 exposes validation problems via `issues` (not `errors`).
+      console.error("❌ config.json is invalid or corrupted:", JSON.stringify(err.issues ?? [], null, 2));
+      console.log("Falling back to default configuration.");
+    } else {
+      console.error("❌ Failed to parse config.json:", err?.message || err);
       console.log("Falling back to default configuration.");
     }
     return { ...DEFAULT_CONFIG };
