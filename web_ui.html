@@ -442,6 +442,7 @@
           <th>Speed</th>
           <th>ETA</th>
           <th>Status</th>
+          <th>Metadata</th>
           <th>Action</th>
         </tr>
       </thead>
@@ -623,7 +624,8 @@
         document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
         document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
         document.getElementById('failedCount').textContent = data.stats?.failed || 0;
-        document.getElementById('completedSub').textContent = `${data.stats?.total || 0} total jobs`;
+        document.getElementById('completedSub').textContent =
+          `${data.stats?.total || 0} total · ${data.stats?.metadataPending || 0} meta pending · ${data.stats?.converting || 0} converting`;
 
         const speed = typeof data.speed === 'number' ? data.speed : 0;
         document.getElementById('aggregateSpeed').textContent = formatBytesPerSec(speed);
@@ -682,7 +684,7 @@
       );
 
       if (filtered.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary);">${search ? 'No jobs match your search' : 'No jobs yet — add a playlist URL above'}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary);">${search ? 'No jobs match your search' : 'No jobs yet — add a playlist URL above'}</td></tr>`;
         return;
       }
 
@@ -696,12 +698,23 @@
           else if (job.conversion_status === 'failed') status = 'failed';
         }
         const statusClass = `status-${status}`;
+        const statusLabel = status === 'pending' ? 'not started' : status;
+        const badgeText = status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)' : statusLabel;
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
+        const location = job.file_path || job.output_directory || job.folder || '';
+        const meta = job.metadata_status || 'not_needed';
+        const metaBadge = {
+          pending: '⏳ pending', in_progress: '🔄 working', done: '✅ done',
+          failed: '❌ failed', not_needed: '–'
+        }[meta] || escapeHtml(meta);
 
         return `
           <tr data-job-id="${job.id}">
             <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" ${isChecked} onchange="toggleJobSelection('${job.id}')" /></td>
-            <td>${escapeHtml(job.title || 'Unknown')}</td>
+            <td>
+              ${escapeHtml(job.title || 'Unknown')}
+              ${location ? `<div style="font-size: 0.72rem; color: var(--text-secondary); margin-top: 3px; word-break: break-all;" title="${escapeHtml(location)}">📍 ${escapeHtml(location)}</div>` : ''}
+            </td>
             <td>
               ${job.download_status === 'downloading' ? `
                 <div class="progress-bar" style="width: 150px;">
@@ -712,7 +725,8 @@
             </td>
             <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
             <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
-            <td><span class="status-badge ${statusClass}">${status}</span></td>
+            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span></td>
+            <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
               ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
             </td>

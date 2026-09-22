@@ -44,6 +44,7 @@ const ConfigSchema = z.object({
   maxFailuresPerVideo: z.number().min(1),
   minFreeSpaceGB: z.number().min(1),
   secondaryStoragePath: z.string(),
+  maxMetadataWorkers: z.number().min(1).max(10),
   daemonMode: z.boolean(),
   webPort: z.number().min(1).max(65535),
   rssEnabled: z.boolean(),
@@ -85,6 +86,7 @@ const DEFAULT_CONFIG: Config = {
   maxFailuresPerVideo: 4,
   minFreeSpaceGB: 10,
   secondaryStoragePath: "",
+  maxMetadataWorkers: 2,
   daemonMode: false,
   webPort: 3000,
   rssEnabled: true,
@@ -246,6 +248,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   console.log("\n— Concurrency —");
   config.maxConcurrentDownloads = await askNumber("Starting download workers", config.maxConcurrentDownloads, 1, 20);
   config.maxConcurrentConverts = await askNumber("Concurrent conversion workers", config.maxConcurrentConverts, 1, 10);
+  config.maxMetadataWorkers = await askNumber("Metadata workers (subs/thumbs/descriptions)", config.maxMetadataWorkers, 1, 10);
   
   // Autoscaling
   console.log("\n— Dynamic Autoscaling —");
