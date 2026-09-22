@@ -192,6 +192,8 @@ const ConfigSchema = z.object({
   maxBandwidthKBps: z.number().min(0),
   autoscaleEnabled: z.boolean(),
   denoPath: z.string(),
+  ytDlpPath: z.string(),
+  ffmpegPath: z.string(),
   validateCookiesOnStart: z.boolean(),
   outputRoot: z.string(),
   archiveFile: z.string(),
@@ -225,7 +227,7 @@ const DEFAULT_CONFIG: Config = {
   playlists: [], channels: [], channelPlaylists: [],
   maxConcurrentDownloads: 3, maxConcurrentConverts: 2, maxDownloadWorkers: 5, minDownloadWorkers: 1, maxMetadataWorkers: 2,
   maxBandwidthKBps: 0, autoscaleEnabled: true,
-  denoPath: "deno", validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
+  denoPath: "deno", ytDlpPath: "", ffmpegPath: "", validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
   deleteSourceAfterConvert: true, videoQuality: "1080p",
   downloadSubtitles: true, embedMetadata: true, writeInfoJson: true, writeDescription: true, writeThumbnail: true,
   archiveLiveStreams: false, verifyIntegrity: true, skipShorts: true, downloadShorts: false,
@@ -327,8 +329,38 @@ function parseSpeedToBytesPerSec(speedStr: string): number {
   return val * (multipliers[unit] || 1);
 }
 
-function sanitizeFolderName(name: string): string { return name.replace(/[/:*?"<>|]/g, " ").trim() || "playlist"; }
-function sanitizeFileName(name: string): string { return name.replace(/[\/:*?"<>|]/g, " ").trim() || "video"; }
+// Windows forbids these device names anywhere in a path (CON, NUL, COM1…).
+const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+// Strip characters Windows rejects, trailing dots/spaces (invisible in
+// Explorer but illegal on NTFS), and guard reserved device names.
+function hardenName(name: string): string {
+  let n = name.replace(/[\x00-\x1f]/g, " ").replace(/\s+/g, " ").trim();
+  n = n.replace(/[. ]+$/g, "");
+  if (!n) return "";
+  const stem = n.split(".")[0];
+  if (WINDOWS_RESERVED.test(stem)) n = `_${n}`;
+  return n;
+}
+
+function sanitizeFolderName(name: string): string {
+  return hardenName(name.replace(/[\/:*?"<>|]/g, " ").trim()) || "playlist";
+}
+function sanitizeFileName(name: string): string {
+  return hardenName(name.replace(/[\\/:*?"<>|]/g, " ").trim()) || "video";
+}
+
+// Keep generated filenames well under Windows' MAX_PATH (260) once the
+// directory and sidecar suffixes (.en.vtt, .info.json …) are added. Long
+// titles are truncated and made unique with the video id.
+function fitBaseFilename(dir: string, base: string, uniqueId: string): string {
+  const SIDE_MARGIN = 20; // ".%(ext)s" + language/extension suffixes + slack
+  const budget = 238 - dir.length - SIDE_MARGIN;
+  if (base.length <= budget) return base;
+  const idPart = ` [${uniqueId}]`;
+  const keep = Math.max(8, budget - idPart.length);
+  return base.slice(0, keep).trimEnd() + idPart;
+}
 
 function logError(scope: string, message: string) {
   try {
@@ -384,7 +416,7 @@ function cookiesArgs(config: Config): string[] {
 
 async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  const proc = Bun.spawn(["yt-dlp", "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([ytDlp(), "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"], { stdout: "pipe", stderr: "pipe" });
   const [, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   return code === 0 && !stderr.toLowerCase().includes("login required");
 }
@@ -407,24 +439,87 @@ async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; 
   }
 }
 
-// Verifies every required external tool BEFORE loading links or touching the
-// database, so misconfigured machines fail fast with a clear message.
-async function checkDependencies(): Promise<void> {
-  console.log("🔎 Checking dependencies...");
-  const required: { bin: string; args: string[]; hint: string }[] = [
-    { bin: "yt-dlp", args: ["--version"], hint: "Install: https://github.com/yt-dlp/yt-dlp#installation (e.g. pipx install yt-dlp / brew install yt-dlp)" },
-    { bin: "ffmpeg", args: ["-version"], hint: "Install: https://ffmpeg.org/download.html (e.g. apt install ffmpeg / brew install ffmpeg)" },
-  ];
-  const missing: string[] = [];
-  for (const dep of required) {
-    const probe = await probeBinary(dep.bin, dep.args);
-    if (probe.ok) {
-      console.log(`  ✅ ${dep.bin}: ${dep.version || "ok"}`);
-    } else {
-      console.error(`  ❌ ${dep.bin}: not found or not working`);
-      missing.push(`${dep.bin} — ${dep.hint}`);
+// Resolved tool locations — set by checkDependencies(), used everywhere so
+// custom Windows installs (exe next to the app, scoop, choco, winget, or an
+// explicit config path) all work without touching PATH.
+const resolvedTools = { ytDlp: "yt-dlp", ffmpeg: "ffmpeg" };
+function ytDlp(): string { return resolvedTools.ytDlp; }
+function ffmpeg(): string { return resolvedTools.ffmpeg; }
+
+// Candidate search order: explicit config path → PATH → app folder → folder of
+// the compiled exe → common Windows package-manager shims.
+function toolCandidates(cfgPath: string, posixNames: string[], winNames: string[]): string[] {
+  const cands: string[] = [];
+  if (cfgPath && cfgPath.trim()) cands.push(cfgPath.trim());
+  const cwd = process.cwd();
+  const exeDir = dirname(process.execPath);
+  for (const n of posixNames) {
+    cands.push(n);               // bare name → PATH lookup
+    cands.push(join(cwd, n));    // next to config.json / working dir
+    cands.push(join(exeDir, n)); // next to the compiled archive.exe
+  }
+  if (process.platform === "win32") {
+    const home = os.homedir();
+    const progData = process.env.ProgramData || "C:\\ProgramData";
+    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    for (const n of winNames) {
+      cands.push(
+        join(cwd, n),
+        join(exeDir, n),
+        join(progData, "chocolatey", "bin", n),
+        join(home, "scoop", "shims", n),
+        join(localAppData, "Microsoft", "WinGet", "Links", n),
+      );
     }
   }
+  const seen = new Set<string>();
+  return cands.filter(c => {
+    if (seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+}
+
+async function resolveTool(
+  cfgPath: string,
+  versionArgs: string[],
+  posixNames: string[],
+  winNames: string[],
+): Promise<{ path: string; version: string } | null> {
+  for (const cand of toolCandidates(cfgPath, posixNames, winNames)) {
+    const isBare = !cand.includes("/") && !cand.includes("\\");
+    if (!isBare && !existsSync(cand)) continue;
+    const probe = await probeBinary(cand, versionArgs);
+    if (probe.ok) return { path: cand, version: probe.version };
+  }
+  return null;
+}
+
+// Verifies every required external tool BEFORE opening the database or
+// scanning any links, so misconfigured machines fail fast with clear hints.
+async function checkDependencies(): Promise<void> {
+  console.log("🔎 Checking dependencies...");
+  const missing: string[] = [];
+  const [ytdlp, ffm] = await Promise.all([
+    resolveTool(globalConfig.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"]),
+    resolveTool(globalConfig.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"]),
+  ]);
+
+  if (ytdlp) {
+    resolvedTools.ytDlp = ytdlp.path;
+    console.log(`  ✅ yt-dlp: ${ytdlp.version || "ok"}${ytdlp.path.includes("/") || ytdlp.path.includes("\\") ? `  [${ytdlp.path}]` : "  [PATH]"}`);
+  } else {
+    console.error("  ❌ yt-dlp: not found (PATH, app folder, winget/scoop/chocolatey, ytDlpPath)");
+    missing.push(`yt-dlp — Install: winget install yt-dlp  |  scoop install yt-dlp  |  pipx install yt-dlp  |  or set "ytDlpPath" in config.json`);
+  }
+  if (ffm) {
+    resolvedTools.ffmpeg = ffm.path;
+    console.log(`  ✅ ffmpeg: ${ffm.version || "ok"}${ffm.path.includes("/") || ffm.path.includes("\\") ? `  [${ffm.path}]` : "  [PATH]"}`);
+  } else {
+    console.error("  ❌ ffmpeg: not found (PATH, app folder, winget/scoop/chocolatey, ffmpegPath)");
+    missing.push(`ffmpeg — Install: winget install ffmpeg  |  scoop install ffmpeg  |  choco install ffmpeg  |  or set "ffmpegPath" in config.json`);
+  }
+
   if (missing.length > 0) {
     const msg = `Missing required dependencies:\n${missing.map(m => `  • ${m}`).join("\n")}`;
     console.error(`\n❌ ${msg}\n`);
@@ -532,13 +627,38 @@ async function cleanOrphanedFiles(rootDir: string) {
   } catch {}
 }
 
+let diskCheckWarned = false;
+
 async function checkDiskSpace(path: string, minGB: number): Promise<{ free: number; ok: boolean }> {
   try {
     const stats = await statfs(path);
     const freeGB = stats.bavail * stats.bsize / (1024 ** 3);
     return { free: freeGB, ok: freeGB > minGB };
   } catch {
-    return { free: 0, ok: false };
+    // Windows fallback: some Bun builds lack statfs — ask PowerShell instead.
+    try {
+      if (process.platform === "win32") {
+        const root = resolve(path); // e.g. D:\Downloads\YT
+        const drive = root.slice(0, 1); // "D"
+        if (/^[A-Za-z]$/.test(drive)) {
+          const proc = Bun.spawn(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", `(Get-PSDrive -Name '${drive}').Free`],
+            { stdout: "pipe", stderr: "pipe" }
+          );
+          const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+          const freeGB = parseFloat(out.trim()) / (1024 ** 3);
+          if (code === 0 && Number.isFinite(freeGB)) return { free: freeGB, ok: freeGB > minGB };
+        }
+      }
+    } catch {}
+    // Degraded mode: never permanently brick the engine over a failed probe —
+    // log once and allow (yt-dlp will still surface a real disk-full error).
+    if (!diskCheckWarned) {
+      diskCheckWarned = true;
+      console.warn("⚠️ Could not determine free disk space — continuing without the low-disk guard.");
+      logError("disk", `statfs/PowerShell probe failed for ${path}; low-disk guard disabled for this run`);
+    }
+    return { free: -1, ok: true };
   }
 }
 
@@ -577,7 +697,7 @@ function reapStaleClaims() {
 // 6. SCANNING & INGESTION (BATCH)
 // ==========================================
 async function getPlaylistItems(url: string, config: Config) {
-  const proc = Bun.spawn(["yt-dlp", ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s", url], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s", url], { stdout: "pipe", stderr: "pipe" });
   const [out, , code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) return [];
   return out.split("\n").filter(l => l.trim()).map(line => {
@@ -649,11 +769,15 @@ async function downloadWorker(id: number, config: Config) {
     try {
       updateWorkerLine(id, `⬇️ Starting... | ${job.title}`, config);
       const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
-      const baseFilename = `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
+      const baseFilename = fitBaseFilename(
+        job.output_directory,
+        `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`,
+        job.id
+      );
       const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
 
       const args = [
-        "yt-dlp", job.url, ...cookiesArgs(config), "--format", format,
+        ytDlp(), job.url, ...cookiesArgs(config), "--format", format,
         "--concurrent-fragments", "16", "-o", outTemplate,
         // --newline/--no-colors keep progress lines parseable from a pipe.
         "--progress", "--newline", "--no-colors",
@@ -762,7 +886,7 @@ async function downloadWorker(id: number, config: Config) {
 
       if (errMsg.includes("signature") || errMsg.includes("unable to extract")) {
         console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
-        const updateProc = Bun.spawn(["yt-dlp", "-U"], { stdout: "pipe", stderr: "pipe" });
+        const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
         await updateProc.exited;
         db.run(`UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
         updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
@@ -814,7 +938,7 @@ async function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: num
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const proc = Bun.spawn(["ffmpeg", ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
+    const proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
     const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     return { code, stderr, timedOut: ctl.signal.aborted };
   } finally {
@@ -919,7 +1043,7 @@ async function metadataWorker(id: number, config: Config) {
       const outTemplate = join(mediaDir, `${mediaBase}.%(ext)s`);
 
       const args = [
-        "yt-dlp", job.url, ...cookiesArgs(config),
+        ytDlp(), job.url, ...cookiesArgs(config),
         "--skip-download", "--no-simulate", "-o", outTemplate,
         "--socket-timeout", "15", "--retries", "5", "--extractor-retries", "3",
         "--newline", "--no-colors",
@@ -1358,6 +1482,42 @@ async function startAutonomousPolling(config: Config) {
 // 12. MAIN EXECUTION
 // ==========================================
 let isShuttingDown = false;
+let runHistoryId: number | null = null;
+
+function runHistorySnapshot() {
+  const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
+  return [
+    fmt(Date.now()),
+    (Date.now() - startTime) / 1000,
+    stats.downloaded, stats.skipped, stats.failed, stats.totalQueued,
+  ] as const;
+}
+
+// Insert a run row at startup and refresh it every minute (heartbeat), so a
+// hard kill (window close, taskkill, power loss) still leaves usable history.
+function startRunHistory() {
+  try {
+    const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
+    const res = db.run(
+      `INSERT INTO run_history (started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued) VALUES (?, ?, ?, 0, 0, 0, 0)`,
+      [fmt(startTime), fmt(startTime), 0]
+    );
+    runHistoryId = Number(res.lastInsertRowid);
+  } catch (e: any) {
+    logError("history", String(e?.message || e));
+  }
+}
+
+function heartbeatRunHistory() {
+  if (runHistoryId == null) return;
+  try {
+    const [endedAt, duration, dl, sk, fl, tq] = runHistorySnapshot();
+    db.run(
+      `UPDATE run_history SET ended_at = ?, duration_seconds = ?, downloaded = ?, skipped = ?, failed = ?, total_queued = ? WHERE id = ?`,
+      [endedAt, duration, dl, sk, fl, tq, runHistoryId]
+    );
+  } catch {}
+}
 
 async function handleShutdown(sig: string) {
   if (isShuttingDown) return;
@@ -1389,12 +1549,8 @@ async function handleShutdown(sig: string) {
       `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
        WHERE metadata_status = 'in_progress'`
     );
-    // Record this run so the History tab has something to show.
-    const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
-    db.run(
-      `INSERT INTO run_history (started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [fmt(startTime), fmt(Date.now()), (Date.now() - startTime) / 1000, stats.downloaded, stats.skipped, stats.failed, stats.totalQueued]
-    );
+    // Final history flush (row was created at startup + heartbeated since).
+    heartbeatRunHistory();
   } catch {}
   webServer?.stop(true);
   resetTerminal();
@@ -1419,6 +1575,8 @@ function supervise(name: string, fn: () => Promise<void>) {
 async function main() {
   process.on("SIGINT", () => handleShutdown("SIGINT"));
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+  // Windows: Ctrl+Break / console close events surface as SIGBREAK.
+  process.on("SIGBREAK", () => handleShutdown("SIGBREAK"));
   process.on("unhandledRejection", (reason) => {
     logError("process", `unhandledRejection: ${reason instanceof Error ? (reason.stack || String(reason)) : String(reason)}`);
   });
@@ -1427,12 +1585,17 @@ async function main() {
     console.error("‼️ Uncaught exception (engine continues):", err);
   });
 
-  // 1) Dependencies first — fail fast with install hints.
-  await checkDependencies();
-  // 2) Load configuration, open/migrate the central database.
+  // 1) Load configuration first (dependency search may use ytDlpPath/ffmpegPath
+  //    from it), then verify external tools before touching the database.
   globalConfig = await loadConfig();
+  await checkDependencies();
+  // 2) Open/migrate the central database.
   initDatabase();
   reconcileCrashedJobs();
+  // Run history: row created now, heartbeated so hard kills still leave data.
+  startRunHistory();
+  setTimeout(heartbeatRunHistory, 10_000);
+  setInterval(heartbeatRunHistory, 60_000);
   // Ensure the output root exists — otherwise statfs fails, the disk check
   // reports 0 GB free, and the engine falsely pauses with LOW_DISK_SPACE.
   await mkdir(globalConfig.outputRoot, { recursive: true });

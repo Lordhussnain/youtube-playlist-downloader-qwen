@@ -24,6 +24,8 @@ const ConfigSchema = z.object({
   maxBandwidthKBps: z.number().min(0),
   autoscaleEnabled: z.boolean(),
   denoPath: z.string(),
+  ytDlpPath: z.string(),
+  ffmpegPath: z.string(),
   validateCookiesOnStart: z.boolean(),
   outputRoot: z.string(),
   archiveFile: z.string(),
@@ -66,6 +68,8 @@ const DEFAULT_CONFIG: Config = {
   maxBandwidthKBps: 0,
   autoscaleEnabled: true,
   denoPath: "deno",
+  ytDlpPath: "",
+  ffmpegPath: "",
   validateCookiesOnStart: true,
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
@@ -285,6 +289,12 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   console.log("\n— JS Runtime —");
   const denoAns = await ask(`   Deno path (directory or .exe) [current: ${config.denoPath}]: `);
   if (denoAns.trim()) config.denoPath = denoAns.trim();
+
+  console.log("\n— External Tools (Windows-friendly auto-detect) —");
+  const ytdlpAns = await ask(`   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `);
+  if (ytdlpAns.trim()) config.ytDlpPath = ytdlpAns.trim();
+  const ffAns = await ask(`   ffmpeg path (blank = auto-detect) [current: ${config.ffmpegPath || "auto"}]: `);
+  if (ffAns.trim()) config.ffmpegPath = ffAns.trim();
   
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;
