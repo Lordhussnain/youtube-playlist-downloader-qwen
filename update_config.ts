@@ -1,56 +1,62 @@
-// update_config.ts (V3)
+// update_config.ts (V5 - Proxy-Free, Zod-Validated)
 // Interactive configuration manager for the YouTube Archival Engine
 // Run with: bun run update_config.ts
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { z } from "zod";
 
 const CONFIG_PATH = "./config.json";
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
-// ---- Types & Defaults (MUST match batch_playlist_downloader.ts) ------------
-interface Config {
-  playlists: string[];
-  channels: string[];
-  channelPlaylists: string[];
-  maxConcurrentDownloads: number;
-  maxConcurrentConverts: number;
-  maxDownloadWorkers: number;
-  minDownloadWorkers: number;
-  maxBandwidthKBps: number;
-  autoscaleEnabled: boolean;
-  useProxies: boolean;
-  webshareApiKey: string;
-  maxProxyCount: number;
-  proxyFile: string;
-  denoPath: string;
-  validateCookiesOnStart: boolean;
-  outputRoot: string;
-  archiveFile: string;
-  cookiesFile: string;
-  deleteSourceAfterConvert: boolean;
-  videoQuality: "highest" | "1080p" | "720p" | "480p" | "audio";
-  downloadSubtitles: boolean;
-  embedMetadata: boolean;
-  writeInfoJson: boolean;
-  writeDescription: boolean;
-  writeThumbnail: boolean;
-  archiveLiveStreams: boolean;
-  verifyIntegrity: boolean;
-  skipShorts: boolean;
-  downloadShorts: boolean;
-  maxRetryAttempts: number;
-  maxFailures: number;
-  maxFailuresPerVideo: number;
-  minFreeSpaceGB: number;
-  secondaryStoragePath: string;
-  daemonMode: boolean;
-  webPort: number;
-  rssEnabled: boolean;
-  rssPollIntervalMinutes: number;
-  rescanIntervalHours: number;
-}
+// ==========================================
+// 1. ZOD SCHEMA & TYPES (Single Source of Truth)
+// ==========================================
+const ConfigSchema = z.object({
+  playlists: z.array(z.string()),
+  channels: z.array(z.string()),
+  channelPlaylists: z.array(z.string()),
+  maxConcurrentDownloads: z.number().min(1).max(20),
+  maxConcurrentConverts: z.number().min(1).max(10),
+  maxDownloadWorkers: z.number().min(1).max(20),
+  minDownloadWorkers: z.number().min(1).max(20),
+  maxBandwidthKBps: z.number().min(0),
+  autoscaleEnabled: z.boolean(),
+  ytDlpPath: z.string(),
+  ffmpegPath: z.string(),
+  validateCookiesOnStart: z.boolean(),
+  outputRoot: z.string(),
+  archiveFile: z.string(),
+  cookiesFile: z.string(),
+  deleteSourceAfterConvert: z.boolean(),
+  videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+  downloadSubtitles: z.boolean(),
+  embedMetadata: z.boolean(),
+  writeInfoJson: z.boolean(),
+  writeDescription: z.boolean(),
+  writeThumbnail: z.boolean(),
+  archiveLiveStreams: z.boolean(),
+  verifyIntegrity: z.boolean(),
+  skipShorts: z.boolean(),
+  downloadShorts: z.boolean(),
+  maxRetryAttempts: z.number().min(1),
+  maxFailures: z.number().min(1),
+  maxFailuresPerVideo: z.number().min(1),
+  minFreeSpaceGB: z.number().min(1),
+  secondaryStoragePath: z.string(),
+  maxMetadataWorkers: z.number().min(1).max(10),
+  daemonMode: z.boolean(),
+  webPort: z.number().min(1).max(65535),
+  webBind: z.string(),
+  webToken: z.string(),
+  rssEnabled: z.boolean(),
+  rssPollIntervalMinutes: z.number().min(1),
+  rescanIntervalHours: z.number().min(0),
+});
+
+// Infer the TypeScript type directly from Zod (No manual interface needed!)
+type Config = z.infer<typeof ConfigSchema>;
 
 const DEFAULT_CONFIG: Config = {
   playlists: [],
@@ -62,11 +68,8 @@ const DEFAULT_CONFIG: Config = {
   minDownloadWorkers: 1,
   maxBandwidthKBps: 0,
   autoscaleEnabled: true,
-  useProxies: true,
-  webshareApiKey: "YOUR_NEW_API_KEY_HERE",
-  maxProxyCount: 0,
-  proxyFile: "proxies.txt",
-  denoPath: "C:\\Users\\shahh\\.deno\\bin",
+  ytDlpPath: "",
+  ffmpegPath: "",
   validateCookiesOnStart: true,
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",
@@ -87,25 +90,43 @@ const DEFAULT_CONFIG: Config = {
   maxFailuresPerVideo: 4,
   minFreeSpaceGB: 10,
   secondaryStoragePath: "",
+  maxMetadataWorkers: 2,
   daemonMode: false,
   webPort: 3000,
+  webBind: "127.0.0.1",
+  webToken: "",
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
 };
 
-// ---- Load / Save -----------------------------------------------------------
+// ==========================================
+// 2. LOAD / SAVE WITH ZOD VALIDATION
+// ==========================================
 async function loadConfig(): Promise<Config> {
   if (!existsSync(CONFIG_PATH)) return { ...DEFAULT_CONFIG };
   try {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(await readFile(CONFIG_PATH, "utf-8")) };
-  } catch {
+    const raw = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
+    // Merge with defaults to fill any missing new keys, then validate
+    const merged = { ...DEFAULT_CONFIG, ...raw };
+    return ConfigSchema.parse(merged); 
+  } catch (err: any) {
+    if (err.name === 'ZodError') {
+      // Zod v4 exposes validation problems via `issues` (not `errors`).
+      console.error("❌ config.json is invalid or corrupted:", JSON.stringify(err.issues ?? [], null, 2));
+      console.log("Falling back to default configuration.");
+    } else {
+      console.error("❌ Failed to parse config.json:", err?.message || err);
+      console.log("Falling back to default configuration.");
+    }
     return { ...DEFAULT_CONFIG };
   }
 }
 
 async function saveConfig(config: Config) {
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
+  // Final safety check before writing to disk
+  const validated = ConfigSchema.parse(config);
+  await writeFile(CONFIG_PATH, JSON.stringify(validated, null, 2));
 }
 
 // ---- Prompt Helpers --------------------------------------------------------
@@ -233,6 +254,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   console.log("\n— Concurrency —");
   config.maxConcurrentDownloads = await askNumber("Starting download workers", config.maxConcurrentDownloads, 1, 20);
   config.maxConcurrentConverts = await askNumber("Concurrent conversion workers", config.maxConcurrentConverts, 1, 10);
+  config.maxMetadataWorkers = await askNumber("Metadata workers (subs/thumbs/descriptions)", config.maxMetadataWorkers, 1, 10);
   
   // Autoscaling
   console.log("\n— Dynamic Autoscaling —");
@@ -244,20 +266,21 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   
   // Bandwidth
   console.log("\n— Bandwidth Throttle —");
-  config.maxBandwidthKBps = await askNumber("Max bandwidth in KB/s (0 = unlimited)", config.maxBandwidthKBps, 0);
+  config.maxBandwidthKBps = await askNumber("Max bandwidth in KB/s (0 = unlimited, enforced via yt-dlp --limit-rate)", config.maxBandwidthKBps, 0);
   if (config.maxBandwidthKBps > 0) {
     console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap`);
   }
-  
-  // Proxies
-  console.log("\n— Proxies (Webshare API) —");
-  config.useProxies = await askYesNo("Use Webshare API-driven proxies?", config.useProxies);
-  if (config.useProxies) {
-    console.log("   ℹ️  Get an API key at https://www.webshare.io (Proxy > API).");
-    const apiKeyAns = await ask(`   Webshare API key [current: ${config.webshareApiKey}]: `);
-    if (apiKeyAns.trim()) config.webshareApiKey = apiKeyAns.trim();
-  }
-  
+
+  // Failure handling (circuit breaker)
+  console.log("\n— Failure Handling —");
+  config.maxRetryAttempts = await askNumber("Retries per video before it fails", config.maxRetryAttempts, 1);
+  config.maxFailuresPerVideo = await askNumber("Max failures per video (effective cap = min with retries)", config.maxFailuresPerVideo, 1);
+  config.maxFailures = await askNumber("Consecutive failures before the engine auto-pauses (circuit breaker)", config.maxFailures, 1);
+
+  // Download archive (yt-dlp idempotence)
+  const archAns = await ask(`   yt-dlp download-archive file [current: ${config.archiveFile}]: `);
+  if (archAns.trim() !== "") config.archiveFile = archAns.trim();
+
   // Storage Management
   console.log("\n— Storage Management —");
   config.minFreeSpaceGB = await askNumber("Min free space (GB) before pausing", config.minFreeSpaceGB, 1);
@@ -266,18 +289,32 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   
   // Web UI & Daemon
   console.log("\n— Web UI & Headless Daemon —");
-  config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from the Web UI)?", config.daemonMode);
+  config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from Web UI)?", config.daemonMode);
   config.webPort = await askNumber("Web UI port", config.webPort, 1, 65535);
-  if (config.daemonMode) {
-    config.rssEnabled = await askYesNo("Watch RSS feeds (subscribe to new uploads, cheap, ~15 min latency)?", config.rssEnabled);
-    config.rssPollIntervalMinutes = await askNumber("RSS poll interval (minutes)", config.rssPollIntervalMinutes, 1);
-    config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
+  const bindAns = await ask(`   Web UI bind address (127.0.0.1 = this PC only, 0.0.0.0 = reachable from LAN) [current: ${config.webBind}]: `);
+  if (bindAns.trim() !== "") config.webBind = bindAns.trim();
+  const tokenAns = await ask(`   Web UI access token (blank keeps current, '-' clears it) [current: ${config.webToken ? "(set)" : "none"}]: `);
+  if (tokenAns.trim() === "-") config.webToken = "";
+  else if (tokenAns.trim() !== "") config.webToken = tokenAns.trim();
+  if (config.webToken && config.webBind === "0.0.0.0") {
+    console.log("   ℹ️ UI reachable from the LAN with a token set — good.");
+  } else if (config.webBind === "0.0.0.0") {
+    console.log("   ⚠️ 0.0.0.0 without a token: anyone on your network can pause/purge jobs.");
   }
-  
-  // JS Runtime (yt-dlp signature extraction)
-  console.log("\n— JS Runtime —");
-  const denoAns = await ask(`   Deno path (directory or .exe) [current: ${config.denoPath}]: `);
-  if (denoAns.trim()) config.denoPath = denoAns.trim();
+
+  // Channel watching (RSS + rescans)
+  console.log("\n— Channel Watching —");
+  config.rssEnabled = await askYesNo("Watch channel RSS feeds for new uploads (cheap, ~15 min latency)?", config.rssEnabled);
+  if (config.rssEnabled) {
+    config.rssPollIntervalMinutes = await askNumber("RSS poll interval (minutes)", config.rssPollIntervalMinutes, 1);
+  }
+  config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
+
+  console.log("\n— External Tools (Windows-friendly auto-detect) —");
+  const ytdlpAns = await ask(`   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `);
+  if (ytdlpAns.trim()) config.ytDlpPath = ytdlpAns.trim();
+  const ffAns = await ask(`   ffmpeg path (blank = auto-detect) [current: ${config.ffmpegPath || "auto"}]: `);
+  if (ffAns.trim()) config.ffmpegPath = ffAns.trim();
   
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;
@@ -317,12 +354,12 @@ async function mainMenu() {
   while (true) {
     console.clear();
     console.log("=======================================");
-    console.log("  🎬 Archiver V3 Config Manager ");
+    console.log("  🎬 Archiver V5 Config Manager      ");
     console.log("=======================================\n");
     console.log("  1. Manage Standard Playlists");
     console.log("  2. Manage Channels (all uploads)");
     console.log("  3. Manage Channel Playlists");
-    console.log("  4. Change Download Settings (Quality, Concurrency, Autoscale, Bandwidth, Proxies, Storage, Web UI/daemon)");
+    console.log("  4. Change Download Settings (Quality, Concurrency, Autoscale, Storage, Web UI)");
     console.log("  5. Change Feature Toggles (Subs, Metadata, Shorts, Integrity)");
     console.log("  6. View Current Configuration");
     console.log("  7. Save and Exit");
@@ -338,8 +375,12 @@ async function mainMenu() {
       case "5": config = await changeFeatureToggles(config); break;
       case "6": await viewConfig(config); break;
       case "7":
-        await saveConfig(config);
-        console.log("\n✅ Configuration saved to " + CONFIG_PATH);
+        try {
+          await saveConfig(config);
+          console.log("\n✅ Configuration saved to " + CONFIG_PATH);
+        } catch (e: any) {
+          console.error("\n❌ Failed to save config:", e.message);
+        }
         rl.close();
         return;
       case "8":

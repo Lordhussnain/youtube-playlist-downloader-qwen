@@ -1,11 +1,13 @@
-// batch_playlist_downloader.ts (V3 - Central DB Pipeline)
+// batch_playlist_downloader.ts (V5 - Resilient, Autonomous, Proxy-Free)
 // Run with: bun run batch_playlist_downloader.ts
 import { mkdir, unlink, readFile, writeFile, statfs, rm, stat, appendFile, readdir, cp, rename } from "node:fs/promises";
-import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join, basename, resolve } from "node:path";
-import { networkInterfaces } from "node:os";
-import { createHash } from "node:crypto";
+import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from "node:fs";
+import { join, basename, resolve, dirname } from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { Database } from "bun:sqlite";
+import { z } from "zod";
+import os from "node:os";
 
 // ==========================================
 // 1. DATABASE & SCHEMA
@@ -14,20 +16,29 @@ let db: Database;
 
 interface Job {
   id: string; url: string; title: string; output_directory: string; target_format: string;
-  want_subtitles: number; want_thumbnail: number; want_description: number; want_info_json: number;
-  download_status: string; metadata_status: string; conversion_status: string;
-  download_claimed_by: string | null; conversion_claimed_by: string | null;
+  want_subtitles: number; want_thumbnail: number; want_description: number;
+  download_status: string; conversion_status: string; metadata_status: string;
+  pause_reason: string | null; metadata_retry_count: number; metadata_files: string | null;
+  download_claimed_by: string | null; download_claimed_at: string | null;
+  conversion_claimed_by: string | null; conversion_claimed_at: string | null;
   partial_file_path: string | null; retry_count: number; last_error: string | null;
   folder: string; index: number; file_path: string | null; file_size: number; integrity: string | null;
+  progress: number; speed: number; eta: number;
+  created_at: string; updated_at: string;
+}
+
+// Add a column to an existing table if an older database doesn't have it yet.
+function ensureColumn(table: string, column: string, ddl: string) {
+  const cols = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some(c => c.name === column)) db.run(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
 
 function initDatabase() {
   db = new Database("archive.db");
-  db.run("PRAGMA journal_mode = WAL;"); // Crucial for concurrent workers
+  db.run("PRAGMA journal_mode = WAL;");
   db.run("PRAGMA busy_timeout = 5000;");
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS jobs (
+  db.run(
+    `CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
       url TEXT,
       title TEXT,
@@ -36,65 +47,124 @@ function initDatabase() {
       want_subtitles INTEGER DEFAULT 0,
       want_thumbnail INTEGER DEFAULT 0,
       want_description INTEGER DEFAULT 0,
-      want_info_json INTEGER DEFAULT 1,
-      
-      download_status TEXT DEFAULT 'pending',   -- pending, downloading, paused, downloaded, failed
-      metadata_status TEXT DEFAULT 'done',      -- done, not_needed (handled by download worker)
-      conversion_status TEXT DEFAULT 'pending', -- pending, in_progress, done, failed, not_needed
-      
-      download_claimed_by TEXT, download_claimed_at TEXT,
-      conversion_claimed_by TEXT, conversion_claimed_at TEXT,
-      
+      download_status TEXT DEFAULT 'pending',
+      conversion_status TEXT DEFAULT 'pending',
+      metadata_status TEXT DEFAULT 'not_needed',
+      metadata_files TEXT,
+      pause_reason TEXT,
+      metadata_retry_count INTEGER DEFAULT 0,
+      download_claimed_by TEXT,
+      download_claimed_at TEXT,
+      conversion_claimed_by TEXT,
+      conversion_claimed_at TEXT,
       partial_file_path TEXT,
       retry_count INTEGER DEFAULT 0,
       last_error TEXT,
-      
       folder TEXT,
-      index INTEGER,
+      "index" INTEGER,
       file_path TEXT,
       file_size INTEGER DEFAULT 0,
       integrity TEXT,
-      playlist_count INTEGER DEFAULT 1,
-      
+      progress REAL DEFAULT 0,
+      speed REAL DEFAULT 0,
+      eta REAL DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Keep auxiliary tables for RSS, Playlist Indexing, and History
+    )`
+  );
   db.run(`CREATE TABLE IF NOT EXISTS playlist_state (folder TEXT PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS rss_state (source TEXT PRIMARY KEY, channel_id TEXT, channel TEXT, last_poll TEXT, last_error TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS discovered_playlists (channel_id TEXT NOT NULL, playlist_id TEXT NOT NULL, title TEXT, updated_at TEXT, PRIMARY KEY (channel_id, playlist_id))`);
   db.run(`CREATE TABLE IF NOT EXISTS run_history (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, ended_at TEXT, duration_seconds REAL, downloaded INTEGER, skipped INTEGER, failed INTEGER, total_queued INTEGER)`);
+
+  // Schema migrations for databases created by older versions.
+  ensureColumn("jobs", "metadata_status", "metadata_status TEXT DEFAULT 'not_needed'");
+  ensureColumn("jobs", "metadata_files", "metadata_files TEXT");
+  ensureColumn("jobs", "pause_reason", "pause_reason TEXT");
+  ensureColumn("jobs", "metadata_retry_count", "metadata_retry_count INTEGER DEFAULT 0");
+  db.run(
+    `UPDATE jobs SET metadata_status = CASE
+       WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
+       ELSE 'not_needed' END
+     WHERE metadata_status IS NULL OR metadata_status = ''`
+  );
+
+  // Claim transactions MUST be created here, after `db` is initialized.
+  // Defining them at module top-level would evaluate `db.transaction` while
+  // `db` is still undefined and crash the process on startup.
+  //
+  // Download claim — atomic so two workers can never grab the same video:
+  //   'pending'                  → not started yet
+  //   'paused' + interrupted     → resumed automatically after a crash/shutdown
+  //   'paused' + 'user'          → held until an explicit Resume
+  claimDownloadJob = db.transaction((workerId: string) => {
+    const row = db.query(
+      `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL, download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE download_status = 'pending'
+           OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
+        ORDER BY created_at, rowid LIMIT 1
+      )
+      RETURNING *`
+    ).get(workerId) as Job | null;
+    return row;
+  });
+
+  // Converter claim — only after download AND metadata work are terminal.
+  claimConvertJob = db.transaction((workerId: string) => {
+    const row = db.query(
+      `UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE download_status = 'downloaded' AND conversion_status = 'pending'
+          AND metadata_status IN ('done', 'not_needed', 'failed')
+        ORDER BY created_at, rowid LIMIT 1
+      )
+      RETURNING *`
+    ).get(workerId) as Job | null;
+    return row;
+  });
+
+  // Metadata claim — sidecars (subs/thumbnail/description/info.json) for
+  // finished downloads whose flags say metadata is wanted.
+  claimMetadataJob = db.transaction((workerId: string) => {
+    const row = db.query(
+      `UPDATE jobs SET metadata_status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE download_status = 'downloaded' AND metadata_status = 'pending'
+        ORDER BY created_at, rowid LIMIT 1
+      )
+      RETURNING *`
+    ).get(workerId) as Job | null;
+    return row;
+  });
 }
 
-// 🛡️ CRASH RECOVERY: Reset interrupted jobs to paused/pending so they resume
+type ClaimJobFn = (workerId: string) => Job | null;
+let claimDownloadJob: ClaimJobFn;
+let claimConvertJob: ClaimJobFn;
+let claimMetadataJob: ClaimJobFn;
+
 function reconcileCrashedJobs() {
-  const stmt = db.run(`
-    UPDATE jobs SET 
+  // Interrupted mid-download jobs become 'paused' + 'interrupted' so they are
+  // visible as paused AND automatically re-claimed (resuming where they left
+  // off via yt-dlp --continue). User-paused jobs stay held.
+  const stmt = db.run(
+    `UPDATE jobs SET
       download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
+      pause_reason = CASE WHEN download_status = 'downloading' OR (download_status = 'paused' AND pause_reason IS NULL) THEN 'interrupted' ELSE pause_reason END,
       conversion_status = CASE WHEN conversion_status = 'in_progress' THEN 'pending' ELSE conversion_status END,
-      download_claimed_by = NULL, conversion_claimed_by = NULL,
+      metadata_status = CASE WHEN metadata_status = 'in_progress' THEN 'pending' ELSE metadata_status END,
+      download_claimed_by = NULL, download_claimed_at = NULL,
+      conversion_claimed_by = NULL, conversion_claimed_at = NULL,
       updated_at = CURRENT_TIMESTAMP
-    WHERE download_status = 'downloading' OR conversion_status = 'in_progress'
-  `);
-  if (stmt.changes > 0) console.log(`🔄 Reconciled ${stmt.changes} crashed job(s) back to paused/pending.`);
+    WHERE download_status = 'downloading'
+       OR (download_status = 'paused' AND pause_reason IS NULL)
+       OR conversion_status = 'in_progress'
+       OR metadata_status = 'in_progress'`
+  );
+  if (stmt.changes > 0) console.log(`🔄 Reconciled ${stmt.changes} interrupted job(s) — paused/interrupted jobs will resume automatically.`);
 }
-
-// 🌟 ATOMIC CLAIMING: Prevents two workers from grabbing the same job
-const claimDownloadJob = db.transaction((workerId: string) => {
-  const row = db.query(`SELECT id FROM jobs WHERE download_status IN ('pending', 'paused') ORDER BY created_at LIMIT 1`).get() as { id: string } | null;
-  if (!row) return null;
-  db.run(`UPDATE jobs SET download_status = 'downloading', download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [workerId, row.id]);
-  return db.query(`SELECT * FROM jobs WHERE id = ?`).get(row.id) as Job;
-});
-
-const claimConvertJob = db.transaction((workerId: string) => {
-  const row = db.query(`SELECT id FROM jobs WHERE download_status = 'downloaded' AND conversion_status = 'pending' ORDER BY created_at LIMIT 1`).get() as { id: string } | null;
-  if (!row) return null;
-  db.run(`UPDATE jobs SET conversion_status = 'in_progress', conversion_claimed_by = ?, conversion_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [workerId, row.id]);
-  return db.query(`SELECT * FROM jobs WHERE id = ?`).get(row.id) as Job;
-});
 
 function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
@@ -108,117 +178,291 @@ function getNextIndex(folder: string): number {
 }
 
 // ==========================================
-// 2. CONFIG & TYPES
+// 2. CONFIG WITH ZOD VALIDATION
 // ==========================================
-interface Config {
-  playlists: string[]; channels: string[]; channelPlaylists: string[];
-  maxConcurrentDownloads: number; maxConcurrentConverts: number;
-  maxDownloadWorkers: number; minDownloadWorkers: number;
-  maxBandwidthKBps: number; autoscaleEnabled: boolean;
-  useProxies: boolean; webshareApiKey: string; maxProxyCount: number; proxyFile: string;
-  denoPath: string; validateCookiesOnStart: boolean; outputRoot: string; archiveFile: string; cookiesFile: string;
-  deleteSourceAfterConvert: boolean; videoQuality: "highest" | "1080p" | "720p" | "480p" | "audio";
-  downloadSubtitles: boolean; embedMetadata: boolean; writeInfoJson: boolean; writeDescription: boolean; writeThumbnail: boolean;
-  archiveLiveStreams: boolean; verifyIntegrity: boolean; skipShorts: boolean; downloadShorts: boolean;
-  maxRetryAttempts: number; maxFailures: number; maxFailuresPerVideo: number;
-  minFreeSpaceGB: number; secondaryStoragePath: string;
-  daemonMode: boolean; webPort: number; rssEnabled: boolean; rssPollIntervalMinutes: number; rescanIntervalHours: number;
-}
+const ConfigSchema = z.object({
+  playlists: z.array(z.string()),
+  channels: z.array(z.string()),
+  channelPlaylists: z.array(z.string()),
+  maxConcurrentDownloads: z.number().min(1).max(20),
+  maxConcurrentConverts: z.number().min(1).max(10),
+  maxDownloadWorkers: z.number().min(1).max(20),
+  minDownloadWorkers: z.number().min(1).max(20),
+  maxMetadataWorkers: z.number().min(1).max(10),
+  maxBandwidthKBps: z.number().min(0),
+  autoscaleEnabled: z.boolean(),
+  ytDlpPath: z.string(),
+  ffmpegPath: z.string(),
+  validateCookiesOnStart: z.boolean(),
+  outputRoot: z.string(),
+  archiveFile: z.string(),
+  cookiesFile: z.string(),
+  deleteSourceAfterConvert: z.boolean(),
+  videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+  downloadSubtitles: z.boolean(),
+  embedMetadata: z.boolean(),
+  writeInfoJson: z.boolean(),
+  writeDescription: z.boolean(),
+  writeThumbnail: z.boolean(),
+  archiveLiveStreams: z.boolean(),
+  verifyIntegrity: z.boolean(),
+  skipShorts: z.boolean(),
+  downloadShorts: z.boolean(),
+  maxRetryAttempts: z.number().min(1),
+  maxFailures: z.number().min(1),
+  maxFailuresPerVideo: z.number().min(1),
+  minFreeSpaceGB: z.number().min(1),
+  secondaryStoragePath: z.string(),
+  daemonMode: z.boolean(),
+  webPort: z.number().min(1).max(65535),
+  // Security: webBind restricts which interface the UI listens on (loopback
+  // only by default), webToken gates every request behind a shared secret.
+  webBind: z.string(),
+  webToken: z.string(),
+  rssEnabled: z.boolean(),
+  rssPollIntervalMinutes: z.number().min(1),
+  rescanIntervalHours: z.number().min(0),
+});
+
+type Config = z.infer<typeof ConfigSchema>;
 
 const DEFAULT_CONFIG: Config = {
   playlists: [], channels: [], channelPlaylists: [],
-  maxConcurrentDownloads: 3, maxConcurrentConverts: 2, maxDownloadWorkers: 5, minDownloadWorkers: 1,
-  maxBandwidthKBps: 0, autoscaleEnabled: true, useProxies: true, webshareApiKey: "YOUR_NEW_API_KEY_HERE",
-  maxProxyCount: 0, proxyFile: "proxies.txt", denoPath: "C:\\Users\\shahh\\.deno\\bin",
-  validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
+  maxConcurrentDownloads: 3, maxConcurrentConverts: 2, maxDownloadWorkers: 5, minDownloadWorkers: 1, maxMetadataWorkers: 2,
+  maxBandwidthKBps: 0, autoscaleEnabled: true,
+  ytDlpPath: "", ffmpegPath: "", validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
   deleteSourceAfterConvert: true, videoQuality: "1080p",
   downloadSubtitles: true, embedMetadata: true, writeInfoJson: true, writeDescription: true, writeThumbnail: true,
   archiveLiveStreams: false, verifyIntegrity: true, skipShorts: true, downloadShorts: false,
   maxRetryAttempts: 3, maxFailures: 10, maxFailuresPerVideo: 4,
   minFreeSpaceGB: 10, secondaryStoragePath: "",
-  daemonMode: false, webPort: 3000, rssEnabled: true, rssPollIntervalMinutes: 15, rescanIntervalHours: 24,
+  daemonMode: false, webPort: 3000, webBind: "127.0.0.1", webToken: "",
+  rssEnabled: true, rssPollIntervalMinutes: 15, rescanIntervalHours: 24,
 };
 
 let globalConfig: Config = { ...DEFAULT_CONFIG };
+
 async function loadConfig(): Promise<Config> {
+  let raw: string;
   try {
-    const raw = await readFile("./config.json", "utf-8");
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
-  } catch {
-    await writeFile("./config.json", JSON.stringify(DEFAULT_CONFIG, null, 2));
-    return DEFAULT_CONFIG;
+    raw = await readFile("./config.json", "utf-8");
+  } catch (err: any) {
+    // Only create a default config when the file genuinely does not exist —
+    // never overwrite an existing file because of a parse/validation error.
+    if (err?.code === "ENOENT") {
+      console.log("⚠️ config.json not found. Creating default...");
+      await writeFile("./config.json", JSON.stringify(DEFAULT_CONFIG, null, 2));
+      return { ...DEFAULT_CONFIG };
+    }
+    console.error("❌ Failed to read config.json:", err?.message || err);
+    process.exit(1);
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    const merged = { ...DEFAULT_CONFIG, ...parsed };
+    return ConfigSchema.parse(merged);
+  } catch (err: any) {
+    if (err?.name === "ZodError") {
+      // Zod v4 exposes validation problems via `issues` (not `errors`).
+      console.error("❌ Invalid config.json:", JSON.stringify(err.issues ?? [], null, 2));
+    } else {
+      console.error("❌ config.json contains invalid JSON:", err?.message || err);
+    }
+    process.exit(1);
   }
 }
 
 const QUALITY_FORMATS: Record<string, string> = {
-  highest: "bv*+ba/b", "1080p": "bv*[height<=1080]+ba/b", "720p": "bv*[height<=720]+ba/b", "480p": "bv*[height<=480]+ba/b", audio: "ba/b"
+  highest: "bv+ba/b",
+  "1080p": "bv[height<=1080]+ba/b[height<=1080]",
+  "720p": "bv[height<=720]+ba/b[height<=720]",
+  "480p": "bv[height<=480]+ba/b[height<=480]",
+  audio: "ba/bestaudio"
 };
 
 // ==========================================
-// 3. GLOBAL STATE & UTILS
+// 3. GLOBAL STATE
 // ==========================================
 let globalIsPaused = false;
 let pauseReason: string | null = null;
 const workerStatuses = new Map<string, string>();
+const stats = { downloaded: 0, skipped: 0, failed: 0, totalQueued: 0, metadata: 0, converted: 0 };
+const playlistStates = new Map<string, { downloaded: number; skipped: number; total: number }>();
 let webServer: any = null;
 const abortController = new AbortController();
 let isTTY = process.stdout.isTTY;
 const startTime = Date.now();
+const activeProcs = new Map<number, Bun.Subprocess>();
+const activeMetadataProcs = new Map<number, Bun.Subprocess>();
 
-// Autoscaler state
 const autoscaler = {
   enabled: true, targetWorkers: 3, minWorkers: 1, maxWorkers: 5,
-  bandwidthMultiplier: 1.0, maxBandwidthKBps: 0,
-  workerSpeeds: new Map<number, number>(),
+  maxBandwidthKBps: 0, workerSpeeds: new Map<number, number>(),
   init(c: Config) {
     this.enabled = c.autoscaleEnabled; this.minWorkers = c.minDownloadWorkers; this.maxWorkers = c.maxDownloadWorkers;
     this.maxBandwidthKBps = c.maxBandwidthKBps; this.targetWorkers = Math.max(this.minWorkers, Math.min(c.maxConcurrentDownloads, this.maxWorkers));
+    setActiveSlots(this.targetWorkers);
   },
   recordSpeed(id: number, bps: number) { this.workerSpeeds.set(id, bps); },
   clearWorker(id: number) { this.workerSpeeds.delete(id); },
   getAggregateSpeed() { let s = 0; for (const v of this.workerSpeeds.values()) s += v; return s; },
 };
 
+// Dynamic download slots: all maxDownloadWorkers processes are supervised and
+// alive, but only the ones whose id is in activeDlSlots may claim jobs. The
+// autoscaler adds/removes slot ids — a slot removed mid-download lets its
+// worker finish the current job and then idle.
+const activeDlSlots = new Set<number>();
+
+function setActiveSlots(target: number) {
+  const clamped = Math.max(1, Math.min(Math.round(target), 20));
+  if (clamped > activeDlSlots.size) {
+    for (let i = 1; i <= 20 && activeDlSlots.size < clamped; i++) activeDlSlots.add(i);
+  } else if (clamped < activeDlSlots.size) {
+    for (let i = 20; i >= 1 && activeDlSlots.size > clamped; i--) activeDlSlots.delete(i);
+  }
+}
+
+// Autoscale tick (every 15s when autoscaleEnabled): grow toward
+// maxDownloadWorkers while the queue has backlog and bandwidth headroom, shed
+// slots when the aggregate speed saturates the configured cap, and fall back
+// to minDownloadWorkers when there is nothing to do. With autoscaling
+// disabled the slot count stays pinned to maxConcurrentDownloads.
+function autoscaleTick() {
+  if (!autoscaler.enabled) {
+    setActiveSlots(Math.max(autoscaler.minWorkers, Math.min(globalConfig.maxConcurrentDownloads, autoscaler.maxWorkers)));
+    autoscaler.targetWorkers = activeDlSlots.size;
+    return;
+  }
+  try {
+    const q = db.query(
+      `SELECT SUM(CASE WHEN download_status = 'pending'
+            OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
+          THEN 1 ELSE 0 END) as backlog
+       FROM jobs`
+    ).get() as any;
+    const backlog = q?.backlog || 0;
+    const aggBps = autoscaler.getAggregateSpeed();
+    const capBps = autoscaler.maxBandwidthKBps * 1024;
+    let target = activeDlSlots.size;
+    if (backlog === 0) {
+      target = autoscaler.minWorkers;
+    } else if (capBps > 0 && aggBps > capBps * 0.9 && target > autoscaler.minWorkers) {
+      target--; // bandwidth saturated — fewer slots = more headroom each
+    } else if (backlog > target && target < autoscaler.maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
+      target++; // waiting jobs + bandwidth headroom — add one slot per tick
+    }
+    setActiveSlots(target);
+    autoscaler.targetWorkers = activeDlSlots.size;
+  } catch {}
+}
+
 const aliveDownloadWorkers = new Set<number>();
 let activeConverts = 0;
 
 function formatBytes(bytes: number): string {
   if (!bytes || bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"]; let i = 0, v = bytes;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = bytes;
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(1)}${units[i]}`;
+  return `${v.toFixed(1)} ${units[i]}`;
 }
-function formatBytesPerSec(bps: number): string { return bps <= 0 ? "0 B/s" : `${formatBytes(bps)}/s`; }
-function sanitizeFolderName(name: string): string { return name.replace(/[\/:*?"<>|]/g, "_").trim() || "playlist"; }
+
+function formatBytesPerSec(bps: number): string {
+  if (!bps || bps <= 0) return "0 B/s";
+  return formatBytes(bps) + "/s";
+}
+
+function parseSpeedToBytesPerSec(speedStr: string): number {
+  if (!speedStr || speedStr.trim() === "" || speedStr.toLowerCase() === "na") return 0;
+  const match = speedStr.match(/([\d.]+)\s*([KMGT]?i?B)/i);
+  if (!match) return 0;
+  const val = parseFloat(match[1]);
+  const unit = match[2].toLowerCase().replace("ib", "b");
+  const multipliers: Record<string, number> = { b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3, tb: 1024 ** 4 };
+  return val * (multipliers[unit] || 1);
+}
+
+// Windows forbids these device names anywhere in a path (CON, NUL, COM1…).
+const WINDOWS_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+// Strip characters Windows rejects, trailing dots/spaces (invisible in
+// Explorer but illegal on NTFS), and guard reserved device names.
+function hardenName(name: string): string {
+  let n = name.replace(/[\x00-\x1f]/g, " ").replace(/\s+/g, " ").trim();
+  n = n.replace(/[. ]+$/g, "");
+  if (!n) return "";
+  const stem = n.split(".")[0];
+  if (WINDOWS_RESERVED.test(stem)) n = `_${n}`;
+  return n;
+}
+
+function sanitizeFolderName(name: string): string {
+  return hardenName(name.replace(/[\/:*?"<>|]/g, " ").trim()) || "playlist";
+}
+function sanitizeFileName(name: string): string {
+  return hardenName(name.replace(/[\\/:*?"<>|]/g, " ").trim()) || "video";
+}
+
+// Keep generated filenames well under Windows' MAX_PATH (260) once the
+// directory and sidecar suffixes (.en.vtt, .info.json …) are added. Long
+// titles are truncated and made unique with the video id.
+function fitBaseFilename(dir: string, base: string, uniqueId: string): string {
+  const SIDE_MARGIN = 20; // ".%(ext)s" + language/extension suffixes + slack
+  const budget = 238 - dir.length - SIDE_MARGIN;
+  if (base.length <= budget) return base;
+  const idPart = ` [${uniqueId}]`;
+  const keep = Math.max(8, budget - idPart.length);
+  return base.slice(0, keep).trimEnd() + idPart;
+}
+
+function logError(scope: string, message: string) {
+  try {
+    appendFileSync("error.log", `[${new Date().toISOString()}] [${scope}] ${message}\n`);
+    if (existsSync("error.log") && statSync("error.log").size > 1_000_000) {
+      const lines = readFileSync("error.log", "utf-8").split("\n");
+      writeFileSync("error.log", lines.slice(-400).join("\n"));
+    }
+  } catch {}
+}
+
+const MEDIA_EXTENSIONS = new Set([
+  "mp4", "mkv", "webm", "mov", "flv", "avi", "ts", "m4v",
+  "mp3", "m4a", "opus", "ogg", "flac", "wav", "aac", "ac3", "eac3", "3gp", "amr",
+]);
+
+// Fallback used when yt-dlp's `--print after_move:filepath` output was not
+// captured: locate the media file we expect from the output template.
+async function findDownloadedFile(dir: string, baseFilename: string): Promise<string> {
+  try {
+    const files = await readdir(dir);
+    const matches: { path: string; mtime: number }[] = [];
+    for (const f of files) {
+      if (!f.startsWith(baseFilename + ".")) continue;
+      const ext = f.split(".").pop()?.toLowerCase() || "";
+      if (!MEDIA_EXTENSIONS.has(ext)) continue;
+      const s = await stat(join(dir, f)).catch(() => null);
+      if (s?.isFile()) matches.push({ path: join(dir, f), mtime: s.mtimeMs });
+    }
+    matches.sort((a, b) => b.mtime - a.mtime);
+    return matches[0]?.path || "";
+  } catch {
+    return "";
+  }
+}
+
+function formatDuration(seconds: number): string {
+  if (!seconds || seconds <= 0) return '--';
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
 
 // ==========================================
-// 4. PROXY & COOKIE MANAGEMENT
+// 4. COOKIE MANAGEMENT (NO PROXIES)
 // ==========================================
-// (Simplified for brevity, assumes WebshareProxyManager and cookie logic from V2 is preserved here)
-class WebshareProxyManager {
-  private proxies: any[] = []; private currentIndex = 0; private apiKey = "";
-  async init(apiKey: string) { this.apiKey = apiKey; if (!apiKey || apiKey.includes("YOUR_NEW")) return; await this.refreshProxies(); }
-  async refreshProxies() {
-    try {
-      const res = await fetch("https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=25", { headers: { "Authorization": this.apiKey } });
-      if (!res.ok) return;
-      const data = await res.json();
-      this.proxies = data.results.filter((p: any) => p.valid).map((p: any) => ({
-        id: p.id, url: `http://${p.username}:${p.password}@${p.proxy_address}:${p.port}`, country: p.country_code, city: p.city_name, burnedUntil: 0
-      }));
-    } catch {}
-  }
-  getProxy() {
-    if (this.proxies.length === 0) return null;
-    const p = this.proxies[this.currentIndex];
-    this.currentIndex = (this.currentIndex + 1) % this.proxies.length;
-    return { url: p.url, geo: `${p.country}-${p.city}` };
-  }
-  getActiveCount() { return this.proxies.length; }
-  getTotalCount() { return this.proxies.length; }
-}
-const proxyManager = new WebshareProxyManager();
-
 function cookiesArgs(config: Config): string[] {
   try { if (statSync(config.cookiesFile).size > 0) return ["--cookies", config.cookiesFile]; } catch {}
   return [];
@@ -226,258 +470,1508 @@ function cookiesArgs(config: Config): string[] {
 
 async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  const proc = Bun.spawn(["yt-dlp", "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([ytDlp(), "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"], { stdout: "pipe", stderr: "pipe" });
   const [, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   return code === 0 && !stderr.toLowerCase().includes("login required");
 }
 
 // ==========================================
-// 5. SCANNING & INGESTION
+// 4b. DEPENDENCY CHECK (runs first on startup)
+// ==========================================
+async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; version: string }> {
+  try {
+    const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const firstLine = (out || err || "").split("\n").map(l => l.trim()).find(l => l) || "";
+    return { ok: code === 0, version: firstLine.slice(0, 80) };
+  } catch {
+    return { ok: false, version: "" };
+  }
+}
+
+// Resolved tool locations — set by checkDependencies(), used everywhere so
+// custom Windows installs (exe next to the app, scoop, choco, winget, or an
+// explicit config path) all work without touching PATH.
+const resolvedTools = { ytDlp: "yt-dlp", ffmpeg: "ffmpeg" };
+function ytDlp(): string { return resolvedTools.ytDlp; }
+function ffmpeg(): string { return resolvedTools.ffmpeg; }
+
+// Candidate search order: explicit config path → PATH → app folder → folder of
+// the compiled exe → common Windows package-manager shims.
+function toolCandidates(cfgPath: string, posixNames: string[], winNames: string[]): string[] {
+  const cands: string[] = [];
+  if (cfgPath && cfgPath.trim()) cands.push(cfgPath.trim());
+  const cwd = process.cwd();
+  const exeDir = dirname(process.execPath);
+  for (const n of posixNames) {
+    cands.push(n);               // bare name → PATH lookup
+    cands.push(join(cwd, n));    // next to config.json / working dir
+    cands.push(join(exeDir, n)); // next to the compiled archive.exe
+  }
+  if (process.platform === "win32") {
+    const home = os.homedir();
+    const progData = process.env.ProgramData || "C:\\ProgramData";
+    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    for (const n of winNames) {
+      cands.push(
+        join(cwd, n),
+        join(exeDir, n),
+        join(progData, "chocolatey", "bin", n),
+        join(home, "scoop", "shims", n),
+        join(localAppData, "Microsoft", "WinGet", "Links", n),
+      );
+    }
+  }
+  const seen = new Set<string>();
+  return cands.filter(c => {
+    if (seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+}
+
+async function resolveTool(
+  cfgPath: string,
+  versionArgs: string[],
+  posixNames: string[],
+  winNames: string[],
+): Promise<{ path: string; version: string } | null> {
+  for (const cand of toolCandidates(cfgPath, posixNames, winNames)) {
+    const isBare = !cand.includes("/") && !cand.includes("\\");
+    if (!isBare && !existsSync(cand)) continue;
+    const probe = await probeBinary(cand, versionArgs);
+    if (probe.ok) return { path: cand, version: probe.version };
+  }
+  return null;
+}
+
+// Verifies every required external tool BEFORE opening the database or
+// scanning any links, so misconfigured machines fail fast with clear hints.
+async function checkDependencies(): Promise<void> {
+  console.log("🔎 Checking dependencies...");
+  const missing: string[] = [];
+  const [ytdlp, ffm] = await Promise.all([
+    resolveTool(globalConfig.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"]),
+    resolveTool(globalConfig.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"]),
+  ]);
+
+  if (ytdlp) {
+    resolvedTools.ytDlp = ytdlp.path;
+    console.log(`  ✅ yt-dlp: ${ytdlp.version || "ok"}${ytdlp.path.includes("/") || ytdlp.path.includes("\\") ? `  [${ytdlp.path}]` : "  [PATH]"}`);
+  } else {
+    console.error("  ❌ yt-dlp: not found (PATH, app folder, winget/scoop/chocolatey, ytDlpPath)");
+    missing.push(`yt-dlp — Install: winget install yt-dlp  |  scoop install yt-dlp  |  pipx install yt-dlp  |  or set "ytDlpPath" in config.json`);
+  }
+  if (ffm) {
+    resolvedTools.ffmpeg = ffm.path;
+    console.log(`  ✅ ffmpeg: ${ffm.version || "ok"}${ffm.path.includes("/") || ffm.path.includes("\\") ? `  [${ffm.path}]` : "  [PATH]"}`);
+  } else {
+    console.error("  ❌ ffmpeg: not found (PATH, app folder, winget/scoop/chocolatey, ffmpegPath)");
+    missing.push(`ffmpeg — Install: winget install ffmpeg  |  scoop install ffmpeg  |  choco install ffmpeg  |  or set "ffmpegPath" in config.json`);
+  }
+
+  if (missing.length > 0) {
+    const msg = `Missing required dependencies:\n${missing.map(m => `  • ${m}`).join("\n")}`;
+    console.error(`\n❌ ${msg}\n`);
+    logError("startup", msg.replace(/\n/g, " | "));
+    process.exit(1);
+  }
+  console.log("✅ All dependencies satisfied.");
+}
+
+// ==========================================
+// 5. RESILIENCE: PAUSE, NETWORK MONITOR, TIMEOUTS
+// ==========================================
+function triggerPause(reason: string) {
+  if (globalIsPaused && pauseReason === reason) return;
+  globalIsPaused = true;
+  pauseReason = reason;
+  console.log(`⏸️ Triggering pause: ${reason}`);
+  for (const [id, proc] of activeProcs.entries()) {
+    try { proc.kill('SIGINT'); } catch {}
+  }
+}
+
+function triggerResume() {
+  globalIsPaused = false;
+  pauseReason = null;
+  try {
+    // Re-queue ALL paused jobs (global + user-paused) on an explicit Resume All.
+    // In-flight jobs still holding a claim finish naturally in their worker.
+    const stmt = db.run(
+      `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE download_status = 'paused' AND download_claimed_by IS NULL`
+    );
+    if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
+  } catch {}
+  // A human resumed the engine — give the failure circuit a clean slate.
+  failureCircuit.dl = 0;
+  failureCircuit.post = 0;
+}
+
+// --- Circuit breaker ---------------------------------------------------------
+// maxFailures is a consecutive-failure tripwire per pipeline stage: a run of
+// hard failures with no successes in between (expired cookies overnight, a
+// YouTube outage, a broken ffmpeg) pauses the whole engine instead of letting
+// it burn through the queue one video at a time.
+const failureCircuit = { dl: 0, post: 0 };
+
+function notePipelineSuccess(stage: "dl" | "post") {
+  if (stage === "dl") failureCircuit.dl = 0;
+  else failureCircuit.post = 0;
+}
+
+function notePipelineFailure(stage: "dl" | "post", config: Config) {
+  if (stage === "dl") failureCircuit.dl++;
+  else failureCircuit.post++;
+  const worst = Math.max(failureCircuit.dl, failureCircuit.post);
+  if (worst >= config.maxFailures) {
+    const detail = `TOO_MANY_FAILURES (${failureCircuit.dl} consecutive download / ${failureCircuit.post} consecutive post-processing failures, limit ${config.maxFailures})`;
+    failureCircuit.dl = 0;
+    failureCircuit.post = 0;
+    logError("circuit", `pausing engine: ${detail}`);
+    triggerPause(detail);
+  }
+}
+
+// Remove a video id from the yt-dlp --download-archive file (the id is the
+// last field of each line) so a lost or moved file can be downloaded again.
+function removeFromArchive(archiveFile: string, videoId: string) {
+  try {
+    if (!archiveFile || !existsSync(archiveFile)) return;
+    const lines = readFileSync(archiveFile, "utf-8").split("\n");
+    const kept = lines.filter((l) => {
+      const parts = l.trim().split(/\s+/);
+      return parts.length === 0 || parts[parts.length - 1] !== videoId;
+    });
+    if (kept.length !== lines.length) writeFileSync(archiveFile, kept.join("\n"));
+  } catch {}
+}
+
+async function checkInternet(): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    await fetch('https://www.youtube.com/favicon.ico', { signal: controller.signal, method: 'HEAD', redirect: 'follow' });
+    clearTimeout(timeout);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function networkMonitor() {
+  let consecutiveFails = 0;
+  console.log("🌐 Network monitor started.");
+  while (!abortController.signal.aborted) {
+    const isUp = await checkInternet();
+    if (!isUp) {
+      consecutiveFails++;
+      if (consecutiveFails >= 2 && !globalIsPaused) {
+        triggerPause("NETWORK_DISCONNECTED");
+        console.log("🌐 Network down detected. Pausing engine gracefully.");
+      }
+    } else {
+      if (consecutiveFails > 0) {
+        console.log("🌐 Network restored!");
+        consecutiveFails = 0;
+        if (pauseReason === "NETWORK_DISCONNECTED") triggerResume();
+      }
+    }
+    await Bun.sleep(15000);
+  }
+}
+
+function spawnWithTimeout(cmd: string, args: string[], timeoutMs: number) {
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), timeoutMs);
+  const proc = Bun.spawn([cmd, ...args], { stdout: "pipe", stderr: "pipe", signal: ac.signal });
+  proc.exited.finally(() => clearTimeout(timeout));
+  return proc;
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+
+async function cleanOrphanedFiles(rootDir: string) {
+  try {
+    const failedPaths = db.query("SELECT partial_file_path FROM jobs WHERE download_status = 'failed' AND partial_file_path IS NOT NULL").all() as any[];
+    const failedSet = new Set(failedPaths.map(r => r.partial_file_path));
+    const files = await readdir(rootDir, { recursive: true });
+    for (const file of files) {
+      if (file.endsWith('.part') || file.endsWith('.ytdl')) {
+        const fullPath = join(rootDir, file);
+        const stats = await stat(fullPath).catch(() => null);
+        if (!stats) continue;
+        const isOld = (Date.now() - stats.mtimeMs) > 7 * 24 * 60 * 60 * 1000;
+        if (failedSet.has(fullPath) || isOld) {
+          await unlink(fullPath).catch(() => {});
+        }
+      }
+    }
+  } catch {}
+}
+
+let diskCheckWarned = false;
+
+async function checkDiskSpace(path: string, minGB: number): Promise<{ free: number; ok: boolean }> {
+  try {
+    const stats = await statfs(path);
+    const freeGB = stats.bavail * stats.bsize / (1024 ** 3);
+    return { free: freeGB, ok: freeGB > minGB };
+  } catch {
+    // Windows fallback: some Bun builds lack statfs — ask PowerShell instead.
+    try {
+      if (process.platform === "win32") {
+        const root = resolve(path); // e.g. D:\Downloads\YT
+        const drive = root.slice(0, 1); // "D"
+        if (/^[A-Za-z]$/.test(drive)) {
+          const proc = Bun.spawn(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", `(Get-PSDrive -Name '${drive}').Free`],
+            { stdout: "pipe", stderr: "pipe" }
+          );
+          const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+          const freeGB = parseFloat(out.trim()) / (1024 ** 3);
+          if (code === 0 && Number.isFinite(freeGB)) return { free: freeGB, ok: freeGB > minGB };
+        }
+      }
+    } catch {}
+    // Degraded mode: never permanently brick the engine over a failed probe —
+    // log once and allow (yt-dlp will still surface a real disk-full error).
+    if (!diskCheckWarned) {
+      diskCheckWarned = true;
+      console.warn("⚠️ Could not determine free disk space — continuing without the low-disk guard.");
+      logError("disk", `statfs/PowerShell probe failed for ${path}; low-disk guard disabled for this run`);
+    }
+    return { free: -1, ok: true };
+  }
+}
+
+// Periodic safety net: if a worker process/thread dies mid-job the claim can
+// be left behind. Downloads have a 15-minute watchdog, so any claim older than
+// 20 minutes is definitely dead → mark paused+interrupted for auto-resume.
+// Conversion claims older than 3h and metadata older than 15m are re-queued.
+function reapStaleClaims() {
+  try {
+    const dl = db.run(
+      `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
+         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE download_status = 'downloading'
+         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '-20 minutes'))`
+    );
+    const cv = db.run(
+      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE conversion_status = 'in_progress'
+         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '-3 hours'))`
+    );
+    const md = db.run(
+      `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
+       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '-15 minutes')`
+    );
+    const total = dl.changes + cv.changes + md.changes;
+    if (total > 0) {
+      console.log(`🧟 Reclaimed ${dl.changes} stale download(s), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`);
+      logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
+    }
+  } catch (e: any) {
+    logError("reaper", String(e?.message || e));
+  }
+}
+
+// ==========================================
+// 6. SCANNING & INGESTION (BATCH)
 // ==========================================
 async function getPlaylistItems(url: string, config: Config) {
-  const proc = Bun.spawn(["yt-dlp", ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s", url], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--print", "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s", url], { stdout: "pipe", stderr: "pipe" });
   const [out, , code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (code !== 0) return [];
   return out.split("\n").filter(l => l.trim()).map(line => {
-    const [playlist, id, title] = line.split("|||");
-    return { title: (title || "video").trim(), id: (id || "").trim(), playlist: (playlist || "playlist").trim() };
+    const [playlist, id, title, duration] = line.split("|||");
+    return {
+      title: (title || "video").trim(),
+      id: (id || "").trim(),
+      playlist: (playlist || "playlist").trim(),
+      duration: parseFloat(duration),
+    };
   }).filter(i => i.id);
 }
 
-async function scanAndIngest(url: string, config: Config, overrideFolderName?: string) {
-  const items = await getPlaylistItems(url, config);
-  if (items.length === 0) return;
-  
+// Insert (or skip) a batch of listing items into the jobs table. Shared by
+// the full scanner (yt-dlp flat listing) and the cheap RSS poller.
+async function ingestItems(items: { id: string; title: string; playlist: string; duration: number }[], config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
+  if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
-
   const targetFormat = config.videoQuality === 'audio' ? 'mp3' : 'mp4';
   const wantSubs = config.downloadSubtitles ? 1 : 0;
   const wantThumb = config.writeThumbnail ? 1 : 0;
   const wantDesc = config.writeDescription ? 1 : 0;
-  const wantInfo = config.writeInfoJson ? 1 : 0;
+  const conversionStatus = (config.videoQuality === 'audio' || targetFormat !== 'mp4') ? 'pending' : 'not_needed';
+  // Sidecar metadata (subs/thumbnail/description/info.json) is fetched by the
+  // metadata worker after the download completes.
+  const metadataStatus = (wantSubs || wantThumb || wantDesc || config.writeInfoJson) ? 'pending' : 'not_needed';
 
-  const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO jobs 
-    (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, want_info_json, folder, index, download_status, conversion_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')
-  `);
+  let added = 0;
+  let skipped = 0;
+  const insertTransaction = db.transaction((items: any[]) => {
+    const stmt = db.prepare(`INSERT OR IGNORE INTO jobs (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", download_status, conversion_status, metadata_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`);
+    for (const item of items) {
+      if (isVideoInDb(item.id)) {
+        // A job parked as waiting_live (stream was live at download time) may
+        // have ended by now — any fresh listing that still contains it requeues
+        // it; the !is_live filter drops it again if it is somehow still live.
+        db.run(`UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`, [item.id]);
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
+      if (config.skipShorts && !config.downloadShorts && Number.isFinite(item.duration) && item.duration > 0 && item.duration < 60) {
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
+      const index = getNextIndex(folder);
+      stmt.run(item.id, `https://www.youtube.com/watch?v=${item.id}`, item.title, outputDir, targetFormat, wantSubs, wantThumb, wantDesc, folder, index, conversionStatus, metadataStatus);
+      added++;
+      stats.totalQueued++;
+    }
+  });
+  insertTransaction(items);
+  return { found: items.length, added, skipped };
+}
 
-  for (const item of items) {
-    if (isVideoInDb(item.id)) continue;
-    const index = getNextIndex(folder);
-    insertStmt.run(item.id, `https://www.youtube.com/watch?v=${item.id}`, item.title, outputDir, targetFormat, wantSubs, wantThumb, wantDesc, wantInfo, folder, index);
-  }
+async function scanAndIngest(url: string, config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
+  const items = await getPlaylistItems(url, config);
+  return ingestItems(items, config, overrideFolderName);
 }
 
 // ==========================================
-// 6. WORKERS
+// 7. DOWNLOAD WORKER (RESILIENT)
 // ==========================================
 async function downloadWorker(id: number, config: Config) {
   const workerId = `dl-${id}`;
+  aliveDownloadWorkers.add(id);
   while (!abortController.signal.aborted) {
     if (globalIsPaused) { await Bun.sleep(2000); continue; }
-    
+    // Autoscaling gate: a scaled-down slot's worker idles here instead of
+    // claiming work (a job already in flight always runs to completion).
+    if (!activeDlSlots.has(id)) { await Bun.sleep(1000); continue; }
+
+    const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+    if (!disk.ok) {
+      triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
+      await Bun.sleep(10000);
+      continue;
+    }
+
     const job = claimDownloadJob(workerId);
-    if (!job) { await Bun.sleep(2000); continue; }
+    if (!job) { await Bun.sleep(500); continue; }
 
     try {
       updateWorkerLine(id, `⬇️ Starting... | ${job.title}`, config);
       const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
-      const outTemplate = join(job.output_directory, `${String(job.index).padStart(3, "0")} - %(title)s.%(ext)s`);
-      
+      const baseFilename = fitBaseFilename(
+        job.output_directory,
+        `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`,
+        job.id
+      );
+      const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
+
       const args = [
-        "yt-dlp", job.url, ...cookiesArgs(config), "--format", format,
+        ytDlp(), job.url, ...cookiesArgs(config), "--format", format,
         "--concurrent-fragments", "16", "-o", outTemplate,
-        "--progress", "--progress-template", "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-        "--socket-timeout", "30", "--retries", "5"
+        // --newline/--no-colors keep progress lines parseable from a pipe.
+        "--progress", "--newline", "--no-colors",
+        "--progress-template", "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
+        // Print the final path after all post-processing so we can record it.
+        // --print implies --simulate, so --no-simulate is required to actually write files.
+        "--print", "after_move:%(filepath)s", "--no-simulate",
+        "--socket-timeout", "15", "--retries", "10", "--retry-sleep", "5",
+        "--fragment-retries", "10", "--extractor-retries", "5",
+        "--continue", "--no-overwrites"
       ];
 
-      // 🌟 FETCH METADATA NATIVELY (Saves a whole network pass!)
-      if (job.want_subtitles) args.push("--write-subs", "--write-auto-subs", "--sub-langs", "all", "--embed-subs");
-      if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
-      if (job.want_description) args.push("--write-description");
-      if (job.want_info_json) args.push("--write-info-json");
+      // Real bandwidth cap: --limit-rate applies per yt-dlp process, so the
+      // configured global cap is split across the currently active slots.
+      if (config.maxBandwidthKBps > 0) {
+        const perWorkerKBps = Math.max(64, Math.floor(config.maxBandwidthKBps / Math.max(1, activeDlSlots.size)));
+        args.push("--limit-rate", `${perWorkerKBps}K`);
+      }
+      // yt-dlp's own idempotence layer: ids already in the archive file are
+      // never re-downloaded, even if a job is re-queued after a DB reset.
+      if (config.archiveFile) args.push("--download-archive", config.archiveFile);
+      // "Wait for VOD" mode: never grab a stream while it is still live — the
+      // job is parked as waiting_live and re-queued by the next full scan.
+      if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
+
+      // Sidecar files (subs/thumbnail/description/info.json) are fetched by the
+      // metadata worker once the download completes; the download phase only
+      // enriches the container itself (embedded art/metadata/chapters).
       if (config.embedMetadata) args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
 
-      const proxy = config.useProxies ? proxyManager.getProxy() : null;
-      if (proxy) args.push("--proxy", proxy.url);
+      // 15-minute watchdog: abort hung downloads instead of blocking a worker forever.
+      let timedOut = false;
+      const downloadCtl = new AbortController();
+      const downloadTimer = setTimeout(() => { timedOut = true; downloadCtl.abort(); }, 15 * 60 * 1000);
+      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal });
+      activeProcs.set(id, proc);
+      // Drain stderr immediately so a chatty yt-dlp cannot deadlock on a full pipe buffer.
+      const stderrPromise = new Response(proc.stderr).text();
 
-      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-      const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      let buffer = "";
+      let finalFilePath: string | null = null;
+      let lastProgressUpdate = 0;
+
+      const reader = proc.stdout.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += new TextDecoder().decode(value);
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("PROGRESS:")) {
+            const parts = line.replace("PROGRESS:", "").split("|");
+            const bps = parseSpeedToBytesPerSec(parts[1]);
+            if (bps > 0) autoscaler.recordSpeed(id, bps);
+            const sizeNum = parseInt(parts[3], 10);
+            const dlNum = parseInt(parts[4], 10);
+            let pctNum = parseFloat(parts[0]);
+            if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
+            if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
+              // Backfill file_size from progress so the global ETA has a total to work with.
+              const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
+              db.run(`UPDATE jobs SET progress = ?, speed = ?, eta = ?, file_size = COALESCE(?, file_size) WHERE id = ?`, [pctNum, bps, parseFloat(parts[2]) || 0, totalBytes, job.id]);
+              const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
+              const etaNum = parseFloat(parts[2]);
+              const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+              updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+              lastProgressUpdate = Date.now();
+            }
+          } else {
+            const trimmed = line.trim();
+            if (trimmed && existsSync(trimmed)) {
+              finalFilePath = trimmed;
+            } else {
+              // Capture paths embedded in yt-dlp status lines (merger output, etc.).
+              const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
+              if (m && existsSync(m[1])) finalFilePath = m[1];
+            }
+          }
+        }
+      }
+
+      const [stderrText, code] = await Promise.all([stderrPromise, proc.exited]);
+      clearTimeout(downloadTimer);
+      activeProcs.delete(id);
+
+      if (globalIsPaused) {
+        db.run(`UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+        continue;
+      }
+
+      if (timedOut) throw new Error("Process timed out (15m)");
 
       if (code === 0) {
-        const filePath = stdout.split("\n").reverse().find(l => l && existsSync(l)) || "";
-        const fileSize = filePath ? (await stat(filePath)).size : 0;
-        
-        db.run(`UPDATE jobs SET download_status = 'downloaded', metadata_status = 'done', file_path = ?, file_size = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, job.id]);
+        let filePath = finalFilePath || buffer.split("\n").reverse().find(l => l.trim() && existsSync(l.trim()))?.trim() || "";
+        if (!filePath) filePath = await findDownloadedFile(job.output_directory, baseFilename);
+        if (!filePath) {
+          logError("download", `${job.id} exited 0 but the output file could not be located: ${job.title}`);
+          throw new Error("Download finished but output file could not be located");
+        }
+        const fileSize = (await stat(filePath)).size;
+        db.run(`UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = ?, progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, filePath, job.id]);
+        stats.downloaded++;
+        notePipelineSuccess("dl");
         updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
       } else {
-        throw new Error(stderr.split('\n').slice(-3).join(' '));
+        const tail = [stderrText, buffer].filter(Boolean).join("\n").split("\n").filter(l => l.trim()).slice(-4).join(" ");
+        throw new Error(tail || `yt-dlp exited with code ${code}`);
       }
     } catch (err: any) {
+      if (globalIsPaused) {
+        db.run(`UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+        continue;
+      }
+
+      const errMsg = String(err).toLowerCase();
+
+      if (errMsg.includes("signature") || errMsg.includes("unable to extract")) {
+        console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
+        const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
+        await updateProc.exited;
+        db.run(`UPDATE jobs SET download_status = 'pending', retry_count = 0, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
+        continue;
+      }
+
+      if (errMsg.includes("unable to resume") || errMsg.includes("incomplete") || errMsg.includes("corrupt")) {
+        if (job.partial_file_path && existsSync(job.partial_file_path)) {
+          await unlink(job.partial_file_path).catch(() => {});
+        }
+        db.run(`UPDATE jobs SET download_status = 'pending', partial_file_path = NULL, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `🗑️ Corrupt fragment deleted, restarting... | ${job.title}`, config);
+        continue;
+      }
+
+      // --download-archive recorded the id but our copy is gone (deleted by
+      // hand, moved, or the folder was cleaned). Scrub the id from the archive
+      // so yt-dlp will actually download it on the retry.
+      if (errMsg.includes("output file could not be located")) {
+        removeFromArchive(config.archiveFile, job.id);
+        db.run(`UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+        continue;
+      }
+
+      // archiveLiveStreams mode: yt-dlp refused the job because the stream is
+      // live right now. Park it until the next full rescan or a manual retry —
+      // scans flip waiting_live jobs back to pending once a VOD exists.
+      if (errMsg.includes("does not pass filter") || errMsg.includes("is live") || errMsg.includes("live event")) {
+        db.run(`UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
+        continue;
+      }
+
+      const isTransient = ["unable to download", "connection reset", "timeout", "network is unreachable", "err_connection", "temporary failure", "could not connect", "sigabrt", "aborted"].some(e => errMsg.includes(e));
+      if (isTransient) {
+        db.run(`UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [errMsg.slice(0, 500), job.id]);
+        updateWorkerLine(id, `🌐 Transient error, backing off... | ${job.title}`, config);
+        await Bun.sleep(30000);
+        continue;
+      }
+
       const retryCount = job.retry_count + 1;
-      const newStatus = retryCount >= config.maxRetryAttempts ? 'failed' : 'pending';
-      db.run(`UPDATE jobs SET download_status = ?, retry_count = ?, last_error = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [newStatus, retryCount, String(err).slice(0, 500), job.id]);
+      // Hard per-video cap is the smaller of the two knobs so both stay honest.
+      const perVideoCap = Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
+      const newStatus = retryCount >= perVideoCap ? 'failed' : 'pending';
+      db.run(`UPDATE jobs SET download_status = ?, retry_count = ?, last_error = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [newStatus, retryCount, errMsg.slice(0, 500), job.id]);
+      if (newStatus === 'failed') {
+        stats.failed++;
+        logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+        notePipelineFailure("dl", config);
+      }
       updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
     } finally {
+      activeProcs.delete(id);
       autoscaler.clearWorker(id);
     }
   }
+  // Loop exited (shutdown): this worker is no longer alive.
+  aliveDownloadWorkers.delete(id);
 }
 
+// Sidecar suffixes that belong next to a media file and must travel with it.
+const SIDECAR_SUFFIXES = [
+  ".vtt", ".srt", ".ass", ".lrc", ".ttml", ".srv1", ".srv2", ".srv3",
+  ".description", ".info.json", ".jpg", ".jpeg", ".png", ".webp", ".gif",
+];
+
+// Run ffmpeg with a hard timeout so a wedged encode can never pin a worker.
+async function runFfmpeg(args: string[], timeoutMs: number): Promise<{ code: number; stderr: string; timedOut: boolean }> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
+    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    return { code, stderr, timedOut: ctl.signal.aborted };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ==========================================
+// 8. CONVERTER WORKER (STREAMING HASH)
+// ==========================================
 async function converterWorker(id: number, config: Config) {
   const workerId = `cv-${id}`;
   while (!abortController.signal.aborted) {
+    if (globalIsPaused) { await Bun.sleep(2000); continue; }
     const job = claimConvertJob(workerId);
     if (!job) { await Bun.sleep(2000); continue; }
-
     try {
       updateConvertWorkerLine(id, `🔄 Converting | ${job.title}`, config);
       const sourcePath = job.file_path!;
       if (!sourcePath || !existsSync(sourcePath)) throw new Error("Source file missing");
-
       let finalPath = sourcePath;
-      if (!sourcePath.endsWith(".mp4")) {
-        const mp4Path = sourcePath.replace(/\.[^./\\]+$/, ".mp4");
-        // Fast remux
-        const proc = Bun.spawn(["ffmpeg", "-y", "-i", sourcePath, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", mp4Path], { stdout: "ignore", stderr: "pipe" });
-        const [, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-        if (code !== 0) throw new Error("FFmpeg remux failed");
+      const wantsMp3 = job.target_format === "mp3" || config.videoQuality === "audio";
+      if (wantsMp3 && !sourcePath.endsWith(".mp3")) {
+        // Audio archive: encode to the target .mp3 instead of leaving the
+        // source container (webm/m4a) untouched.
+        const mp3Path = sourcePath.replace(/\.[^.]+$/, ".mp3");
+        const res = await runFfmpeg(
+          ["-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", mp3Path],
+          60 * 60 * 1000
+        );
+        if (res.code !== 0) throw new Error(`FFmpeg mp3 encode ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter(l => l.trim()).slice(-2).join(" ")}`);
+        if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
+        finalPath = mp3Path;
+      } else if (!wantsMp3 && !sourcePath.endsWith(".mp4")) {
+        const mp4Path = sourcePath.replace(/\.[^.]+$/, ".mp4");
+        const res = await runFfmpeg(
+          ["-y", "-i", sourcePath, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", mp4Path],
+          30 * 60 * 1000
+        );
+        if (res.code !== 0) throw new Error(`FFmpeg remux ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter(l => l.trim()).slice(-2).join(" ")}`);
         if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
         finalPath = mp4Path;
       }
-
-      // Move to NAS if configured
       if (config.secondaryStoragePath) {
         const destDir = join(config.secondaryStoragePath, job.folder);
         await mkdir(destDir, { recursive: true });
+        const srcDir = dirname(finalPath);
+        const srcBase = basename(finalPath).replace(/\.[^.]+$/, "");
+        // Move matching sidecar files (subs/thumbs/description/info.json) with
+        // the media so everything stays together in the final location.
+        const entries = await readdir(srcDir).catch(() => [] as string[]);
+        for (const f of entries) {
+          if (!f.startsWith(srcBase + ".")) continue;
+          if (!SIDECAR_SUFFIXES.some(sfx => f.endsWith(sfx))) continue;
+          const sideSrc = join(srcDir, f);
+          const sideDest = join(destDir, f);
+          await rename(sideSrc, sideDest).catch(async () => {
+            await cp(sideSrc, sideDest, { force: true }).catch(() => {});
+            await unlink(sideSrc).catch(() => {});
+          });
+        }
         const destPath = join(destDir, basename(finalPath));
         await rename(finalPath, destPath).catch(async () => { await cp(finalPath, destPath, { force: true }); await unlink(finalPath); });
         finalPath = destPath;
       }
-
-      // Integrity check
       let integrity = null;
       if (config.verifyIntegrity) {
-        const hash = createHash("sha256").update(await readFile(finalPath)).digest("hex");
-        integrity = hash;
+        integrity = await hashFile(finalPath);
       }
-
       db.run(`UPDATE jobs SET conversion_status = 'done', file_path = ?, integrity = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [finalPath, integrity, job.id]);
+      stats.converted++;
+      notePipelineSuccess("post");
       updateConvertWorkerLine(id, `✅ Done | ${job.title}`, config);
     } catch (err: any) {
-      db.run(`UPDATE jobs SET conversion_status = 'failed', last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [String(err).slice(0, 500), job.id]);
+      const errMsg = String(err).slice(0, 500);
+      db.run(`UPDATE jobs SET conversion_status = 'failed', last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [errMsg, job.id]);
+      stats.failed++;
+      logError("conversion", `${job.id} ${job.title}: ${errMsg}`);
+      notePipelineFailure("post", config);
       updateConvertWorkerLine(id, `❌ Failed | ${job.title}`, config);
     }
   }
 }
 
 // ==========================================
-// 7. TUI & WEB UI
+// 8b. METADATA WORKER (SUBS / THUMBS / DESCRIPTIONS / INFO.JSON)
 // ==========================================
-function updateWorkerLine(id: number, text: string, config: Config) {
-  workerStatuses.set(`DL${id}`, text);
-  if (isTTY) process.stdout.write(`\x1b[s\x1b[${2 + id};1H\x1b[2K[DL${id}] ${text}\x1b[u`);
-}
-function updateConvertWorkerLine(id: number, text: string, config: Config) {
-  workerStatuses.set(`CV${id}`, text);
-  if (isTTY) process.stdout.write(`\x1b[s\x1b[${2 + config.maxDownloadWorkers + id};1H\x1b[2K[CV${id}] ${text}\x1b[u`);
+async function metadataWorker(id: number, config: Config) {
+  const workerId = `md-${id}`;
+  while (!abortController.signal.aborted) {
+    if (globalIsPaused) { await Bun.sleep(2000); continue; }
+    const job = claimMetadataJob(workerId);
+    if (!job) { await Bun.sleep(2000); continue; }
+    try {
+      updateMetadataWorkerLine(id, `📎 Metadata | ${job.title}`, config);
+
+      if (!job.file_path || !existsSync(job.file_path)) {
+        throw new Error("Downloaded file missing — cannot fetch metadata");
+      }
+
+      // Write sidecars next to the downloaded file using the same basename.
+      const mediaDir = dirname(job.file_path);
+      const mediaBase = basename(job.file_path).replace(/\.[^.]+$/, "");
+      const outTemplate = join(mediaDir, `${mediaBase}.%(ext)s`);
+
+      const args = [
+        ytDlp(), job.url, ...cookiesArgs(config),
+        "--skip-download", "--no-simulate", "-o", outTemplate,
+        "--socket-timeout", "15", "--retries", "5", "--extractor-retries", "3",
+        "--newline", "--no-colors",
+      ];
+      if (job.want_subtitles) args.push("--write-subs", "--write-auto-subs", "--sub-langs", "all.*");
+      if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
+      if (job.want_description) args.push("--write-description");
+      if (config.writeInfoJson) args.push("--write-info-json");
+
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 10 * 60 * 1000);
+      const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+      activeMetadataProcs.set(id, proc);
+      // Drain both pipes concurrently to avoid deadlock.
+      const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
+      const stderrPromise = new Response(proc.stderr).text();
+      const [stdoutText, stderrText, code] = await Promise.all([stdoutPromise, stderrPromise, proc.exited]);
+      clearTimeout(timer);
+      activeMetadataProcs.delete(id);
+
+      if (globalIsPaused) {
+        db.run(`UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        continue;
+      }
+      if (ctl.signal.aborted) throw new Error("Metadata fetch timed out (10m)");
+      if (code !== 0) {
+        const tail = [stderrText, stdoutText].filter(Boolean).join("\n").split("\n").filter(l => l.trim()).slice(-3).join(" ");
+        throw new Error(tail || `yt-dlp exited with code ${code}`);
+      }
+
+      // Record which sidecar files now exist next to the media file.
+      const entries = await readdir(mediaDir).catch(() => [] as string[]);
+      const sidecars = entries.filter(f =>
+        f.startsWith(mediaBase + ".") &&
+        SIDECAR_SUFFIXES.some(sfx => f.endsWith(sfx)) &&
+        f !== basename(job.file_path!)
+      );
+      db.run(
+        `UPDATE jobs SET metadata_status = 'done', metadata_files = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [JSON.stringify(sidecars), job.id]
+      );
+      stats.metadata++;
+      notePipelineSuccess("post");
+      updateMetadataWorkerLine(id, `✅ Metadata done (${sidecars.length} file(s)) | ${job.title}`, config);
+    } catch (err: any) {
+      const errMsg = String(err?.message || err).slice(0, 500);
+      if (globalIsPaused) {
+        db.run(`UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        continue;
+      }
+      const attempts = (job.metadata_retry_count || 0) + 1;
+      const perVideoCap = Math.min(config.maxRetryAttempts || 3, config.maxFailuresPerVideo || 3);
+      const newStatus = attempts >= perVideoCap ? "failed" : "pending";
+      db.run(
+        `UPDATE jobs SET metadata_status = ?, metadata_retry_count = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [newStatus, attempts, errMsg, job.id]
+      );
+      if (newStatus === "failed") {
+        stats.failed++;
+        logError("metadata", `${job.id} ${job.title}: ${errMsg}`);
+        notePipelineFailure("post", config);
+        updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
+      } else {
+        await Bun.sleep(15_000);
+      }
+    }
+  }
 }
 
-// (Web UI HTML omitted for brevity, use the exact HTML string from your V2 file)
-const WEB_UI_HTML = `<!DOCTYPE html><html><body><h1>Archival Engine V3</h1><p>Check /api/status</p></body></html>`;
+// ==========================================
+// 9. TUI DASHBOARD
+// ==========================================
+function initDashboard(config: Config) {
+  if (!isTTY) return;
+  const cols = process.stdout.columns || 80;
+  const rows = process.stdout.rows || 50;
+  const dashboardLines = 2 + config.maxDownloadWorkers + config.maxConcurrentConverts + config.maxMetadataWorkers;
+  if (rows <= dashboardLines + 5 || cols < 60) {
+    isTTY = false;
+    console.log("⚠️ Terminal too small for TUI dashboard. Falling back to standard logs.");
+    return;
+  }
+  process.stdout.write("\x1b[2J\x1b[1;1H");
+  process.stdout.write(`\x1b[${dashboardLines + 1};${rows}r\x1b[${dashboardLines + 1};1H`);
+  for (let i = 1; i <= dashboardLines; i++) process.stdout.write(`\x1b[${i};1H\x1b[2K`);
+  for (let i = 1; i <= config.maxDownloadWorkers; i++) updateWorkerLine(i, "— idle slot —", config);
+  for (let i = 1; i <= config.maxConcurrentConverts; i++) updateConvertWorkerLine(i, "💤 Idle", config);
+  for (let i = 1; i <= config.maxMetadataWorkers; i++) updateMetadataWorkerLine(i, "💤 Idle", config);
+}
+
+function updateAbsoluteLine(row: number, text: string) {
+  if (!isTTY) return;
+  const cols = process.stdout.columns || 80;
+  let safeText = text.length > cols - 1 ? text.slice(0, cols - 4) + '...' : text;
+  safeText = safeText.padEnd(cols - 1, ' ');
+  process.stdout.write(`\x1b7\x1b[${row};1H\x1b[2K${safeText}\x1b8`);
+}
+
+function updateWorkerLine(id: number, text: string, config: Config) {
+  workerStatuses.set(`DL${id}`, text);
+  updateAbsoluteLine(2 + id, `[DL${id}] ${text}`);
+}
+
+function updateConvertWorkerLine(id: number, text: string, config: Config) {
+  workerStatuses.set(`CV${id}`, text);
+  updateAbsoluteLine(2 + config.maxDownloadWorkers + id, `[CV${id}] ${text}`);
+}
+
+function updateMetadataWorkerLine(id: number, text: string, config: Config) {
+  workerStatuses.set(`MD${id}`, text);
+  updateAbsoluteLine(2 + config.maxDownloadWorkers + config.maxConcurrentConverts + id, `[MD${id}] ${text}`);
+}
+
+function renderDashboard() {
+  if (!isTTY) return;
+  const agg = formatBytesPerSec(autoscaler.getAggregateSpeed());
+  const cap = autoscaler.maxBandwidthKBps > 0 ? `/${formatBytesPerSec(autoscaler.maxBandwidthKBps * 1024)}` : "";
+  const statsData = db.query(
+    `SELECT 
+      SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
+      SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
+      SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
+      SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+      COUNT(*) as total
+    FROM jobs`
+  ).get() as any;
+  updateAbsoluteLine(1, `🚀 DL:${statsData.downloading || 0}/${autoscaler.targetWorkers} | ${agg}${cap} | Done:${statsData.downloaded || 0} Fail:${statsData.failed || 0} Tot:${statsData.total || 0}${globalIsPaused ? ' | ⏸️ PAUSED' : ''}`);
+}
+
+function resetTerminal() {
+  if (!isTTY) return;
+  const rows = process.stdout.rows || 50;
+  process.stdout.write(`\x1b[1;${rows}r\x1b[${rows};1H`);
+}
+
+// ==========================================
+// 10. WEB UI SERVER
+// ==========================================
+function buildRunReport(): string[] {
+  try {
+    const totals = db.query(
+      `SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN download_status = 'pending' THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN download_status = 'paused' THEN 1 ELSE 0 END) as paused,
+        SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
+        SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
+        SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN conversion_status = 'pending' THEN 1 ELSE 0 END) as conv_pending,
+        SUM(CASE WHEN conversion_status = 'in_progress' THEN 1 ELSE 0 END) as conv_active,
+        SUM(CASE WHEN conversion_status = 'done' THEN 1 ELSE 0 END) as conv_done,
+        SUM(CASE WHEN conversion_status = 'failed' THEN 1 ELSE 0 END) as conv_failed,
+        SUM(CASE WHEN metadata_status = 'pending' THEN 1 ELSE 0 END) as meta_pending,
+        SUM(CASE WHEN metadata_status = 'in_progress' THEN 1 ELSE 0 END) as meta_active,
+        SUM(CASE WHEN metadata_status = 'done' THEN 1 ELSE 0 END) as meta_done,
+        SUM(CASE WHEN metadata_status = 'failed' THEN 1 ELSE 0 END) as meta_failed
+      FROM jobs`
+    ).get() as any;
+    const failures = db.query(
+      `SELECT id, title, retry_count, metadata_retry_count, last_error FROM jobs
+       WHERE download_status = 'failed' OR conversion_status = 'failed' OR metadata_status = 'failed'
+       ORDER BY updated_at DESC LIMIT 10`
+    ).all() as any[];
+    const lines: string[] = [];
+    lines.push(`=== Archive Engine Report — ${new Date().toISOString()} ===`);
+    lines.push(`Uptime: ${formatDuration(process.uptime())} | Engine: ${globalIsPaused ? `PAUSED (${pauseReason || "unknown"})` : "RUNNING"}`);
+    lines.push(`Download slots: ${activeDlSlots.size} (autoscale ${autoscaler.enabled ? "on" : "off"}) | Busy: ${totals.downloading || 0} | Speed: ${formatBytesPerSec(autoscaler.getAggregateSpeed())}`);
+    lines.push(`Jobs — total: ${totals.total || 0}, pending: ${totals.pending || 0}, paused: ${totals.paused || 0}, downloading: ${totals.downloading || 0}, downloaded: ${totals.downloaded || 0}, failed: ${totals.failed || 0}`);
+    lines.push(`Conversion — pending: ${totals.conv_pending || 0}, in progress: ${totals.conv_active || 0}, done: ${totals.conv_done || 0}, failed: ${totals.conv_failed || 0}`);
+    lines.push(`Metadata — pending: ${totals.meta_pending || 0}, in progress: ${totals.meta_active || 0}, done: ${totals.meta_done || 0}, failed: ${totals.meta_failed || 0}`);
+    lines.push(`This run — queued: ${stats.totalQueued}, downloaded: ${stats.downloaded}, skipped: ${stats.skipped}, failed: ${stats.failed}, metadata: ${stats.metadata}, converted: ${stats.converted}`);
+    if (failures.length > 0) {
+      lines.push("");
+      lines.push("Recent failures:");
+      for (const f of failures) {
+        lines.push(`  ✗ [${f.id}] ${f.title} (retries: ${f.retry_count || 0}) — ${f.last_error || "no error recorded"}`);
+      }
+    } else {
+      lines.push("");
+      lines.push("No failed jobs. All clear. ✅");
+    }
+    return lines;
+  } catch (e: any) {
+    return [`Failed to build report: ${e?.message || e}`];
+  }
+}
+
+// --- Web UI auth (optional shared-secret token) ------------------------------
+// When webToken is set, every request must present it — as a cookie (set after
+// the first successful sign-in), an Authorization: Bearer header, an
+// X-Web-Token header, or a ?token= query parameter. Comparison is timing-safe.
+function extractWebToken(req: Request, url: URL): string | null {
+  const auth = req.headers.get("authorization") || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  const header = req.headers.get("x-web-token");
+  if (header) return header.trim();
+  const query = url.searchParams.get("token");
+  if (query) return query.trim();
+  const cookie = req.headers.get("cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)yta_token=([^;]+)/);
+  if (match) return decodeURIComponent(match[1]).trim();
+  return null;
+}
+
+function timingSafeEq(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function isAuthorized(req: Request, url: URL): boolean {
+  if (!globalConfig.webToken) return true;
+  const presented = extractWebToken(req, url);
+  return !!presented && timingSafeEq(presented, globalConfig.webToken);
+}
+
+// Minimal sign-in page: submits the token as ?token=..., the server validates
+// it, sets an HttpOnly cookie, and serves the real UI — so the stock dashboard
+// JS (plain fetch, no token logic) keeps working unchanged.
+const LOGIN_PAGE = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive — Sign in</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: min(360px, 90vw); box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  input { width: 100%; box-sizing: border-box; padding: .6rem .8rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 1rem; }
+  button { margin-top: .8rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px; background: #3b82f6; color: white; font-size: 1rem; cursor: pointer; }
+  .err { color: #f87171; font-size: .85rem; margin-top: .6rem; min-height: 1.2em; }
+</style></head>
+<body><div class="card">
+  <h1>Archive Web UI — sign in</h1>
+  <form onsubmit="return go()">
+    <input id="token" type="password" placeholder="Access token" autofocus>
+    <button type="submit">Sign in</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<script>
+  function go() {
+    const t = document.getElementById("token").value.trim();
+    if (!t) return false;
+    location.href = "/?token=" + encodeURIComponent(t);
+    return false;
+  }
+  if (new URLSearchParams(location.search).has("token")) {
+    document.getElementById("err").textContent = "Invalid token — try again.";
+  }
+</script>
+</body></html>`;
 
 function startWebServer(port: number) {
   return Bun.serve({
-    port, hostname: "0.0.0.0",
+    // LAN-safe default: listen on loopback unless webBind is explicitly set
+    // (e.g. 0.0.0.0 to reach the UI from other devices on the LAN).
+    port, hostname: globalConfig.webBind || "127.0.0.1",
     async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === "/") return new Response(WEB_UI_HTML, { headers: { "Content-Type": "text/html" } });
-      
-      if (url.pathname === "/api/status") {
-        const stats = db.query(`
-          SELECT 
-            SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
-            SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
-            SUM(CASE WHEN download_status = 'failed' OR conversion_status = 'failed' THEN 1 ELSE 0 END) as failed,
-            COUNT(*) as total
-          FROM jobs
-        `).get() as any;
-
-        const workers = [];
-        for (let i = 1; i <= globalConfig.maxDownloadWorkers; i++) workers.push({ id: `[DL${i}]`, type: "download", status: workerStatuses.get(`DL${i}`) || "Idle" });
-        for (let i = 1; i <= globalConfig.maxConcurrentConverts; i++) workers.push({ id: `[CV${i}]`, type: "convert", status: workerStatuses.get(`CV${i}`) || "Idle" });
-
-        return Response.json({
-          stats: { totalQueued: stats.queued || 0, downloaded: stats.downloaded || 0, failed: stats.failed || 0 },
-          isPaused: globalIsPaused, pauseReason,
-          activeWorkers: aliveDownloadWorkers.size, targetWorkers: autoscaler.targetWorkers,
-          aggregateSpeed: formatBytesPerSec(autoscaler.getAggregateSpeed()),
-          workers, proxyHealth: { active: proxyManager.getActiveCount(), total: proxyManager.getTotalCount() }
-        });
+      // Every request is wrapped: a handler crash returns JSON 500 instead of
+      // hanging the socket, and the error lands in error.log.
+      try {
+        return await handleRequest(req);
+      } catch (e: any) {
+        logError("http", `${req.method} ${new URL(req.url).pathname}: ${e?.stack || e}`);
+        return Response.json({ ok: false, error: "Internal server error" }, { status: 500 });
       }
-      
-      if (url.pathname === "/api/pause" && req.method === "POST") { globalIsPaused = true; pauseReason = "MANUAL_WEB_UI"; return Response.json({ success: true }); }
-      if (url.pathname === "/api/resume" && req.method === "POST") { globalIsPaused = false; pauseReason = null; return Response.json({ success: true }); }
-      
-      if (url.pathname === "/api/failed" && req.method === "GET") {
-        const rows = db.query("SELECT id, title, folder, retry_count, last_error FROM jobs WHERE download_status = 'failed' OR conversion_status = 'failed' LIMIT 100").all();
-        return Response.json({ ok: true, failed: rows.map((r: any) => ({ ...r, fail_count: r.retry_count })) });
-      }
-
-      if (url.pathname.startsWith("/api/retry/") && req.method === "POST") {
-        const id = decodeURIComponent(url.pathname.replace("/api/retry/", ""));
-        db.run("UPDATE jobs SET download_status = 'pending', conversion_status = 'pending', retry_count = 0, last_error = NULL WHERE id = ?", [id]);
-        return Response.json({ ok: true });
-      }
-
-      return new Response("Not Found", { status: 404 });
     }
   });
 }
 
+async function handleRequest(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/") {
+    const queryToken = url.searchParams.get("token");
+    if (globalConfig.webToken && !isAuthorized(req, url)) {
+      // Missing/wrong token → the sign-in page (401 so browsers don't treat it
+      // as the real app). A *valid* query token falls through, gets served the
+      // app, and receives an HttpOnly cookie for subsequent requests.
+      return new Response(LOGIN_PAGE, { status: 401, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    }
+    if (existsSync("./web_ui.html")) {
+      const headers: Record<string, string> = { "Content-Type": "text/html" };
+      if (globalConfig.webToken && queryToken) {
+        headers["Set-Cookie"] = `yta_token=${encodeURIComponent(queryToken)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`;
+      }
+      return new Response(Bun.file("./web_ui.html"), { headers });
+    }
+    return new Response("web_ui.html not found. Please create it.", { status: 500 });
+  }
+
+  // Every API route (status, scan, pause/resume, purge, delete, ...) is gated
+  // behind the token too — purge/delete are destructive.
+  if (!isAuthorized(req, url)) {
+    return Response.json({ ok: false, error: "Unauthorized — token required" }, { status: 401 });
+  }
+
+  if (url.pathname === "/api/ping") {
+    return new Response(null, { status: 200 });
+  }
+
+  if (url.pathname === "/api/status") {
+    const statsData = db.query(
+      `SELECT
+        SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
+        SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
+        SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
+        SUM(CASE WHEN download_status = 'failed' OR conversion_status = 'failed' OR metadata_status = 'failed' THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN metadata_status IN ('pending', 'in_progress') THEN 1 ELSE 0 END) as metadata_pending,
+        SUM(CASE WHEN conversion_status IN ('pending', 'in_progress') THEN 1 ELSE 0 END) as converting,
+        COUNT(*) as total
+      FROM jobs`
+    ).get() as any;
+    const workers = [];
+    for (let i = 1; i <= globalConfig.maxDownloadWorkers; i++) {
+      workers.push({ id: `DL${i}`, type: "download", status: workerStatuses.get(`DL${i}`) || "Idle" });
+    }
+    for (let i = 1; i <= globalConfig.maxConcurrentConverts; i++) {
+      workers.push({ id: `CV${i}`, type: "convert", status: workerStatuses.get(`CV${i}`) || "Idle" });
+    }
+    for (let i = 1; i <= globalConfig.maxMetadataWorkers; i++) {
+      workers.push({ id: `MD${i}`, type: "metadata", status: workerStatuses.get(`MD${i}`) || "Idle" });
+    }
+
+    const diskStats = await statfs(globalConfig.outputRoot).catch(() => ({ bavail: 0, blocks: 1, bsize: 1 }));
+    const freeGB = (diskStats.bavail * diskStats.bsize / (1024 ** 3)).toFixed(1);
+    const totalGB = (diskStats.blocks * diskStats.bsize / (1024 ** 3)).toFixed(1);
+    const diskPercent = ((diskStats.bavail / diskStats.blocks) * 100).toFixed(0);
+
+    const memUsage = process.memoryUsage();
+    const ramUsedGB = (memUsage.rss / (1024 ** 3)).toFixed(2);
+    const ramTotalGB = (os.totalmem() / (1024 ** 3)).toFixed(2);
+    const ramPercent = ((memUsage.rss / os.totalmem()) * 100).toFixed(0);
+    const uptime = formatDuration(process.uptime());
+
+    const avgSpeed = autoscaler.getAggregateSpeed();
+    const remaining = db.query(`SELECT SUM(file_size * (1 - COALESCE(progress, 0) / 100)) as remaining FROM jobs WHERE download_status = 'downloading'`).get() as any;
+    const secondsRemaining = avgSpeed > 0 && remaining.remaining ? (remaining.remaining / avgSpeed) : 0;
+    const globalETA = secondsRemaining > 0 ? formatDuration(secondsRemaining) : "--";
+
+    return Response.json({
+      stats: {
+        totalQueued: statsData.queued || 0,
+        downloading: statsData.downloading || 0,
+        downloaded: statsData.downloaded || 0,
+        failed: statsData.failed || 0,
+        metadataPending: statsData.metadata_pending || 0,
+        converting: statsData.converting || 0,
+        total: statsData.total || 0
+      },
+      queuePosition: statsData.queued || 0,
+      speed: avgSpeed,
+      aggregateSpeed: formatBytesPerSec(avgSpeed),
+      activeWorkers: activeDlSlots.size,
+      targetWorkers: autoscaler.targetWorkers,
+      workers,
+      isPaused: globalIsPaused,
+      pauseReason,
+      diskSpace: { free: `${freeGB} GB / ${totalGB} GB`, percent: parseFloat(diskPercent) },
+      system: {
+        cpu: "--", cpuPercent: 0,
+        ram: `${ramUsedGB} GB / ${ramTotalGB} GB`,
+        ramPercent: parseFloat(ramPercent)
+      },
+      uptime,
+      globalETA
+    });
+  }
+
+  if (url.pathname === "/api/jobs") {
+    const rows = db.query(
+      `SELECT id, url, title, folder, output_directory, file_path, target_format,
+              download_status, conversion_status, metadata_status, pause_reason, metadata_files,
+              retry_count, last_error, file_size, progress, speed, eta
+       FROM jobs ORDER BY created_at DESC LIMIT 500`
+    ).all();
+    return Response.json({ jobs: rows });
+  }
+
+  if (url.pathname === "/api/scan" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const { url: scanUrl, folder } = body || {};
+    if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
+    try {
+      const result = await scanAndIngest(scanUrl, globalConfig, folder);
+      const message = result.found === 0
+        ? `No videos found at ${scanUrl} (check the URL, network, or cookies)`
+        : `Scanned ${result.found} video(s): ${result.added} added, ${result.skipped} skipped`;
+      return Response.json({ ok: true, message, ...result });
+    } catch (e: any) {
+      logError("scan", `${scanUrl}: ${e?.message || e}`);
+      return Response.json({ ok: false, error: e.message || "Scan failed" }, { status: 500 });
+    }
+  }
+
+  if (url.pathname === "/api/queue/purge" && req.method === "POST") {
+    const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'waiting_live', 'failed')");
+    return Response.json({ ok: true, deleted: result.changes });
+  }
+
+  if (url.pathname === "/api/pause" && req.method === "POST") {
+    triggerPause("MANUAL_WEB_UI");
+    return Response.json({ success: true });
+  }
+  if (url.pathname === "/api/resume" && req.method === "POST") {
+    triggerResume();
+    return Response.json({ success: true });
+  }
+
+  if (url.pathname.startsWith("/api/retry/") && req.method === "POST") {
+    const id = decodeURIComponent(url.pathname.replace("/api/retry/", ""));
+    // Re-queue download AND any failed metadata/conversion work; preserve
+    // conversion_status='not_needed'. Also clears a user pause.
+    db.run(
+      `UPDATE jobs SET
+         download_status = 'pending', pause_reason = NULL, progress = 0, retry_count = 0,
+         conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
+         metadata_status = CASE
+           WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
+           ELSE metadata_status END,
+         metadata_retry_count = 0,
+         last_error = NULL, download_claimed_by = NULL, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [id]
+    );
+    return Response.json({ ok: true });
+  }
+
+  if (url.pathname.startsWith("/api/failcount/reset/") && req.method === "POST") {
+    const id = decodeURIComponent(url.pathname.replace("/api/failcount/reset/", ""));
+    if (id) {
+      db.run(`UPDATE jobs SET retry_count = 0, metadata_retry_count = 0, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [id]);
+    }
+    return Response.json({ ok: true });
+  }
+
+  if (url.pathname === "/api/jobs/pause" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const ids = Array.isArray(body?.ids) ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500) : [];
+    if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
+    const placeholders = ids.map(() => "?").join(",");
+    const result = db.run(
+      `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
+         download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
+      ids
+    );
+    return Response.json({ ok: true, paused: result.changes });
+  }
+
+  if (url.pathname === "/api/jobs/delete" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const ids = Array.isArray(body?.ids) ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500) : [];
+    if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
+    const placeholders = ids.map(() => "?").join(",");
+    const result = db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
+    return Response.json({ ok: true, deleted: result.changes });
+  }
+
+  if (url.pathname.startsWith("/api/jobs/") && req.method === "DELETE") {
+    const id = decodeURIComponent(url.pathname.replace("/api/jobs/", ""));
+    db.run(`DELETE FROM jobs WHERE id = ?`, [id]);
+    return Response.json({ ok: true });
+  }
+
+  if (url.pathname === "/api/failed" && req.method === "GET") {
+    const rows = db.query(
+      `SELECT id, title, folder, output_directory, retry_count, metadata_retry_count,
+              download_status, conversion_status, metadata_status, last_error
+       FROM jobs
+       WHERE download_status = 'failed' OR conversion_status = 'failed' OR metadata_status = 'failed'
+       LIMIT 100`
+    ).all();
+    return Response.json({ ok: true, failed: rows });
+  }
+
+  if (url.pathname === "/api/history" && req.method === "GET") {
+    const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+    const rows = db.query("SELECT * FROM run_history ORDER BY ended_at DESC LIMIT ?").all(limit);
+    return Response.json({ ok: true, history: rows });
+  }
+
+  if (url.pathname === "/api/logs" && req.method === "GET") {
+    const logType = url.searchParams.get("type") || "error";
+    const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+    let logs: string[] = [];
+    try {
+      if (logType === "report") {
+        logs = buildRunReport();
+      } else if (existsSync("error.log")) {
+        logs = readFileSync("error.log", "utf-8").split("\n").filter(l => l.trim()).slice(-limit);
+      } else {
+        logs = ["No logs available"];
+      }
+    } catch (e: any) { logs = [`Error: ${e.message}`]; }
+    return Response.json({ ok: true, logs, type: logType });
+  }
+
+  return new Response("Not Found", { status: 404 });
+}
+
 // ==========================================
-// 8. MAIN EXECUTION
+// 10b. RSS POLLING (CHEAP NEW-UPLOAD WATCHER)
 // ==========================================
+// Polling YouTube's per-channel RSS feed costs one plain HTTP GET per channel
+// (no yt-dlp spawn) and surfaces new uploads within ~rssPollIntervalMinutes —
+// far cheaper than a full flat-playlist rescan, which remains the slow safety
+// net via rescanIntervalHours. New video ids go through the same ingestItems
+// dedup as every other source.
+const channelIdCache = new Map<string, string>();
+
+async function resolveChannelId(channelUrl: string, config: Config): Promise<string | null> {
+  // /channel/UC... URLs carry the id directly — no yt-dlp call needed.
+  const direct = channelUrl.match(/channel\/(UC[\w-]{10,})/);
+  if (direct) return direct[1];
+  const cached = channelIdCache.get(channelUrl);
+  if (cached) return cached;
+  try {
+    // @handle / custom URLs: resolve once via yt-dlp, then cache for the run.
+    const proc = Bun.spawn([ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--playlist-end", "1", "--print", "%(channel_id)s", channelUrl], { stdout: "pipe", stderr: "pipe" });
+    const [out, , code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    if (code !== 0) return null;
+    const id = out.split("\n").map((s) => s.trim()).find((s) => /^UC[\w-]{10,}$/.test(s));
+    if (id) channelIdCache.set(channelUrl, id);
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function pollChannelRss(channelUrl: string, config: Config): Promise<number> {
+  const channelId = await resolveChannelId(channelUrl, config);
+  if (!channelId) throw new Error(`could not resolve channel id for ${channelUrl}`);
+  const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+  const res = await fetch(feedUrl, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`RSS HTTP ${res.status} for ${channelUrl}`);
+  const xml = await res.text();
+  // The feed-level title is the first <title> before any <entry>.
+  const feedTitle = xml.match(/<feed[^>]*>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() || "RSS Channel";
+  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
+  const items: { id: string; title: string; playlist: string; duration: number }[] = [];
+  for (const entry of entries) {
+    const id = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/)?.[1];
+    if (!id) continue;
+    const title = entry.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() || id;
+    // media:duration is best-effort; a missing duration (NaN) simply bypasses
+    // the shorts filter — the metadata worker records the real value later.
+    const duration = parseFloat(entry.match(/<media:content[^>]*duration="(\d+)"/)?.[1] ?? "NaN");
+    items.push({ id, title, playlist: feedTitle, duration });
+  }
+  const result = await ingestItems(items, config);
+  return result.added;
+}
+
+function startRssPolling(config: Config) {
+  if (!config.rssEnabled || config.channels.length === 0) return;
+  const intervalMs = Math.max(1, config.rssPollIntervalMinutes) * 60_000;
+  console.log(`RSS polling enabled: ${config.channels.length} channel(s), every ${config.rssPollIntervalMinutes} min.`);
+  // First pass shortly after startup (ingest dedup makes it harmless), then
+  // once per configured interval. The in-flight guard keeps a slow poll (dead
+  // network, stuck yt-dlp) from overlapping with the next tick.
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      for (const channel of config.channels) {
+        try {
+          const added = await pollChannelRss(channel, config);
+          if (added > 0) console.log(`RSS: ${added} new video(s) from ${channel}`);
+        } catch (e: any) {
+          logError("rss", `${channel}: ${e?.message || e}`);
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+  setTimeout(tick, Math.min(intervalMs, 2 * 60_000));
+  setInterval(tick, intervalMs);
+}
+
+// ==========================================
+// 11. AUTONOMOUS POLLING
+// ==========================================
+async function startAutonomousPolling(config: Config) {
+  if (config.rescanIntervalHours > 0 && (config.channels.length > 0 || config.channelPlaylists.length > 0)) {
+    const intervalMs = config.rescanIntervalHours * 60 * 60 * 1000;
+    setInterval(async () => {
+      console.log("🔄 [Daemon] Running full channel rescan...");
+      for (const url of [...config.channels, ...config.channelPlaylists]) {
+        try {
+          await scanAndIngest(url, config);
+        } catch (e: any) {
+          logError("rescan", `${url}: ${e?.message || e}`);
+          console.error(`❌ Rescan failed for ${url}:`, e?.message || e);
+        }
+      }
+    }, intervalMs);
+  }
+}
+
+// ==========================================
+// 12. MAIN EXECUTION
+// ==========================================
+let isShuttingDown = false;
+let runHistoryId: number | null = null;
+
+function runHistorySnapshot() {
+  const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
+  return [
+    fmt(Date.now()),
+    (Date.now() - startTime) / 1000,
+    stats.downloaded, stats.skipped, stats.failed, stats.totalQueued,
+  ] as const;
+}
+
+// Insert a run row at startup and refresh it every minute (heartbeat), so a
+// hard kill (window close, taskkill, power loss) still leaves usable history.
+function startRunHistory() {
+  try {
+    const fmt = (t: number) => new Date(t).toISOString().replace("T", " ").slice(0, 19);
+    const res = db.run(
+      `INSERT INTO run_history (started_at, ended_at, duration_seconds, downloaded, skipped, failed, total_queued) VALUES (?, ?, ?, 0, 0, 0, 0)`,
+      [fmt(startTime), fmt(startTime), 0]
+    );
+    runHistoryId = Number(res.lastInsertRowid);
+  } catch (e: any) {
+    logError("history", String(e?.message || e));
+  }
+}
+
+function heartbeatRunHistory() {
+  if (runHistoryId == null) return;
+  try {
+    const [endedAt, duration, dl, sk, fl, tq] = runHistorySnapshot();
+    db.run(
+      `UPDATE run_history SET ended_at = ?, duration_seconds = ?, downloaded = ?, skipped = ?, failed = ?, total_queued = ? WHERE id = ?`,
+      [endedAt, duration, dl, sk, fl, tq, runHistoryId]
+    );
+  } catch {}
+}
+
 async function handleShutdown(sig: string) {
-  console.log(`\n🛑 ${sig} received. Pausing active jobs...`);
-  db.run(`UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL WHERE download_status = 'downloading'`);
-  db.run(`UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL WHERE conversion_status = 'in_progress'`);
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\n🛑 ${sig} received. Gracefully stopping active downloads...`);
+  triggerPause("SHUTDOWN_REQUESTED");
+  await Bun.sleep(3000);
   abortController.abort();
+
+  // Kill any still-running child processes.
+  for (const [, proc] of activeProcs) { try { proc.kill("SIGINT"); } catch {} }
+  for (const [, proc] of activeMetadataProcs) { try { proc.kill("SIGINT"); } catch {} }
+
+  try {
+    // Persist an accurate picture of the interrupted pipeline:
+    //  - in-flight downloads become 'paused' + 'interrupted' (auto-resumed
+    //    and continued from where they left off on the next start)
+    //  - in-flight conversions/metadata re-queue to run again on next start
+    db.run(
+      `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
+         download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE download_status = 'downloading'`
+    );
+    db.run(
+      `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE conversion_status = 'in_progress'`
+    );
+    db.run(
+      `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
+       WHERE metadata_status = 'in_progress'`
+    );
+    // Final history flush (row was created at startup + heartbeated since).
+    heartbeatRunHistory();
+  } catch {}
   webServer?.stop(true);
+  resetTerminal();
   process.exit(0);
+}
+
+// Restart crashed worker loops with a short backoff instead of dying silently.
+function supervise(name: string, fn: () => Promise<void>) {
+  fn()
+    .catch((err) => {
+      logError("worker", `${name} crashed: ${err?.stack || err}`);
+      console.error(`❌ Worker ${name} crashed:`, err?.message || err);
+    })
+    .finally(() => {
+      if (!abortController.signal.aborted) {
+        console.log(`♻️ Restarting ${name} in 5s...`);
+        setTimeout(() => supervise(name, fn), 5000);
+      }
+    });
 }
 
 async function main() {
   process.on("SIGINT", () => handleShutdown("SIGINT"));
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+  // Windows: Ctrl+Break / console close events surface as SIGBREAK.
+  process.on("SIGBREAK", () => handleShutdown("SIGBREAK"));
+  process.on("unhandledRejection", (reason) => {
+    logError("process", `unhandledRejection: ${reason instanceof Error ? (reason.stack || String(reason)) : String(reason)}`);
+  });
+  process.on("uncaughtException", (err) => {
+    logError("process", `uncaughtException: ${err?.stack || err}`);
+    console.error("‼️ Uncaught exception (engine continues):", err);
+  });
 
+  // 1) Load configuration first (dependency search may use ytDlpPath/ffmpegPath
+  //    from it), then verify external tools before touching the database.
   globalConfig = await loadConfig();
+  await checkDependencies();
+  // 2) Open/migrate the central database.
   initDatabase();
-  reconcileCrashedJobs(); // 🌟 Safety net for crashes
-  
-  await proxyManager.init(globalConfig.webshareApiKey);
+  reconcileCrashedJobs();
+  // Run history: row created now, heartbeated so hard kills still leave data.
+  startRunHistory();
+  setTimeout(heartbeatRunHistory, 10_000);
+  setInterval(heartbeatRunHistory, 60_000);
+  // Ensure the output root exists — otherwise statfs fails, the disk check
+  // reports 0 GB free, and the engine falsely pauses with LOW_DISK_SPACE.
+  await mkdir(globalConfig.outputRoot, { recursive: true });
+  await cleanOrphanedFiles(globalConfig.outputRoot);
   autoscaler.init(globalConfig);
 
-  // Ingest links from config
-  for (const url of globalConfig.playlists) await scanAndIngest(url, globalConfig);
-  for (const url of globalConfig.channels) await scanAndIngest(url, globalConfig);
+  if (globalConfig.validateCookiesOnStart && existsSync(globalConfig.cookiesFile)) {
+    const valid = await validateCookies(globalConfig.cookiesFile);
+    if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
+    else console.log("✅ Cookies validated.");
+  }
 
+  // 3) Load every link from config.json, fetch video details, store in DB.
+  const allLinks = [...globalConfig.playlists, ...globalConfig.channels, ...globalConfig.channelPlaylists];
+  for (const url of allLinks) {
+    try {
+      const r = await scanAndIngest(url, globalConfig);
+      console.log(`📥 ${url} → found ${r.found}, added ${r.added}, skipped ${r.skipped}`);
+    } catch (e: any) {
+      logError("scan", `${url}: ${e?.message || e}`);
+      console.error(`❌ Failed to scan ${url}:`, e?.message || e);
+    }
+  }
+
+  initDashboard(globalConfig);
   webServer = startWebServer(globalConfig.webPort);
-  console.log(`🌐 Web UI: http://127.0.0.1:${globalConfig.webPort}`);
+  const uiHost = !globalConfig.webBind || globalConfig.webBind === "0.0.0.0" ? "127.0.0.1" : globalConfig.webBind;
+  console.log(`Web UI: http://${uiHost}:${globalConfig.webPort}${globalConfig.webToken ? "  (token required)" : ""}${globalConfig.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`);
 
-  // Start Workers
-  for (let i = 1; i <= globalConfig.maxConcurrentDownloads; i++) {
-    aliveDownloadWorkers.add(i);
-    downloadWorker(i, globalConfig).finally(() => aliveDownloadWorkers.delete(i));
+  networkMonitor();
+  setInterval(reapStaleClaims, 60_000);
+  // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
+  setInterval(autoscaleTick, 15_000);
+  // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
+  startRssPolling(globalConfig);
+
+  // 4) Pipeline workers (each supervised — crashed loops restart automatically):
+  //    download → metadata → converter, all driven by job status in the DB.
+  for (let i = 1; i <= globalConfig.maxDownloadWorkers; i++) {
+    supervise(`download-worker-${i}`, () => downloadWorker(i, globalConfig));
+  }
+  for (let i = 1; i <= globalConfig.maxMetadataWorkers; i++) {
+    supervise(`metadata-worker-${i}`, () => metadataWorker(i, globalConfig));
   }
   for (let i = 1; i <= globalConfig.maxConcurrentConverts; i++) {
-    converterWorker(i, globalConfig);
+    supervise(`converter-worker-${i}`, () => converterWorker(i, globalConfig));
   }
 
-  console.log("🚀 Engine started. Press Ctrl+C to stop.");
+  if (globalConfig.daemonMode) startAutonomousPolling(globalConfig);
+
+  setInterval(renderDashboard, 2000);
+  console.log("🚀 Engine V5 started. Resilient, autonomous, proxy-free.");
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  logError("startup", `main() failed: ${err?.stack || err}`);
+  console.error("❌ Fatal startup error:", err);
+  process.exit(1);
+});

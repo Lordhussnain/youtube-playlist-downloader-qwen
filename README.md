@@ -24,13 +24,11 @@ a terminal UI to watch it all happen.
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
 - [aria2c](https://aria2.github.io) — multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion
-- [Deno](https://deno.land) — sandboxed JS runtime for YouTube signature decoding
 
 ## Requirements
 
 - Bun ≥ 1.0
 - `yt-dlp`, `aria2c`, and `ffmpeg` available on `PATH`
-- Deno (used for signature-challenge solving)
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
@@ -88,6 +86,38 @@ The TUI shows live status for every video across all active workers.
 3. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 4. **Converter workers** — convert completed downloads into the target format
 
+## Security & operations
+
+- **Loopback-only Web UI by default** — `webBind` defaults to `127.0.0.1`, so the
+  dashboard (pause/purge/delete!) is not reachable from your LAN. Set
+  `"webBind": "0.0.0.0"` to expose it deliberately.
+- **Optional shared-secret token** — set `webToken` and every request (UI and
+  API) needs it, via cookie, `Authorization: Bearer`, `X-Web-Token`, or
+  `?token=`. The login page sets an `HttpOnly` cookie after the first
+  sign-in; comparisons are timing-safe.
+- **Real bandwidth cap** — `maxBandwidthKBps` maps to yt-dlp `--limit-rate`,
+  split across the active download slots.
+- **Worker autoscaling** — with `autoscaleEnabled` the engine grows download
+  slots toward `maxDownloadWorkers` while a backlog exists and bandwidth
+  headroom remains, sheds slots when the cap saturates, and returns to
+  `minDownloadWorkers` when idle.
+- **Cheap new-upload watching** — `rssEnabled` polls each channel's RSS feed
+  every `rssPollIntervalMinutes` (one HTTP GET per channel, ~15 min latency)
+  instead of waiting for a full rescan.
+- **Circuit breaker** — after `maxFailures` consecutive pipeline failures
+  (dead cookies overnight, a YouTube outage) the engine pauses itself with
+  `TOO_MANY_FAILURES` instead of burning through the queue. Resume from the
+  UI when you're ready. Per-video, the effective retry cap is
+  `min(maxRetryAttempts, maxFailuresPerVideo)`.
+- **yt-dlp download archive** — `archiveFile` is passed to
+  `--download-archive` as a second idempotence layer; if a downloaded file
+  disappears (moved/deleted by hand) the archive entry is scrubbed and the
+  video is fetched again on the next attempt.
+- **Wait for VOD** — with `archiveLiveStreams` enabled, currently-live
+  streams are never grabbed mid-broadcast: the job parks as
+  `waiting for VOD` and is re-queued by the next scan/RSS pass once the
+  stream has ended.
+
 ## Roadmap
 
 - [ ] Central SQLite job database — persist per-video status (`pending` →
@@ -96,6 +126,53 @@ The TUI shows live status for every video across all active workers.
       relying on in-memory state
 - [ ] Resume interrupted downloads from exactly where they left off
 - [ ] Fully independent, parallel metadata and conversion pipelines
+
+## Windows 11
+
+The engine is fully supported on Windows 11. Recommended setup:
+
+**Quick start (no runtime install):**
+
+```powershell
+# 1. Build the standalone exe (requires Bun once, on any machine)
+bun run build:win          # → dist\youtube-archive.exe
+
+# 2. Copy dist\youtube-archive.exe into this folder, then double-click:
+start-archive.bat
+```
+
+`start-archive.bat` sets UTF-8 codepage, puts the app folder first on `PATH`
+(so a local `yt-dlp.exe` / `ffmpeg.exe` sitting next to the app is picked up
+automatically), and prefers the compiled exe over a source checkout.
+
+**Dependency auto-detection** — at startup the engine searches, in order:
+
+1. `ytDlpPath` / `ffmpegPath` in `config.json` (set them via `bun run config`)
+2. `PATH`
+3. The app folder (next to `archive.exe` / `config.json`)
+4. Winget, Scoop, and Chocolatey shims
+
+**Start automatically at logon:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-task.ps1
+# to remove later:
+powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
+```
+
+**Windows-specific safeguards built in:**
+
+- Filenames are stripped of reserved device names (`CON`, `NUL`, `COM1`…),
+  trailing dots/spaces, and illegal characters `/\:*?"<>|`
+- Long titles are truncated so paths stay under `MAX_PATH` (260) — no registry
+  tweak required
+- Run history is heartbeated every minute, so even `taskkill /F` or a window
+  close still leaves a usable history row
+- Interrupted downloads are marked `paused (resume)` and continue from the
+  `.part` file on next start
+- If `statfs` is unavailable, free space falls back to PowerShell
+  (`Get-PSDrive`); if that also fails the engine runs in degraded mode
+  instead of pausing forever
 
 ## License
 
