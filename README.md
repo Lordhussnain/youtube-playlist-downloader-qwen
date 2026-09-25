@@ -24,13 +24,11 @@ a terminal UI to watch it all happen.
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
 - [aria2c](https://aria2.github.io) — multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion
-- [Deno](https://deno.land) — sandboxed JS runtime for YouTube signature decoding
 
 ## Requirements
 
 - Bun ≥ 1.0
 - `yt-dlp`, `aria2c`, and `ffmpeg` available on `PATH`
-- Deno (used for signature-challenge solving)
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
@@ -87,6 +85,38 @@ The TUI shows live status for every video across all active workers.
 2. **Download workers** — pull videos into the configured output directory, retrying on failure with exponential backoff
 3. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 4. **Converter workers** — convert completed downloads into the target format
+
+## Security & operations
+
+- **Loopback-only Web UI by default** — `webBind` defaults to `127.0.0.1`, so the
+  dashboard (pause/purge/delete!) is not reachable from your LAN. Set
+  `"webBind": "0.0.0.0"` to expose it deliberately.
+- **Optional shared-secret token** — set `webToken` and every request (UI and
+  API) needs it, via cookie, `Authorization: Bearer`, `X-Web-Token`, or
+  `?token=`. The login page sets an `HttpOnly` cookie after the first
+  sign-in; comparisons are timing-safe.
+- **Real bandwidth cap** — `maxBandwidthKBps` maps to yt-dlp `--limit-rate`,
+  split across the active download slots.
+- **Worker autoscaling** — with `autoscaleEnabled` the engine grows download
+  slots toward `maxDownloadWorkers` while a backlog exists and bandwidth
+  headroom remains, sheds slots when the cap saturates, and returns to
+  `minDownloadWorkers` when idle.
+- **Cheap new-upload watching** — `rssEnabled` polls each channel's RSS feed
+  every `rssPollIntervalMinutes` (one HTTP GET per channel, ~15 min latency)
+  instead of waiting for a full rescan.
+- **Circuit breaker** — after `maxFailures` consecutive pipeline failures
+  (dead cookies overnight, a YouTube outage) the engine pauses itself with
+  `TOO_MANY_FAILURES` instead of burning through the queue. Resume from the
+  UI when you're ready. Per-video, the effective retry cap is
+  `min(maxRetryAttempts, maxFailuresPerVideo)`.
+- **yt-dlp download archive** — `archiveFile` is passed to
+  `--download-archive` as a second idempotence layer; if a downloaded file
+  disappears (moved/deleted by hand) the archive entry is scrubbed and the
+  video is fetched again on the next attempt.
+- **Wait for VOD** — with `archiveLiveStreams` enabled, currently-live
+  streams are never grabbed mid-broadcast: the job parks as
+  `waiting for VOD` and is re-queued by the next scan/RSS pass once the
+  stream has ended.
 
 ## Roadmap
 

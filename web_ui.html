@@ -235,6 +235,7 @@
     .status-failed { background: var(--danger); color: white; }
     .status-converting { background: #8b5cf6; color: white; }
     .status-done { background: var(--success); color: white; }
+    .status-waiting_live { background: #0ea5e9; color: white; }
     
     .search-box {
       padding: 10px 15px;
@@ -472,6 +473,15 @@
   <div class="notification-container" id="notifications"></div>
   
   <script>
+    // Auth guard: a 401 anywhere means the session token is missing/expired —
+    // bounce to '/' so the server can show its sign-in page.
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = async (...args) => {
+      const res = await _origFetch(...args);
+      if (res && res.status === 401 && !location.search.includes('token=')) location.href = '/';
+      return res;
+    };
+
     let selectedJobs = new Set();
     let lastFailedCount = 0;
     let wasPaused = false;
@@ -698,8 +708,11 @@
           else if (job.conversion_status === 'failed') status = 'failed';
         }
         const statusClass = `status-${status}`;
-        const statusLabel = status === 'pending' ? 'not started' : status;
-        const badgeText = status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)' : statusLabel;
+        let statusLabel = status === 'pending' ? 'not started' : status;
+        if (status === 'waiting_live') statusLabel = 'waiting for VOD';
+        const badgeText = status === 'paused' && job.pause_reason === 'waiting_live' ? 'waiting for VOD'
+          : status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)'
+          : statusLabel;
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
         const location = job.file_path || job.output_directory || job.folder || '';
         const meta = job.metadata_status || 'not_needed';

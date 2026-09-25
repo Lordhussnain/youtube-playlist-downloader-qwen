@@ -3,7 +3,7 @@
 import { mkdir, unlink, readFile, writeFile, statfs, rm, stat, appendFile, readdir, cp, rename } from "node:fs/promises";
 import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from "node:fs";
 import { join, basename, resolve, dirname } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { Database } from "bun:sqlite";
 import { z } from "zod";
@@ -101,7 +101,7 @@ function initDatabase() {
       WHERE id = (
         SELECT id FROM jobs
         WHERE download_status = 'pending'
-           OR (download_status = 'paused' AND COALESCE(pause_reason, '') <> 'user')
+           OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
         ORDER BY created_at, rowid LIMIT 1
       )
       RETURNING *`
@@ -191,7 +191,6 @@ const ConfigSchema = z.object({
   maxMetadataWorkers: z.number().min(1).max(10),
   maxBandwidthKBps: z.number().min(0),
   autoscaleEnabled: z.boolean(),
-  denoPath: z.string(),
   ytDlpPath: z.string(),
   ffmpegPath: z.string(),
   validateCookiesOnStart: z.boolean(),
@@ -216,6 +215,10 @@ const ConfigSchema = z.object({
   secondaryStoragePath: z.string(),
   daemonMode: z.boolean(),
   webPort: z.number().min(1).max(65535),
+  // Security: webBind restricts which interface the UI listens on (loopback
+  // only by default), webToken gates every request behind a shared secret.
+  webBind: z.string(),
+  webToken: z.string(),
   rssEnabled: z.boolean(),
   rssPollIntervalMinutes: z.number().min(1),
   rescanIntervalHours: z.number().min(0),
@@ -227,13 +230,14 @@ const DEFAULT_CONFIG: Config = {
   playlists: [], channels: [], channelPlaylists: [],
   maxConcurrentDownloads: 3, maxConcurrentConverts: 2, maxDownloadWorkers: 5, minDownloadWorkers: 1, maxMetadataWorkers: 2,
   maxBandwidthKBps: 0, autoscaleEnabled: true,
-  denoPath: "deno", ytDlpPath: "", ffmpegPath: "", validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
+  ytDlpPath: "", ffmpegPath: "", validateCookiesOnStart: true, outputRoot: "./downloads", archiveFile: "downloaded_videos.txt", cookiesFile: "cookies.txt",
   deleteSourceAfterConvert: true, videoQuality: "1080p",
   downloadSubtitles: true, embedMetadata: true, writeInfoJson: true, writeDescription: true, writeThumbnail: true,
   archiveLiveStreams: false, verifyIntegrity: true, skipShorts: true, downloadShorts: false,
   maxRetryAttempts: 3, maxFailures: 10, maxFailuresPerVideo: 4,
   minFreeSpaceGB: 10, secondaryStoragePath: "",
-  daemonMode: false, webPort: 3000, rssEnabled: true, rssPollIntervalMinutes: 15, rescanIntervalHours: 24,
+  daemonMode: false, webPort: 3000, webBind: "127.0.0.1", webToken: "",
+  rssEnabled: true, rssPollIntervalMinutes: 15, rescanIntervalHours: 24,
 };
 
 let globalConfig: Config = { ...DEFAULT_CONFIG };
@@ -297,11 +301,61 @@ const autoscaler = {
   init(c: Config) {
     this.enabled = c.autoscaleEnabled; this.minWorkers = c.minDownloadWorkers; this.maxWorkers = c.maxDownloadWorkers;
     this.maxBandwidthKBps = c.maxBandwidthKBps; this.targetWorkers = Math.max(this.minWorkers, Math.min(c.maxConcurrentDownloads, this.maxWorkers));
+    setActiveSlots(this.targetWorkers);
   },
   recordSpeed(id: number, bps: number) { this.workerSpeeds.set(id, bps); },
   clearWorker(id: number) { this.workerSpeeds.delete(id); },
   getAggregateSpeed() { let s = 0; for (const v of this.workerSpeeds.values()) s += v; return s; },
 };
+
+// Dynamic download slots: all maxDownloadWorkers processes are supervised and
+// alive, but only the ones whose id is in activeDlSlots may claim jobs. The
+// autoscaler adds/removes slot ids — a slot removed mid-download lets its
+// worker finish the current job and then idle.
+const activeDlSlots = new Set<number>();
+
+function setActiveSlots(target: number) {
+  const clamped = Math.max(1, Math.min(Math.round(target), 20));
+  if (clamped > activeDlSlots.size) {
+    for (let i = 1; i <= 20 && activeDlSlots.size < clamped; i++) activeDlSlots.add(i);
+  } else if (clamped < activeDlSlots.size) {
+    for (let i = 20; i >= 1 && activeDlSlots.size > clamped; i--) activeDlSlots.delete(i);
+  }
+}
+
+// Autoscale tick (every 15s when autoscaleEnabled): grow toward
+// maxDownloadWorkers while the queue has backlog and bandwidth headroom, shed
+// slots when the aggregate speed saturates the configured cap, and fall back
+// to minDownloadWorkers when there is nothing to do. With autoscaling
+// disabled the slot count stays pinned to maxConcurrentDownloads.
+function autoscaleTick() {
+  if (!autoscaler.enabled) {
+    setActiveSlots(Math.max(autoscaler.minWorkers, Math.min(globalConfig.maxConcurrentDownloads, autoscaler.maxWorkers)));
+    autoscaler.targetWorkers = activeDlSlots.size;
+    return;
+  }
+  try {
+    const q = db.query(
+      `SELECT SUM(CASE WHEN download_status = 'pending'
+            OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
+          THEN 1 ELSE 0 END) as backlog
+       FROM jobs`
+    ).get() as any;
+    const backlog = q?.backlog || 0;
+    const aggBps = autoscaler.getAggregateSpeed();
+    const capBps = autoscaler.maxBandwidthKBps * 1024;
+    let target = activeDlSlots.size;
+    if (backlog === 0) {
+      target = autoscaler.minWorkers;
+    } else if (capBps > 0 && aggBps > capBps * 0.9 && target > autoscaler.minWorkers) {
+      target--; // bandwidth saturated — fewer slots = more headroom each
+    } else if (backlog > target && target < autoscaler.maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
+      target++; // waiting jobs + bandwidth headroom — add one slot per tick
+    }
+    setActiveSlots(target);
+    autoscaler.targetWorkers = activeDlSlots.size;
+  } catch {}
+}
 
 const aliveDownloadWorkers = new Set<number>();
 let activeConverts = 0;
@@ -554,6 +608,48 @@ function triggerResume() {
     );
     if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
   } catch {}
+  // A human resumed the engine — give the failure circuit a clean slate.
+  failureCircuit.dl = 0;
+  failureCircuit.post = 0;
+}
+
+// --- Circuit breaker ---------------------------------------------------------
+// maxFailures is a consecutive-failure tripwire per pipeline stage: a run of
+// hard failures with no successes in between (expired cookies overnight, a
+// YouTube outage, a broken ffmpeg) pauses the whole engine instead of letting
+// it burn through the queue one video at a time.
+const failureCircuit = { dl: 0, post: 0 };
+
+function notePipelineSuccess(stage: "dl" | "post") {
+  if (stage === "dl") failureCircuit.dl = 0;
+  else failureCircuit.post = 0;
+}
+
+function notePipelineFailure(stage: "dl" | "post", config: Config) {
+  if (stage === "dl") failureCircuit.dl++;
+  else failureCircuit.post++;
+  const worst = Math.max(failureCircuit.dl, failureCircuit.post);
+  if (worst >= config.maxFailures) {
+    const detail = `TOO_MANY_FAILURES (${failureCircuit.dl} consecutive download / ${failureCircuit.post} consecutive post-processing failures, limit ${config.maxFailures})`;
+    failureCircuit.dl = 0;
+    failureCircuit.post = 0;
+    logError("circuit", `pausing engine: ${detail}`);
+    triggerPause(detail);
+  }
+}
+
+// Remove a video id from the yt-dlp --download-archive file (the id is the
+// last field of each line) so a lost or moved file can be downloaded again.
+function removeFromArchive(archiveFile: string, videoId: string) {
+  try {
+    if (!archiveFile || !existsSync(archiveFile)) return;
+    const lines = readFileSync(archiveFile, "utf-8").split("\n");
+    const kept = lines.filter((l) => {
+      const parts = l.trim().split(/\s+/);
+      return parts.length === 0 || parts[parts.length - 1] !== videoId;
+    });
+    if (kept.length !== lines.length) writeFileSync(archiveFile, kept.join("\n"));
+  } catch {}
 }
 
 async function checkInternet(): Promise<boolean> {
@@ -590,7 +686,7 @@ async function networkMonitor() {
   }
 }
 
-function spawnWithTimeout(cmd: string[], args: string[], timeoutMs: number) {
+function spawnWithTimeout(cmd: string, args: string[], timeoutMs: number) {
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), timeoutMs);
   const proc = Bun.spawn([cmd, ...args], { stdout: "pipe", stderr: "pipe", signal: ac.signal });
@@ -711,8 +807,9 @@ async function getPlaylistItems(url: string, config: Config) {
   }).filter(i => i.id);
 }
 
-async function scanAndIngest(url: string, config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
-  const items = await getPlaylistItems(url, config);
+// Insert (or skip) a batch of listing items into the jobs table. Shared by
+// the full scanner (yt-dlp flat listing) and the cheap RSS poller.
+async function ingestItems(items: { id: string; title: string; playlist: string; duration: number }[], config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
   const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
   const outputDir = join(config.outputRoot, folder);
@@ -731,7 +828,15 @@ async function scanAndIngest(url: string, config: Config, overrideFolderName?: s
   const insertTransaction = db.transaction((items: any[]) => {
     const stmt = db.prepare(`INSERT OR IGNORE INTO jobs (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", download_status, conversion_status, metadata_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`);
     for (const item of items) {
-      if (isVideoInDb(item.id)) { skipped++; stats.skipped++; continue; }
+      if (isVideoInDb(item.id)) {
+        // A job parked as waiting_live (stream was live at download time) may
+        // have ended by now — any fresh listing that still contains it requeues
+        // it; the !is_live filter drops it again if it is somehow still live.
+        db.run(`UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`, [item.id]);
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
       if (config.skipShorts && !config.downloadShorts && Number.isFinite(item.duration) && item.duration > 0 && item.duration < 60) {
         skipped++;
         stats.skipped++;
@@ -747,6 +852,11 @@ async function scanAndIngest(url: string, config: Config, overrideFolderName?: s
   return { found: items.length, added, skipped };
 }
 
+async function scanAndIngest(url: string, config: Config, overrideFolderName?: string): Promise<{ found: number; added: number; skipped: number }> {
+  const items = await getPlaylistItems(url, config);
+  return ingestItems(items, config, overrideFolderName);
+}
+
 // ==========================================
 // 7. DOWNLOAD WORKER (RESILIENT)
 // ==========================================
@@ -755,6 +865,9 @@ async function downloadWorker(id: number, config: Config) {
   aliveDownloadWorkers.add(id);
   while (!abortController.signal.aborted) {
     if (globalIsPaused) { await Bun.sleep(2000); continue; }
+    // Autoscaling gate: a scaled-down slot's worker idles here instead of
+    // claiming work (a job already in flight always runs to completion).
+    if (!activeDlSlots.has(id)) { await Bun.sleep(1000); continue; }
 
     const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
     if (!disk.ok) {
@@ -789,6 +902,19 @@ async function downloadWorker(id: number, config: Config) {
         "--fragment-retries", "10", "--extractor-retries", "5",
         "--continue", "--no-overwrites"
       ];
+
+      // Real bandwidth cap: --limit-rate applies per yt-dlp process, so the
+      // configured global cap is split across the currently active slots.
+      if (config.maxBandwidthKBps > 0) {
+        const perWorkerKBps = Math.max(64, Math.floor(config.maxBandwidthKBps / Math.max(1, activeDlSlots.size)));
+        args.push("--limit-rate", `${perWorkerKBps}K`);
+      }
+      // yt-dlp's own idempotence layer: ids already in the archive file are
+      // never re-downloaded, even if a job is re-queued after a DB reset.
+      if (config.archiveFile) args.push("--download-archive", config.archiveFile);
+      // "Wait for VOD" mode: never grab a stream while it is still live — the
+      // job is parked as waiting_live and re-queued by the next full scan.
+      if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
 
       // Sidecar files (subs/thumbnail/description/info.json) are fetched by the
       // metadata worker once the download completes; the download phase only
@@ -870,6 +996,7 @@ async function downloadWorker(id: number, config: Config) {
         const fileSize = (await stat(filePath)).size;
         db.run(`UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = ?, progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [filePath, fileSize, filePath, job.id]);
         stats.downloaded++;
+        notePipelineSuccess("dl");
         updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
       } else {
         const tail = [stderrText, buffer].filter(Boolean).join("\n").split("\n").filter(l => l.trim()).slice(-4).join(" ");
@@ -902,6 +1029,25 @@ async function downloadWorker(id: number, config: Config) {
         continue;
       }
 
+      // --download-archive recorded the id but our copy is gone (deleted by
+      // hand, moved, or the folder was cleaned). Scrub the id from the archive
+      // so yt-dlp will actually download it on the retry.
+      if (errMsg.includes("output file could not be located")) {
+        removeFromArchive(config.archiveFile, job.id);
+        db.run(`UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+        continue;
+      }
+
+      // archiveLiveStreams mode: yt-dlp refused the job because the stream is
+      // live right now. Park it until the next full rescan or a manual retry —
+      // scans flip waiting_live jobs back to pending once a VOD exists.
+      if (errMsg.includes("does not pass filter") || errMsg.includes("is live") || errMsg.includes("live event")) {
+        db.run(`UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);
+        updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
+        continue;
+      }
+
       const isTransient = ["unable to download", "connection reset", "timeout", "network is unreachable", "err_connection", "temporary failure", "could not connect", "sigabrt", "aborted"].some(e => errMsg.includes(e));
       if (isTransient) {
         db.run(`UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [errMsg.slice(0, 500), job.id]);
@@ -911,11 +1057,14 @@ async function downloadWorker(id: number, config: Config) {
       }
 
       const retryCount = job.retry_count + 1;
-      const newStatus = retryCount >= config.maxRetryAttempts ? 'failed' : 'pending';
+      // Hard per-video cap is the smaller of the two knobs so both stay honest.
+      const perVideoCap = Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
+      const newStatus = retryCount >= perVideoCap ? 'failed' : 'pending';
       db.run(`UPDATE jobs SET download_status = ?, retry_count = ?, last_error = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [newStatus, retryCount, errMsg.slice(0, 500), job.id]);
       if (newStatus === 'failed') {
         stats.failed++;
         logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+        notePipelineFailure("dl", config);
       }
       updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
     } finally {
@@ -1010,12 +1159,14 @@ async function converterWorker(id: number, config: Config) {
       }
       db.run(`UPDATE jobs SET conversion_status = 'done', file_path = ?, integrity = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [finalPath, integrity, job.id]);
       stats.converted++;
+      notePipelineSuccess("post");
       updateConvertWorkerLine(id, `✅ Done | ${job.title}`, config);
     } catch (err: any) {
       const errMsg = String(err).slice(0, 500);
       db.run(`UPDATE jobs SET conversion_status = 'failed', last_error = ?, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [errMsg, job.id]);
       stats.failed++;
       logError("conversion", `${job.id} ${job.title}: ${errMsg}`);
+      notePipelineFailure("post", config);
       updateConvertWorkerLine(id, `❌ Failed | ${job.title}`, config);
     }
   }
@@ -1086,6 +1237,7 @@ async function metadataWorker(id: number, config: Config) {
         [JSON.stringify(sidecars), job.id]
       );
       stats.metadata++;
+      notePipelineSuccess("post");
       updateMetadataWorkerLine(id, `✅ Metadata done (${sidecars.length} file(s)) | ${job.title}`, config);
     } catch (err: any) {
       const errMsg = String(err?.message || err).slice(0, 500);
@@ -1094,7 +1246,8 @@ async function metadataWorker(id: number, config: Config) {
         continue;
       }
       const attempts = (job.metadata_retry_count || 0) + 1;
-      const newStatus = attempts >= (config.maxRetryAttempts || 3) ? "failed" : "pending";
+      const perVideoCap = Math.min(config.maxRetryAttempts || 3, config.maxFailuresPerVideo || 3);
+      const newStatus = attempts >= perVideoCap ? "failed" : "pending";
       db.run(
         `UPDATE jobs SET metadata_status = ?, metadata_retry_count = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [newStatus, attempts, errMsg, job.id]
@@ -1102,6 +1255,7 @@ async function metadataWorker(id: number, config: Config) {
       if (newStatus === "failed") {
         stats.failed++;
         logError("metadata", `${job.id} ${job.title}: ${errMsg}`);
+        notePipelineFailure("post", config);
         updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
       } else {
         await Bun.sleep(15_000);
@@ -1161,12 +1315,13 @@ function renderDashboard() {
   const statsData = db.query(
     `SELECT 
       SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
+      SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
       SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
       SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
       COUNT(*) as total
     FROM jobs`
   ).get() as any;
-  updateAbsoluteLine(1, `🚀 DL:${aliveDownloadWorkers.size}/${autoscaler.targetWorkers} | ${agg}${cap} | Done:${statsData.downloaded || 0} Fail:${statsData.failed || 0} Tot:${statsData.total || 0}${globalIsPaused ? ' | ⏸️ PAUSED' : ''}`);
+  updateAbsoluteLine(1, `🚀 DL:${statsData.downloading || 0}/${autoscaler.targetWorkers} | ${agg}${cap} | Done:${statsData.downloaded || 0} Fail:${statsData.failed || 0} Tot:${statsData.total || 0}${globalIsPaused ? ' | ⏸️ PAUSED' : ''}`);
 }
 
 function resetTerminal() {
@@ -1206,7 +1361,7 @@ function buildRunReport(): string[] {
     const lines: string[] = [];
     lines.push(`=== Archive Engine Report — ${new Date().toISOString()} ===`);
     lines.push(`Uptime: ${formatDuration(process.uptime())} | Engine: ${globalIsPaused ? `PAUSED (${pauseReason || "unknown"})` : "RUNNING"}`);
-    lines.push(`Workers: ${aliveDownloadWorkers.size}/${autoscaler.targetWorkers} download | Speed: ${formatBytesPerSec(autoscaler.getAggregateSpeed())}`);
+    lines.push(`Download slots: ${activeDlSlots.size} (autoscale ${autoscaler.enabled ? "on" : "off"}) | Busy: ${totals.downloading || 0} | Speed: ${formatBytesPerSec(autoscaler.getAggregateSpeed())}`);
     lines.push(`Jobs — total: ${totals.total || 0}, pending: ${totals.pending || 0}, paused: ${totals.paused || 0}, downloading: ${totals.downloading || 0}, downloaded: ${totals.downloaded || 0}, failed: ${totals.failed || 0}`);
     lines.push(`Conversion — pending: ${totals.conv_pending || 0}, in progress: ${totals.conv_active || 0}, done: ${totals.conv_done || 0}, failed: ${totals.conv_failed || 0}`);
     lines.push(`Metadata — pending: ${totals.meta_pending || 0}, in progress: ${totals.meta_active || 0}, done: ${totals.meta_done || 0}, failed: ${totals.meta_failed || 0}`);
@@ -1227,9 +1382,76 @@ function buildRunReport(): string[] {
   }
 }
 
+// --- Web UI auth (optional shared-secret token) ------------------------------
+// When webToken is set, every request must present it — as a cookie (set after
+// the first successful sign-in), an Authorization: Bearer header, an
+// X-Web-Token header, or a ?token= query parameter. Comparison is timing-safe.
+function extractWebToken(req: Request, url: URL): string | null {
+  const auth = req.headers.get("authorization") || "";
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  const header = req.headers.get("x-web-token");
+  if (header) return header.trim();
+  const query = url.searchParams.get("token");
+  if (query) return query.trim();
+  const cookie = req.headers.get("cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)yta_token=([^;]+)/);
+  if (match) return decodeURIComponent(match[1]).trim();
+  return null;
+}
+
+function timingSafeEq(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function isAuthorized(req: Request, url: URL): boolean {
+  if (!globalConfig.webToken) return true;
+  const presented = extractWebToken(req, url);
+  return !!presented && timingSafeEq(presented, globalConfig.webToken);
+}
+
+// Minimal sign-in page: submits the token as ?token=..., the server validates
+// it, sets an HttpOnly cookie, and serves the real UI — so the stock dashboard
+// JS (plain fetch, no token logic) keeps working unchanged.
+const LOGIN_PAGE = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive — Sign in</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: min(360px, 90vw); box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  input { width: 100%; box-sizing: border-box; padding: .6rem .8rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: 1rem; }
+  button { margin-top: .8rem; width: 100%; padding: .6rem; border: 0; border-radius: 8px; background: #3b82f6; color: white; font-size: 1rem; cursor: pointer; }
+  .err { color: #f87171; font-size: .85rem; margin-top: .6rem; min-height: 1.2em; }
+</style></head>
+<body><div class="card">
+  <h1>Archive Web UI — sign in</h1>
+  <form onsubmit="return go()">
+    <input id="token" type="password" placeholder="Access token" autofocus>
+    <button type="submit">Sign in</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<script>
+  function go() {
+    const t = document.getElementById("token").value.trim();
+    if (!t) return false;
+    location.href = "/?token=" + encodeURIComponent(t);
+    return false;
+  }
+  if (new URLSearchParams(location.search).has("token")) {
+    document.getElementById("err").textContent = "Invalid token — try again.";
+  }
+</script>
+</body></html>`;
+
 function startWebServer(port: number) {
   return Bun.serve({
-    port, hostname: "0.0.0.0",
+    // LAN-safe default: listen on loopback unless webBind is explicitly set
+    // (e.g. 0.0.0.0 to reach the UI from other devices on the LAN).
+    port, hostname: globalConfig.webBind || "127.0.0.1",
     async fetch(req) {
       // Every request is wrapped: a handler crash returns JSON 500 instead of
       // hanging the socket, and the error lands in error.log.
@@ -1247,10 +1469,27 @@ async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   if (url.pathname === "/") {
+    const queryToken = url.searchParams.get("token");
+    if (globalConfig.webToken && !isAuthorized(req, url)) {
+      // Missing/wrong token → the sign-in page (401 so browsers don't treat it
+      // as the real app). A *valid* query token falls through, gets served the
+      // app, and receives an HttpOnly cookie for subsequent requests.
+      return new Response(LOGIN_PAGE, { status: 401, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    }
     if (existsSync("./web_ui.html")) {
-      return new Response(Bun.file("./web_ui.html"), { headers: { "Content-Type": "text/html" } });
+      const headers: Record<string, string> = { "Content-Type": "text/html" };
+      if (globalConfig.webToken && queryToken) {
+        headers["Set-Cookie"] = `yta_token=${encodeURIComponent(queryToken)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`;
+      }
+      return new Response(Bun.file("./web_ui.html"), { headers });
     }
     return new Response("web_ui.html not found. Please create it.", { status: 500 });
+  }
+
+  // Every API route (status, scan, pause/resume, purge, delete, ...) is gated
+  // behind the token too — purge/delete are destructive.
+  if (!isAuthorized(req, url)) {
+    return Response.json({ ok: false, error: "Unauthorized — token required" }, { status: 401 });
   }
 
   if (url.pathname === "/api/ping") {
@@ -1309,7 +1548,7 @@ async function handleRequest(req: Request): Promise<Response> {
       queuePosition: statsData.queued || 0,
       speed: avgSpeed,
       aggregateSpeed: formatBytesPerSec(avgSpeed),
-      activeWorkers: aliveDownloadWorkers.size,
+      activeWorkers: activeDlSlots.size,
       targetWorkers: autoscaler.targetWorkers,
       workers,
       isPaused: globalIsPaused,
@@ -1352,7 +1591,7 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   if (url.pathname === "/api/queue/purge" && req.method === "POST") {
-    const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'failed')");
+    const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'waiting_live', 'failed')");
     return Response.json({ ok: true, deleted: result.changes });
   }
 
@@ -1456,6 +1695,87 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   return new Response("Not Found", { status: 404 });
+}
+
+// ==========================================
+// 10b. RSS POLLING (CHEAP NEW-UPLOAD WATCHER)
+// ==========================================
+// Polling YouTube's per-channel RSS feed costs one plain HTTP GET per channel
+// (no yt-dlp spawn) and surfaces new uploads within ~rssPollIntervalMinutes —
+// far cheaper than a full flat-playlist rescan, which remains the slow safety
+// net via rescanIntervalHours. New video ids go through the same ingestItems
+// dedup as every other source.
+const channelIdCache = new Map<string, string>();
+
+async function resolveChannelId(channelUrl: string, config: Config): Promise<string | null> {
+  // /channel/UC... URLs carry the id directly — no yt-dlp call needed.
+  const direct = channelUrl.match(/channel\/(UC[\w-]{10,})/);
+  if (direct) return direct[1];
+  const cached = channelIdCache.get(channelUrl);
+  if (cached) return cached;
+  try {
+    // @handle / custom URLs: resolve once via yt-dlp, then cache for the run.
+    const proc = Bun.spawn([ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--playlist-end", "1", "--print", "%(channel_id)s", channelUrl], { stdout: "pipe", stderr: "pipe" });
+    const [out, , code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    if (code !== 0) return null;
+    const id = out.split("\n").map((s) => s.trim()).find((s) => /^UC[\w-]{10,}$/.test(s));
+    if (id) channelIdCache.set(channelUrl, id);
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function pollChannelRss(channelUrl: string, config: Config): Promise<number> {
+  const channelId = await resolveChannelId(channelUrl, config);
+  if (!channelId) throw new Error(`could not resolve channel id for ${channelUrl}`);
+  const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+  const res = await fetch(feedUrl, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`RSS HTTP ${res.status} for ${channelUrl}`);
+  const xml = await res.text();
+  // The feed-level title is the first <title> before any <entry>.
+  const feedTitle = xml.match(/<feed[^>]*>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() || "RSS Channel";
+  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
+  const items: { id: string; title: string; playlist: string; duration: number }[] = [];
+  for (const entry of entries) {
+    const id = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/)?.[1];
+    if (!id) continue;
+    const title = entry.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() || id;
+    // media:duration is best-effort; a missing duration (NaN) simply bypasses
+    // the shorts filter — the metadata worker records the real value later.
+    const duration = parseFloat(entry.match(/<media:content[^>]*duration="(\d+)"/)?.[1] ?? "NaN");
+    items.push({ id, title, playlist: feedTitle, duration });
+  }
+  const result = await ingestItems(items, config);
+  return result.added;
+}
+
+function startRssPolling(config: Config) {
+  if (!config.rssEnabled || config.channels.length === 0) return;
+  const intervalMs = Math.max(1, config.rssPollIntervalMinutes) * 60_000;
+  console.log(`RSS polling enabled: ${config.channels.length} channel(s), every ${config.rssPollIntervalMinutes} min.`);
+  // First pass shortly after startup (ingest dedup makes it harmless), then
+  // once per configured interval. The in-flight guard keeps a slow poll (dead
+  // network, stuck yt-dlp) from overlapping with the next tick.
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      for (const channel of config.channels) {
+        try {
+          const added = await pollChannelRss(channel, config);
+          if (added > 0) console.log(`RSS: ${added} new video(s) from ${channel}`);
+        } catch (e: any) {
+          logError("rss", `${channel}: ${e?.message || e}`);
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+  setTimeout(tick, Math.min(intervalMs, 2 * 60_000));
+  setInterval(tick, intervalMs);
 }
 
 // ==========================================
@@ -1622,10 +1942,15 @@ async function main() {
 
   initDashboard(globalConfig);
   webServer = startWebServer(globalConfig.webPort);
-  console.log(`🌐 Web UI: http://127.0.0.1:${globalConfig.webPort}`);
+  const uiHost = !globalConfig.webBind || globalConfig.webBind === "0.0.0.0" ? "127.0.0.1" : globalConfig.webBind;
+  console.log(`Web UI: http://${uiHost}:${globalConfig.webPort}${globalConfig.webToken ? "  (token required)" : ""}${globalConfig.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`);
 
   networkMonitor();
   setInterval(reapStaleClaims, 60_000);
+  // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
+  setInterval(autoscaleTick, 15_000);
+  // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
+  startRssPolling(globalConfig);
 
   // 4) Pipeline workers (each supervised — crashed loops restart automatically):
   //    download → metadata → converter, all driven by job status in the DB.

@@ -23,7 +23,6 @@ const ConfigSchema = z.object({
   minDownloadWorkers: z.number().min(1).max(20),
   maxBandwidthKBps: z.number().min(0),
   autoscaleEnabled: z.boolean(),
-  denoPath: z.string(),
   ytDlpPath: z.string(),
   ffmpegPath: z.string(),
   validateCookiesOnStart: z.boolean(),
@@ -49,6 +48,8 @@ const ConfigSchema = z.object({
   maxMetadataWorkers: z.number().min(1).max(10),
   daemonMode: z.boolean(),
   webPort: z.number().min(1).max(65535),
+  webBind: z.string(),
+  webToken: z.string(),
   rssEnabled: z.boolean(),
   rssPollIntervalMinutes: z.number().min(1),
   rescanIntervalHours: z.number().min(0),
@@ -67,7 +68,6 @@ const DEFAULT_CONFIG: Config = {
   minDownloadWorkers: 1,
   maxBandwidthKBps: 0,
   autoscaleEnabled: true,
-  denoPath: "deno",
   ytDlpPath: "",
   ffmpegPath: "",
   validateCookiesOnStart: true,
@@ -93,6 +93,8 @@ const DEFAULT_CONFIG: Config = {
   maxMetadataWorkers: 2,
   daemonMode: false,
   webPort: 3000,
+  webBind: "127.0.0.1",
+  webToken: "",
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
@@ -264,10 +266,20 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   
   // Bandwidth
   console.log("\n— Bandwidth Throttle —");
-  config.maxBandwidthKBps = await askNumber("Max bandwidth in KB/s (0 = unlimited)", config.maxBandwidthKBps, 0);
+  config.maxBandwidthKBps = await askNumber("Max bandwidth in KB/s (0 = unlimited, enforced via yt-dlp --limit-rate)", config.maxBandwidthKBps, 0);
   if (config.maxBandwidthKBps > 0) {
     console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap`);
   }
+
+  // Failure handling (circuit breaker)
+  console.log("\n— Failure Handling —");
+  config.maxRetryAttempts = await askNumber("Retries per video before it fails", config.maxRetryAttempts, 1);
+  config.maxFailuresPerVideo = await askNumber("Max failures per video (effective cap = min with retries)", config.maxFailuresPerVideo, 1);
+  config.maxFailures = await askNumber("Consecutive failures before the engine auto-pauses (circuit breaker)", config.maxFailures, 1);
+
+  // Download archive (yt-dlp idempotence)
+  const archAns = await ask(`   yt-dlp download-archive file [current: ${config.archiveFile}]: `);
+  if (archAns.trim() !== "") config.archiveFile = archAns.trim();
 
   // Storage Management
   console.log("\n— Storage Management —");
@@ -279,16 +291,24 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   console.log("\n— Web UI & Headless Daemon —");
   config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from Web UI)?", config.daemonMode);
   config.webPort = await askNumber("Web UI port", config.webPort, 1, 65535);
-  if (config.daemonMode) {
-    config.rssEnabled = await askYesNo("Watch RSS feeds (subscribe to new uploads, cheap, ~15 min latency)?", config.rssEnabled);
-    config.rssPollIntervalMinutes = await askNumber("RSS poll interval (minutes)", config.rssPollIntervalMinutes, 1);
-    config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
+  const bindAns = await ask(`   Web UI bind address (127.0.0.1 = this PC only, 0.0.0.0 = reachable from LAN) [current: ${config.webBind}]: `);
+  if (bindAns.trim() !== "") config.webBind = bindAns.trim();
+  const tokenAns = await ask(`   Web UI access token (blank keeps current, '-' clears it) [current: ${config.webToken ? "(set)" : "none"}]: `);
+  if (tokenAns.trim() === "-") config.webToken = "";
+  else if (tokenAns.trim() !== "") config.webToken = tokenAns.trim();
+  if (config.webToken && config.webBind === "0.0.0.0") {
+    console.log("   ℹ️ UI reachable from the LAN with a token set — good.");
+  } else if (config.webBind === "0.0.0.0") {
+    console.log("   ⚠️ 0.0.0.0 without a token: anyone on your network can pause/purge jobs.");
   }
-  
-  // JS Runtime (yt-dlp signature extraction)
-  console.log("\n— JS Runtime —");
-  const denoAns = await ask(`   Deno path (directory or .exe) [current: ${config.denoPath}]: `);
-  if (denoAns.trim()) config.denoPath = denoAns.trim();
+
+  // Channel watching (RSS + rescans)
+  console.log("\n— Channel Watching —");
+  config.rssEnabled = await askYesNo("Watch channel RSS feeds for new uploads (cheap, ~15 min latency)?", config.rssEnabled);
+  if (config.rssEnabled) {
+    config.rssPollIntervalMinutes = await askNumber("RSS poll interval (minutes)", config.rssPollIntervalMinutes, 1);
+  }
+  config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
 
   console.log("\n— External Tools (Windows-friendly auto-detect) —");
   const ytdlpAns = await ask(`   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `);
