@@ -345,6 +345,67 @@
       color: var(--text-secondary);
     }
     
+    .reliability-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 15px 18px;
+      margin-bottom: 18px;
+    }
+    
+    .reliability-panel h3 {
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .reliability-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    
+    .reliability-item {
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    
+    .reliability-item .label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+    
+    .reliability-item .value {
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    
+    .pill {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+    }
+    
+    .pill.ok { color: #4ade80; border-color: #166534; }
+    .pill.warn { color: #fbbf24; border-color: #92400e; }
+    .pill.bad { color: #f87171; border-color: #991b1b; }
+    
+    .job-subnote {
+      font-size: 0.7rem;
+      color: var(--text-secondary);
+      margin-top: 3px;
+    }
+    
     @media (max-width: 768px) {
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
       .controls { flex-direction: column; }
@@ -412,6 +473,38 @@
     <button class="btn btn-primary" onclick="scanUrl()">📡 Scan & Add to Queue</button>
   </div>
   
+  <div class="reliability-panel">
+    <h3>🛡️ Reliability &amp; Resume</h3>
+    <div class="reliability-grid">
+      <div class="reliability-item">
+        <div class="label">Engine</div>
+        <div class="value" id="relEngine">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Kept partials</div>
+        <div class="value" id="relPartials">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Retryable failures</div>
+        <div class="value" id="relResumable">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Waiting for VOD</div>
+        <div class="value" id="relWaiting">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Resume / backoff</div>
+        <div class="value" id="relPolicy">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Actions</div>
+        <div class="value">
+          <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.72rem;" onclick="requeueFailed()">♻️ Requeue failed</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
   <div class="controls">
     <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
     <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
@@ -452,6 +545,10 @@
   </div>
   
   <div id="failedTab" class="tab-content">
+    <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
+      <button class="btn btn-success" onclick="requeueFailed()">♻️ Requeue All Failed</button>
+      <small style="color: var(--text-secondary);">Transient failures are retried automatically after their cooldown — permanent ones (private / removed / age-gated) are never re-queued.</small>
+    </div>
     <div id="failedItems"></div>
   </div>
   
@@ -624,12 +721,14 @@
     // Main data fetching — status stats and the jobs table come from two endpoints.
     async function fetchStatus() {
       try {
-        const [res, jobsRes] = await Promise.all([
+        const [res, jobsRes, relRes] = await Promise.all([
           fetch('/api/status'),
-          fetch('/api/jobs')
+          fetch('/api/jobs'),
+          fetch('/api/reliability').catch(() => null)
         ]);
         const data = await res.json();
         const jobsData = jobsRes.ok ? await jobsRes.json() : { jobs: [] };
+        if (relRes && relRes.ok) renderReliability(await relRes.json());
 
         document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
         document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
@@ -679,6 +778,42 @@
       }
     }
     
+    // Reliability & resume panel.
+    function renderReliability(rel) {
+      const engine = document.getElementById('relEngine');
+      if (engine) {
+        if (rel.paused) {
+          engine.innerHTML = `<span class="pill warn">⏸️ paused</span> <small style="color: var(--text-secondary);">${escapeHtml(rel.pauseReason || '')}</small>`;
+        } else {
+          engine.innerHTML = '<span class="pill ok">▶️ running</span>';
+        }
+      }
+      const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+      setText('relPartials', `${rel.partialFiles?.count ?? 0} file(s)`);
+      setText('relResumable', `${rel.resumableFailed ?? 0} job(s)`);
+      setText('relWaiting', `${rel.waitingLive ?? 0} job(s)`);
+      const p = rel.policy || {};
+      setText('relPolicy', `${p.maxResumeAttempts ?? '?'} resumes · ${p.retryBackoffBaseSeconds ?? '?'}-${p.retryBackoffMaxSeconds ?? '?'}s backoff`);
+    }
+    
+    async function requeueFailed() {
+      try {
+        const res = await fetch('/api/failed/requeue', { method: 'POST' });
+        const data = await res.json();
+        const r = data.requeued || {};
+        const total = (r.downloads || 0) + (r.conversions || 0) + (r.metadata || 0);
+        showNotification(
+          total > 0
+            ? `♻️ Re-queued ${total} job(s) — permanent failures are skipped`
+            : '♻️ Nothing to re-queue (permanent failures are never retried)',
+          total > 0 ? 'success' : 'warning'
+        );
+        refreshData();
+      } catch {
+        showNotification('❌ Failed to re-queue failed jobs', 'error');
+      }
+    }
+    
     async function refreshData() {
       await fetchStatus();
       showNotification('🔄 Dashboard refreshed', 'success', 2000);
@@ -713,6 +848,17 @@
         const badgeText = status === 'paused' && job.pause_reason === 'waiting_live' ? 'waiting for VOD'
           : status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)'
           : statusLabel;
+        // Retry/resume bookkeeping — visible so a struggling video is
+        // distinguishable from one that simply has not started yet.
+        const attempts = [];
+        if (job.retry_count) attempts.push(`${job.retry_count} retry${job.retry_count === 1 ? '' : 's'}`);
+        if (job.resume_count) attempts.push(`${job.resume_count} resume${job.resume_count === 1 ? '' : 's'}`);
+        const attemptNote = attempts.length
+          ? `<div class="job-subnote">🔁 ${attempts.join(' · ')}${job.partial_file_path ? ' · partial kept' : ''}</div>`
+          : '';
+        const errorNote = job.last_error && (status === 'failed' || status === 'paused')
+          ? `<div class="job-subnote" title="${escapeHtml(job.last_error)}">⚠️ ${escapeHtml(job.last_error.slice(0, 90))}</div>`
+          : '';
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
         const location = job.file_path || job.output_directory || job.folder || '';
         const meta = job.metadata_status || 'not_needed';
@@ -738,7 +884,7 @@
             </td>
             <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
             <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
-            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span></td>
+            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
               ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
@@ -836,7 +982,7 @@
             <p style="color: var(--danger); margin: 10px 0;">${escapeHtml(job.last_error || 'Unknown error')}</p>
             <div class="history-meta">
               <span>Folder: ${escapeHtml(job.folder)}</span>
-              <span>Retries: ${job.retry_count || 0}</span>
+              <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
               <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>
               <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
             </div>

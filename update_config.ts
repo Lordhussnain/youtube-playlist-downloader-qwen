@@ -1,133 +1,14 @@
-// update_config.ts (V5 - Proxy-Free, Zod-Validated)
-// Interactive configuration manager for the YouTube Archival Engine
-// Run with: bun run update_config.ts
+// update_config.ts — interactive configuration manager for the engine.
+//
+// The Zod schema and defaults are imported from src/config.ts so this tool and
+// the engine can never disagree about what a valid config looks like.
+//
+// Run with: bun run update_config.ts   (or: bun run config)
 
-import { readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
-import { z } from "zod";
+import { CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
 
-const CONFIG_PATH = "./config.json";
 const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-// ==========================================
-// 1. ZOD SCHEMA & TYPES (Single Source of Truth)
-// ==========================================
-const ConfigSchema = z.object({
-  playlists: z.array(z.string()),
-  channels: z.array(z.string()),
-  channelPlaylists: z.array(z.string()),
-  maxConcurrentDownloads: z.number().min(1).max(20),
-  maxConcurrentConverts: z.number().min(1).max(10),
-  maxDownloadWorkers: z.number().min(1).max(20),
-  minDownloadWorkers: z.number().min(1).max(20),
-  maxBandwidthKBps: z.number().min(0),
-  autoscaleEnabled: z.boolean(),
-  ytDlpPath: z.string(),
-  ffmpegPath: z.string(),
-  validateCookiesOnStart: z.boolean(),
-  outputRoot: z.string(),
-  archiveFile: z.string(),
-  cookiesFile: z.string(),
-  deleteSourceAfterConvert: z.boolean(),
-  videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
-  downloadSubtitles: z.boolean(),
-  embedMetadata: z.boolean(),
-  writeInfoJson: z.boolean(),
-  writeDescription: z.boolean(),
-  writeThumbnail: z.boolean(),
-  archiveLiveStreams: z.boolean(),
-  verifyIntegrity: z.boolean(),
-  skipShorts: z.boolean(),
-  downloadShorts: z.boolean(),
-  maxRetryAttempts: z.number().min(1),
-  maxFailures: z.number().min(1),
-  maxFailuresPerVideo: z.number().min(1),
-  minFreeSpaceGB: z.number().min(1),
-  secondaryStoragePath: z.string(),
-  maxMetadataWorkers: z.number().min(1).max(10),
-  daemonMode: z.boolean(),
-  webPort: z.number().min(1).max(65535),
-  webBind: z.string(),
-  webToken: z.string(),
-  rssEnabled: z.boolean(),
-  rssPollIntervalMinutes: z.number().min(1),
-  rescanIntervalHours: z.number().min(0),
-});
-
-// Infer the TypeScript type directly from Zod (No manual interface needed!)
-type Config = z.infer<typeof ConfigSchema>;
-
-const DEFAULT_CONFIG: Config = {
-  playlists: [],
-  channels: [],
-  channelPlaylists: [],
-  maxConcurrentDownloads: 3,
-  maxConcurrentConverts: 2,
-  maxDownloadWorkers: 5,
-  minDownloadWorkers: 1,
-  maxBandwidthKBps: 0,
-  autoscaleEnabled: true,
-  ytDlpPath: "",
-  ffmpegPath: "",
-  validateCookiesOnStart: true,
-  outputRoot: "./downloads",
-  archiveFile: "downloaded_videos.txt",
-  cookiesFile: "cookies.txt",
-  deleteSourceAfterConvert: true,
-  videoQuality: "1080p",
-  downloadSubtitles: true,
-  embedMetadata: true,
-  writeInfoJson: true,
-  writeDescription: true,
-  writeThumbnail: true,
-  archiveLiveStreams: false,
-  verifyIntegrity: true,
-  skipShorts: true,
-  downloadShorts: false,
-  maxRetryAttempts: 3,
-  maxFailures: 10,
-  maxFailuresPerVideo: 4,
-  minFreeSpaceGB: 10,
-  secondaryStoragePath: "",
-  maxMetadataWorkers: 2,
-  daemonMode: false,
-  webPort: 3000,
-  webBind: "127.0.0.1",
-  webToken: "",
-  rssEnabled: true,
-  rssPollIntervalMinutes: 15,
-  rescanIntervalHours: 24,
-};
-
-// ==========================================
-// 2. LOAD / SAVE WITH ZOD VALIDATION
-// ==========================================
-async function loadConfig(): Promise<Config> {
-  if (!existsSync(CONFIG_PATH)) return { ...DEFAULT_CONFIG };
-  try {
-    const raw = JSON.parse(await readFile(CONFIG_PATH, "utf-8"));
-    // Merge with defaults to fill any missing new keys, then validate
-    const merged = { ...DEFAULT_CONFIG, ...raw };
-    return ConfigSchema.parse(merged); 
-  } catch (err: any) {
-    if (err.name === 'ZodError') {
-      // Zod v4 exposes validation problems via `issues` (not `errors`).
-      console.error("❌ config.json is invalid or corrupted:", JSON.stringify(err.issues ?? [], null, 2));
-      console.log("Falling back to default configuration.");
-    } else {
-      console.error("❌ Failed to parse config.json:", err?.message || err);
-      console.log("Falling back to default configuration.");
-    }
-    return { ...DEFAULT_CONFIG };
-  }
-}
-
-async function saveConfig(config: Config) {
-  // Final safety check before writing to disk
-  const validated = ConfigSchema.parse(config);
-  await writeFile(CONFIG_PATH, JSON.stringify(validated, null, 2));
-}
 
 // ---- Prompt Helpers --------------------------------------------------------
 async function ask(q: string): Promise<string> {
@@ -146,9 +27,18 @@ async function askNumber(q: string, current: number, min?: number, max?: number)
     const ans = await ask(`${q} [current: ${current}]: `);
     if (ans.trim() === "") return current;
     const n = parseInt(ans, 10);
-    if (isNaN(n)) { console.log("   ⚠️ Please enter a valid number."); continue; }
-    if (min !== undefined && n < min) { console.log(`   ⚠️ Must be >= ${min}.`); continue; }
-    if (max !== undefined && n > max) { console.log(`   ⚠️ Must be <= ${max}.`); continue; }
+    if (isNaN(n)) {
+      console.log("   ⚠️ Please enter a valid number.");
+      continue;
+    }
+    if (min !== undefined && n < min) {
+      console.log(`   ⚠️ Must be >= ${min}.`);
+      continue;
+    }
+    if (max !== undefined && n > max) {
+      console.log(`   ⚠️ Must be <= ${max}.`);
+      continue;
+    }
     return n;
   }
 }
@@ -172,7 +62,7 @@ async function askMultiLine(prompt: string): Promise<string[]> {
   while (true) {
     const line = await ask(" > ");
     if (line.trim() === "") break;
-    links.push(...line.split(/[,\n]+/).map(s => s.trim()).filter(s => s.length > 0));
+    links.push(...line.split(/[,\n]+/).map((s) => s.trim()).filter((s) => s.length > 0));
   }
   return links;
 }
@@ -198,14 +88,14 @@ async function manageUrlList(
     const list = config[key] || [];
     if (list.length === 0) console.log("  (none configured)\n");
     else list.forEach((url, i) => console.log(`  ${i + 1}. ${url}`));
-    
+
     console.log("\n  A. Add new");
     console.log("  R. Remove one");
     console.log("  C. Clear all");
     console.log("  B. Back\n");
-    
+
     const choice = (await ask("Select: ")).trim().toLowerCase();
-    
+
     if (choice === "a") {
       const newLinks = await askMultiLine(`Enter ${title} URLs/handles:`);
       let added = 0;
@@ -214,12 +104,18 @@ async function manageUrlList(
           console.log(`   ⚠️ Skipping invalid playlist URL: ${link}`);
           continue;
         }
-        if (!list.includes(link)) { list.push(link); added++; }
+        if (!list.includes(link)) {
+          list.push(link);
+          added++;
+        }
       }
       console.log(`\n✅ Added ${added} item(s).`);
       await ask("Press Enter to continue...");
     } else if (choice === "r") {
-      if (list.length === 0) { await ask("Nothing to remove. Press Enter..."); continue; }
+      if (list.length === 0) {
+        await ask("Nothing to remove. Press Enter...");
+        continue;
+      }
       const ans = await ask("Enter number to remove (or 'all'): ");
       if (ans.trim().toLowerCase() === "all") {
         if (await askYesNo("Remove ALL?", false)) config[key] = [];
@@ -242,40 +138,67 @@ async function manageUrlList(
 async function changeDownloadSettings(config: Config): Promise<Config> {
   console.clear();
   console.log("⚙️  Download Settings\n");
-  
+
   // Quality
   config.videoQuality = (await askChoice(
     "Video Quality:",
     ["highest", "1080p", "720p", "480p", "audio"],
     config.videoQuality,
   )) as Config["videoQuality"];
-  
+
   // Concurrency
   console.log("\n— Concurrency —");
   config.maxConcurrentDownloads = await askNumber("Starting download workers", config.maxConcurrentDownloads, 1, 20);
   config.maxConcurrentConverts = await askNumber("Concurrent conversion workers", config.maxConcurrentConverts, 1, 10);
   config.maxMetadataWorkers = await askNumber("Metadata workers (subs/thumbs/descriptions)", config.maxMetadataWorkers, 1, 10);
-  
+
   // Autoscaling
   console.log("\n— Dynamic Autoscaling —");
   config.autoscaleEnabled = await askYesNo("Enable dynamic worker autoscaling?", config.autoscaleEnabled);
   if (config.autoscaleEnabled) {
     config.maxDownloadWorkers = await askNumber("Max download workers (ceiling)", config.maxDownloadWorkers, 1, 20);
-    config.minDownloadWorkers = await askNumber("Min download workers (floor)", config.minDownloadWorkers, 1, config.maxDownloadWorkers);
+    config.minDownloadWorkers = await askNumber(
+      "Min download workers (floor)",
+      config.minDownloadWorkers,
+      1,
+      config.maxDownloadWorkers,
+    );
   }
-  
+
   // Bandwidth
   console.log("\n— Bandwidth Throttle —");
-  config.maxBandwidthKBps = await askNumber("Max bandwidth in KB/s (0 = unlimited, enforced via yt-dlp --limit-rate)", config.maxBandwidthKBps, 0);
+  config.maxBandwidthKBps = await askNumber(
+    "Max bandwidth in KB/s (0 = unlimited, enforced via yt-dlp --limit-rate)",
+    config.maxBandwidthKBps,
+    0,
+  );
   if (config.maxBandwidthKBps > 0) {
     console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap`);
   }
 
-  // Failure handling (circuit breaker)
+  // Failure handling (circuit breaker + backoff)
   console.log("\n— Failure Handling —");
   config.maxRetryAttempts = await askNumber("Retries per video before it fails", config.maxRetryAttempts, 1);
-  config.maxFailuresPerVideo = await askNumber("Max failures per video (effective cap = min with retries)", config.maxFailuresPerVideo, 1);
-  config.maxFailures = await askNumber("Consecutive failures before the engine auto-pauses (circuit breaker)", config.maxFailures, 1);
+  config.maxFailuresPerVideo = await askNumber(
+    "Max failures per video (effective cap = min with retries)",
+    config.maxFailuresPerVideo,
+    1,
+  );
+  config.maxFailures = await askNumber(
+    "Consecutive failures before the engine auto-pauses (circuit breaker)",
+    config.maxFailures,
+    1,
+  );
+  config.retryBackoffBaseSeconds = await askNumber(
+    "Retry backoff base delay (seconds, doubles each retry)",
+    config.retryBackoffBaseSeconds,
+    1,
+  );
+  config.retryBackoffMaxSeconds = await askNumber(
+    "Retry backoff maximum delay (seconds)",
+    config.retryBackoffMaxSeconds,
+    config.retryBackoffBaseSeconds,
+  );
 
   // Download archive (yt-dlp idempotence)
   const archAns = await ask(`   yt-dlp download-archive file [current: ${config.archiveFile}]: `);
@@ -284,16 +207,20 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   // Storage Management
   console.log("\n— Storage Management —");
   config.minFreeSpaceGB = await askNumber("Min free space (GB) before pausing", config.minFreeSpaceGB, 1);
-  const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || 'none'}]: `);
+  const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || "none"}]: `);
   if (nasPath.trim() !== "") config.secondaryStoragePath = nasPath.trim();
-  
+
   // Web UI & Daemon
   console.log("\n— Web UI & Headless Daemon —");
   config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from Web UI)?", config.daemonMode);
   config.webPort = await askNumber("Web UI port", config.webPort, 1, 65535);
-  const bindAns = await ask(`   Web UI bind address (127.0.0.1 = this PC only, 0.0.0.0 = reachable from LAN) [current: ${config.webBind}]: `);
+  const bindAns = await ask(
+    `   Web UI bind address (127.0.0.1 = this PC only, 0.0.0.0 = reachable from LAN) [current: ${config.webBind}]: `,
+  );
   if (bindAns.trim() !== "") config.webBind = bindAns.trim();
-  const tokenAns = await ask(`   Web UI access token (blank keeps current, '-' clears it) [current: ${config.webToken ? "(set)" : "none"}]: `);
+  const tokenAns = await ask(
+    `   Web UI access token (blank keeps current, '-' clears it) [current: ${config.webToken ? "(set)" : "none"}]: `,
+  );
   if (tokenAns.trim() === "-") config.webToken = "";
   else if (tokenAns.trim() !== "") config.webToken = tokenAns.trim();
   if (config.webToken && config.webBind === "0.0.0.0") {
@@ -311,11 +238,61 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
 
   console.log("\n— External Tools (Windows-friendly auto-detect) —");
-  const ytdlpAns = await ask(`   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `);
+  const ytdlpAns = await ask(
+    `   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `,
+  );
   if (ytdlpAns.trim()) config.ytDlpPath = ytdlpAns.trim();
   const ffAns = await ask(`   ffmpeg path (blank = auto-detect) [current: ${config.ffmpegPath || "auto"}]: `);
   if (ffAns.trim()) config.ffmpegPath = ffAns.trim();
-  
+
+  await ask("\n✅ Settings updated. Press Enter to return...");
+  return config;
+}
+
+// ---- Reliability & Resume Settings ------------------------------------------
+async function changeReliabilitySettings(config: Config): Promise<Config> {
+  console.clear();
+  console.log("🛡️  Reliability & Resume Settings\n");
+
+  console.log("These control what happens when a download is interrupted,\n");
+  console.log("fails, or a file disappears. Defaults are sensible for most setups.\n");
+
+  console.log("— Resume —");
+  config.maxResumeAttempts = await askNumber(
+    "Max resume attempts per video before restarting it from scratch",
+    config.maxResumeAttempts,
+    0,
+  );
+  console.log(
+    `   Interrupted downloads keep their .part file and continue with yt-dlp --continue;\n   after ${config.maxResumeAttempts} failed resumes the partial is discarded and the video restarts.`,
+  );
+
+  console.log("\n— Watchdogs —");
+  config.downloadTimeoutMinutes = await askNumber(
+    "Minimum download timeout (minutes) — scales up with video length automatically",
+    config.downloadTimeoutMinutes,
+    1,
+  );
+  config.maxDownloadMinutes = await askNumber(
+    "Maximum download timeout (minutes) for very long videos",
+    config.maxDownloadMinutes,
+    config.downloadTimeoutMinutes,
+  );
+
+  console.log("\n— Failed-job sweep —");
+  config.requeueFailedAfterMinutes = await askNumber(
+    "Re-queue transiently failed jobs after (minutes; 0 = never)",
+    config.requeueFailedAfterMinutes,
+    0,
+  );
+  console.log("   Permanent failures (private / removed / age-gated videos) are never re-queued.");
+
+  console.log("\n— Startup checks —");
+  config.verifyExistingFiles = await askYesNo(
+    "On startup, verify downloaded files still exist and re-queue missing ones?",
+    config.verifyExistingFiles,
+  );
+
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;
 }
@@ -324,7 +301,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
 async function changeFeatureToggles(config: Config): Promise<Config> {
   console.clear();
   console.log("🎛️  Feature Toggles\n");
-  
+
   config.downloadSubtitles = await askYesNo("Download & embed subtitles?", config.downloadSubtitles);
   config.embedMetadata = await askYesNo("Embed metadata, chapters & thumbnail?", config.embedMetadata);
   config.writeInfoJson = await askYesNo("Write .info.json sidecar files?", config.writeInfoJson);
@@ -334,7 +311,7 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   config.skipShorts = await askYesNo("Skip YouTube Shorts (< 60s)?", config.skipShorts);
   config.archiveLiveStreams = await askYesNo("Archive Live Streams (wait for VOD)?", config.archiveLiveStreams);
   config.deleteSourceAfterConvert = await askYesNo("Delete source file after conversion?", config.deleteSourceAfterConvert);
-  
+
   await ask("\n✅ Toggles updated. Press Enter to return...");
   return config;
 }
@@ -349,41 +326,57 @@ async function viewConfig(config: Config) {
 
 // ---- Main Menu -------------------------------------------------------------
 async function mainMenu() {
-  let config = await loadConfig();
-  
+  let config = await loadConfigSafe(CONFIG_PATH);
+
   while (true) {
     console.clear();
     console.log("=======================================");
-    console.log("  🎬 Archiver V5 Config Manager      ");
+    console.log("  🎬 Archiver Config Manager          ");
     console.log("=======================================\n");
     console.log("  1. Manage Standard Playlists");
     console.log("  2. Manage Channels (all uploads)");
     console.log("  3. Manage Channel Playlists");
     console.log("  4. Change Download Settings (Quality, Concurrency, Autoscale, Storage, Web UI)");
     console.log("  5. Change Feature Toggles (Subs, Metadata, Shorts, Integrity)");
-    console.log("  6. View Current Configuration");
-    console.log("  7. Save and Exit");
-    console.log("  8. Exit without Saving\n");
-    
-    const choice = (await ask("Select (1-8): ")).trim();
-    
+    console.log("  6. Change Reliability & Resume Settings");
+    console.log("  7. View Current Configuration");
+    console.log("  8. Save and Exit");
+    console.log("  9. Exit without Saving\n");
+
+    const choice = (await ask("Select (1-9): ")).trim();
+
     switch (choice) {
-      case "1": config = await manageUrlList(config, "playlists", "Playlists"); break;
-      case "2": config = await manageUrlList(config, "channels", "Channels"); break;
-      case "3": config = await manageUrlList(config, "channelPlaylists", "Channel Playlists"); break;
-      case "4": config = await changeDownloadSettings(config); break;
-      case "5": config = await changeFeatureToggles(config); break;
-      case "6": await viewConfig(config); break;
+      case "1":
+        config = await manageUrlList(config, "playlists", "Playlists");
+        break;
+      case "2":
+        config = await manageUrlList(config, "channels", "Channels");
+        break;
+      case "3":
+        config = await manageUrlList(config, "channelPlaylists", "Channel Playlists");
+        break;
+      case "4":
+        config = await changeDownloadSettings(config);
+        break;
+      case "5":
+        config = await changeFeatureToggles(config);
+        break;
+      case "6":
+        config = await changeReliabilitySettings(config);
+        break;
       case "7":
+        await viewConfig(config);
+        break;
+      case "8":
         try {
-          await saveConfig(config);
+          await saveConfig(config, CONFIG_PATH);
           console.log("\n✅ Configuration saved to " + CONFIG_PATH);
         } catch (e: any) {
           console.error("\n❌ Failed to save config:", e.message);
         }
         rl.close();
         return;
-      case "8":
+      case "9":
         console.log("\n👋 Exited without saving.");
         rl.close();
         return;
