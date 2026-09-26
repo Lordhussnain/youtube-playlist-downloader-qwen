@@ -24,6 +24,24 @@ export const ConfigSchema = z
     maxMetadataWorkers: z.number().min(1).max(10),
     maxBandwidthKBps: z.number().min(0),
     autoscaleEnabled: z.boolean(),
+    // Download performance: aria2c multi-connection downloading (preferred
+    // when the binary is available; the engine falls back to yt-dlp's native
+    // downloader otherwise, or for HLS/live streams which aria2c cannot serve).
+    useAria2c: z.boolean(),
+    // aria2c: connections per download (-x/-s/-j) and the minimum size before
+    // aria2c bothers splitting a file (-k / --min-split-size).
+    connectionsPerDownload: z.number().min(1).max(64),
+    minSplitSize: z.string(),
+    // yt-dlp native downloader tuning (used for DASH/HLS fragments and as the
+    // fallback path): parallel fragments, fragment retries, HTTP range
+    // chunking, and the socket buffer size.
+    concurrentFragments: z.number().min(1).max(64),
+    fragmentRetries: z.number().min(1).max(50),
+    httpChunkSize: z.string(),
+    bufferSize: z.string(),
+    // How many download slots the autoscaler may add per tick when the queue
+    // has a backlog (1 = the original slow ramp, one slot per 15s).
+    autoscaleRampStep: z.number().min(1).max(10),
     // --- External tools ------------------------------------------------------
     ytDlpPath: z.string(),
     ffmpegPath: z.string(),
@@ -104,6 +122,14 @@ export const DEFAULT_CONFIG: Config = {
   maxMetadataWorkers: 2,
   maxBandwidthKBps: 0,
   autoscaleEnabled: true,
+  autoscaleRampStep: 2,
+  useAria2c: true,
+  connectionsPerDownload: 16,
+  minSplitSize: "1M",
+  concurrentFragments: 16,
+  fragmentRetries: 10,
+  httpChunkSize: "",
+  bufferSize: "",
   ytDlpPath: "",
   ffmpegPath: "",
   validateCookiesOnStart: true,

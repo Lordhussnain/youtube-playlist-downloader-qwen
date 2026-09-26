@@ -1,0 +1,58 @@
+#!/usr/bin/env bun
+// tests/mocks/aria2c — a fake aria2c for offline integration tests.
+//
+// yt-dlp invokes it as an external downloader:
+//   aria2c --no-conf -x16 -s16 -j16 -k 1M --min-split-size 1M \
+//          --file-allocation=none --remove-control-file=true \
+//          [--max-overall-download-limit 1024K] --out <tmpfilename> <url>
+//
+// The mock answers --version (so the engine's dependency probe accepts it),
+// writes the payload to the --out path, and records the argv it received to
+// "<out>.aria2-args" so the test can assert the multi-connection settings and
+// the bandwidth cap actually reached the downloader.
+
+const argv = process.argv.slice(2);
+
+if (argv.includes("--version")) {
+  console.log("1.37.0-mock");
+  process.exit(0);
+}
+
+function flagValue(name: string): string | null {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+}
+
+const out = flagValue("--out") ?? flagValue("-o");
+
+if (!out) {
+  console.error("aria2c mock: no --out given");
+  process.exit(1);
+}
+
+// Respect the engine's failure injection so retry/resume can be exercised on
+// the aria2c path too.
+const failTimes = parseInt(process.env.FAKE_FAIL_TIMES || "0", 10);
+const counterFile = `${out}.aria2-attempts`;
+let attempts = 0;
+try {
+  attempts = parseInt(await Bun.file(counterFile).text(), 10) || 0;
+} catch {}
+attempts += 1;
+await Bun.write(counterFile, String(attempts));
+
+if (failTimes > 0 && attempts <= failTimes) {
+  await Bun.write(out, "x".repeat(4096)); // partial, like a real interruption
+  console.error("aria2c mock: simulated failure");
+  process.exit(3);
+}
+
+// Record what yt-dlp actually asked for. This file is durable evidence for the
+// integration test, so it is intentionally NOT cleaned up on success.
+await Bun.write(`${out}.aria2-args`, argv.join(" "));
+await Bun.write(out, "fake-aria2c-payload");
+try {
+  await Bun.file(counterFile).unlink();
+} catch {}
+console.log(`aria2c mock: wrote ${out}`);
+process.exit(0);

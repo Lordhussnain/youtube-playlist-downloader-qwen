@@ -14,6 +14,8 @@ export const autoscaler = {
   minWorkers: 1,
   maxWorkers: 5,
   maxBandwidthKBps: 0,
+  // Slots added per tick while a backlog exists (1 = the original slow ramp).
+  rampStep: 2,
   workerSpeeds: new Map<number, number>(),
   init(c: {
     autoscaleEnabled: boolean;
@@ -21,11 +23,13 @@ export const autoscaler = {
     maxDownloadWorkers: number;
     maxConcurrentDownloads: number;
     maxBandwidthKBps: number;
+    autoscaleRampStep: number;
   }) {
     this.enabled = c.autoscaleEnabled;
     this.minWorkers = c.minDownloadWorkers;
     this.maxWorkers = c.maxDownloadWorkers;
     this.maxBandwidthKBps = c.maxBandwidthKBps;
+    this.rampStep = Math.max(1, Math.floor(c.autoscaleRampStep));
     this.targetWorkers = Math.max(this.minWorkers, Math.min(c.maxConcurrentDownloads, this.maxWorkers));
     setActiveSlots(this.targetWorkers);
   },
@@ -83,7 +87,9 @@ export function autoscaleTick(): void {
     } else if (capBps > 0 && aggBps > capBps * 0.9 && target > autoscaler.minWorkers) {
       target--; // bandwidth saturated — fewer slots = more headroom each
     } else if (backlog > target && target < autoscaler.maxWorkers && (capBps === 0 || aggBps < capBps * 0.7)) {
-      target++; // waiting jobs + bandwidth headroom — add one slot per tick
+      // Waiting jobs + bandwidth headroom: grow by the configured ramp step,
+      // but never overshoot either the backlog or the worker ceiling.
+      target = Math.min(target + autoscaler.rampStep, backlog, autoscaler.maxWorkers);
     }
     setActiveSlots(target);
     autoscaler.targetWorkers = activeDlSlots.size;
