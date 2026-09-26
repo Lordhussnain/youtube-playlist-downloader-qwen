@@ -18,6 +18,8 @@ import { triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
+import { aria2cPath } from "./tools";
+import { resolveDownloaderEngine } from "./download-args";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { logError } from "./logger";
 import type { Config } from "./config";
@@ -385,6 +387,14 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
         verifyExistingFiles: config.verifyExistingFiles,
         downloadTimeoutMinutes: config.downloadTimeoutMinutes,
         maxDownloadMinutes: config.maxDownloadMinutes,
+      },
+      downloader: {
+        engine: resolveDownloaderEngine(config, !!aria2cPath()),
+        path: aria2cPath(),
+        connectionsPerDownload: config.connectionsPerDownload,
+        concurrentFragments: config.concurrentFragments,
+        maxBandwidthKBps: config.maxBandwidthKBps,
+        autoscaleRampStep: config.autoscaleRampStep,
       },
     });
   }

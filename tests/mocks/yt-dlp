@@ -16,6 +16,8 @@
 //   FAKE_HANG=1             hang forever (watchdog test)
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
 
+import { rename } from "node:fs/promises";
+
 const argv = process.argv.slice(2);
 
 function flag(name: string): boolean {
@@ -79,6 +81,8 @@ const failTimes = num("FAKE_FAIL_TIMES", 0);
 const failMode = process.env.FAKE_FAIL_MODE || "transient";
 const delayMs = num("FAKE_DELAY_MS", 60);
 const counterFile = `${base}.attempts`;
+// The engine always puts the video URL first (yt-dlp <url> --flags …).
+const url = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
 
 // Count attempts across processes so a retry loop sees the same counter.
 let attempts = 0;
@@ -107,6 +111,39 @@ if (failTimes > 0 && attempts <= failTimes) {
         : "ERROR: Unable to download webpage: Connection reset by peer (transient mock failure)";
   console.error(msg);
   process.exit(1);
+}
+
+// --- external downloader (aria2c) --------------------------------------------
+// yt-dlp hands the transfer to aria2c with its own argument set. Faithfully
+// forward: the parsed --downloader-args, --limit-rate mapped to aria2c's
+// --max-overall-download-limit, the .part temp file as --out, and the URL.
+if (flagValue("--downloader") === "aria2c") {
+  const raw = flagValue("--downloader-args") || "";
+  // Strip the aria2c:"…" wrapper (a simplified shlex) and split into argv.
+  const inner = raw.replace(/^aria2c:"?/, "").replace(/"?$/, "").split(/\s+/).filter(Boolean);
+  const limit = flagValue("--limit-rate");
+  const forwarded = [
+    "aria2c",
+    "--no-conf",
+    ...inner,
+    ...(limit ? ["--max-overall-download-limit", limit] : []),
+    "--file-allocation=none",
+    "--remove-control-file=true",
+    "--out",
+    partPath,
+    url,
+  ];
+  const proc = Bun.spawn(forwarded, { stdout: "inherit", stderr: "inherit" });
+  const code = await proc.exited;
+  if (code !== 0) {
+    console.error(`ERROR: aria2c mock exited ${code}`);
+    process.exit(1);
+  }
+  // aria2c downloaded into the .part file; adopt it as the media file so the
+  // directory ends up exactly like a native yt-dlp run (no leftover .part).
+  try {
+    await rename(partPath, finalPath);
+  } catch {}
 }
 
 // Progress output in the engine's PROGRESS format, then the final path.

@@ -9,6 +9,8 @@ a terminal UI and a web dashboard to watch it all happen.
 
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
 - **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
+- **aria2c multi-connection downloads** — up to 64 parallel connections per file (16 by default), with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams
+- **Bandwidth-aware scaling** — an optional global cap is split across the active download slots, and the autoscaler grows the pool while the queue has backlog and bandwidth headroom
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
@@ -25,16 +27,19 @@ a terminal UI and a web dashboard to watch it all happen.
 
 - [Bun](https://bun.sh) + TypeScript — runtime and application logic
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
+- [aria2c](https://aria2.github.io/) — optional multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion
 
 ## Requirements
 
 - Bun ≥ 1.0
 - `yt-dlp` and `ffmpeg` available on `PATH` (or configured explicitly)
+- [aria2c](https://aria2.github.io/) **optional** — enables multi-connection downloads; without it the engine uses yt-dlp's native downloader
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
-error if anything required is missing.
+error if anything required is missing. A missing aria2c is reported as a
+warning and never blocks startup.
 
 ## Development
 
@@ -103,7 +108,23 @@ supported alongside these global defaults.
 | `downloadTimeoutMinutes` | Minimum per-video download timeout |
 | `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
 
-Edit these interactively with `bun run config` → **Change Reliability & Resume
+Edit these interactively with `bun run config` → **Change Reliability & Resume**.
+
+### Download performance settings
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `useAria2c` | `true` | Download through aria2c for multi-connection transfers. Falls back to yt-dlp's native downloader when the binary is missing, or for HLS/live streams which aria2c cannot serve. |
+| `connectionsPerDownload` | `16` | aria2c `-x`/`-s`/`-j` — connections per download (1–64). Higher is faster on healthy CDNs; lower is gentler on throttled ones. |
+| `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. |
+| `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. |
+| `fragmentRetries` | `10` | Retries per fragment before a download fails. |
+| `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
+| `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
+| `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
+| `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+Edit these interactively with `bun run config` → **Change Download Settings**.
 Settings**, or from the web dashboard's reliability panel.
 
 ## Usage
@@ -132,7 +153,8 @@ src/
   config.ts        Zod schema + defaults + load/save (single source of truth)
   db.ts            SQLite schema, migrations, atomic job claims
   state.ts         shared mutable runtime state (pause, stats, workers)
-  tools.ts         yt-dlp/ffmpeg discovery + cookies helpers
+  tools.ts         yt-dlp/ffmpeg/aria2c discovery + cookies helpers
+  download-args.ts pure yt-dlp command construction (downloader engine, tuning)
   retry.ts         pure retry policy: backoff, watchdogs, error classification
   resilience.ts    pause/resume, circuit breaker, network + disk guards
   reconcile.ts     self-healing sweeps (crashes, stale claims, missing files, failed jobs)
@@ -157,9 +179,11 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
    clean up unusable partials
 2. **Scan** — every configured playlist/channel is listed (yt-dlp flat scan or
    cheap RSS polling) and deduplicated into the jobs table by video id
-3. **Download workers** — pull videos into the configured output directory.
-   Failures keep the `.part` file and retry with exponential backoff; the retry
-   budget only shrinks while the video makes no forward progress
+3. **Download workers** — pull videos into the configured output directory
+   through aria2c (multi-connection) when available, otherwise yt-dlp's native
+   downloader. Failures keep the `.part` file and retry with exponential
+   backoff; the retry budget only shrinks while the video makes no forward
+   progress
 4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
 5. **Converter workers** — convert completed downloads into the target format,
    optionally moving them (with sidecars) to a secondary storage path

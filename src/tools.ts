@@ -9,12 +9,23 @@ import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os from "node:os";
 
-export const resolvedTools = { ytDlp: "yt-dlp", ffmpeg: "ffmpeg" };
+// aria2c is optional: when present it becomes the multi-connection downloader
+// (yt-dlp --downloader aria2c), and when absent the engine transparently uses
+// yt-dlp's native downloader. `aria2cPath` stays "" until discovery finds it.
+export const resolvedTools = { ytDlp: "yt-dlp", ffmpeg: "ffmpeg", aria2cPath: "" as string | null };
 export function ytDlp(): string {
   return resolvedTools.ytDlp;
 }
 export function ffmpeg(): string {
   return resolvedTools.ffmpeg;
+}
+/** Resolved aria2c path, or null when it is unavailable. */
+export function aria2cPath(): string | null {
+  return resolvedTools.aria2cPath;
+}
+/** The executable yt-dlp should hand transfers to, or "native" for its own. */
+export function activeDownloader(): "aria2c" | "native" {
+  return resolvedTools.aria2cPath ? "aria2c" : "native";
 }
 
 /** `--cookies <file>` when the file exists and is non-empty, else nothing. */
@@ -110,12 +121,17 @@ async function resolveTool(
 export async function checkDependencies(config: {
   ytDlpPath: string;
   ffmpegPath: string;
+  aria2cPath?: string;
+  useAria2c?: boolean;
 }): Promise<void> {
   console.log("🔎 Checking dependencies...");
   const missing: string[] = [];
-  const [ytdlp, ffm] = await Promise.all([
+  const [ytdlp, ffm, aria2] = await Promise.all([
     resolveTool(config.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"]),
     resolveTool(config.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"]),
+    // aria2c is probed regardless of the flag so the status line can report
+    // why it is (not) being used; a missing binary is never fatal.
+    resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"]),
   ]);
 
   if (ytdlp) {
@@ -138,6 +154,21 @@ export async function checkDependencies(config: {
     console.error("  ❌ ffmpeg: not found (PATH, app folder, winget/scoop/chocolatey, ffmpegPath)");
     missing.push(
       `ffmpeg — Install: winget install Gyan.FFmpeg  |  scoop install ffmpeg  |  choco install ffmpeg  |  or set "ffmpegPath" in config.json`,
+    );
+  }
+
+  resolvedTools.aria2cPath = aria2 ? aria2.path : null;
+  if (aria2) {
+    if (config.useAria2c === false) {
+      console.log(`  ⚪ aria2c: ${aria2.version || "ok"}  [disabled in config — using yt-dlp's native downloader]`);
+    } else {
+      console.log(
+        `  ✅ aria2c: ${aria2.version || "ok"}${aria2.path.includes("/") || aria2.path.includes("\\") ? `  [${aria2.path}]` : "  [PATH]"}  [multi-connection downloads enabled]`,
+      );
+    }
+  } else if (config.useAria2c !== false) {
+    console.log(
+      "  ⚪ aria2c: not found — using yt-dlp's native downloader (install it for multi-connection speed: winget install aria2.aria2 | scoop install aria2 | choco install aria2)",
     );
   }
 

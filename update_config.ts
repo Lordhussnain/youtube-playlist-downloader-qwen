@@ -173,8 +173,48 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
     0,
   );
   if (config.maxBandwidthKBps > 0) {
-    console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap`);
+    console.log(`   ≈ ${(config.maxBandwidthKBps / 1024).toFixed(2)} MB/s global cap, split across active slots`);
   }
+
+  // Download performance (aria2c multi-connection + fragment tuning)
+  console.log("\n— Download Performance (aria2c / fragments) —");
+  config.useAria2c = await askYesNo(
+    "Use aria2c for multi-connection downloads? (auto-falls back to yt-dlp native when not installed)",
+    config.useAria2c,
+  );
+  if (config.useAria2c) {
+    config.connectionsPerDownload = await askNumber(
+      "Connections per download (aria2c -x/-s/-j)",
+      config.connectionsPerDownload,
+      1,
+      64,
+    );
+    const splitAns = await ask(`   Minimum split size before aria2c splits a file [current: ${config.minSplitSize}]: `);
+    if (splitAns.trim() !== "") config.minSplitSize = splitAns.trim();
+    console.log(`   yt-dlp maps the bandwidth cap to aria2c's --max-overall-download-limit automatically.`);
+  }
+  config.concurrentFragments = await askNumber(
+    "Concurrent fragments for DASH/HLS (yt-dlp native downloader)",
+    config.concurrentFragments,
+    1,
+    64,
+  );
+  config.fragmentRetries = await askNumber("Fragment retries", config.fragmentRetries, 1, 50);
+  const chunkAns = await ask(
+    `   HTTP chunk size for range-based chunked downloads (blank = off, e.g. 10M) [current: ${config.httpChunkSize || "off"}]: `,
+  );
+  config.httpChunkSize = chunkAns.trim();
+  const bufAns = await ask(`   Download buffer size (blank = yt-dlp default 1024, e.g. 16K) [current: ${config.bufferSize || "default"}]: `);
+  config.bufferSize = bufAns.trim();
+
+  // Autoscaling ramp
+  console.log("\n— Autoscaling Ramp —");
+  config.autoscaleRampStep = await askNumber(
+    "Download slots added per autoscale tick while the queue has a backlog",
+    config.autoscaleRampStep,
+    1,
+    10,
+  );
 
   // Failure handling (circuit breaker + backoff)
   console.log("\n— Failure Handling —");

@@ -8,25 +8,19 @@
 
 import { stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
-import { cookiesArgs, ytDlp } from "../tools";
+import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { findPartialFile } from "../reconcile";
 import { removeFromArchive } from "../archive";
-import { computeBackoffMs, computeDownloadTimeoutMs, isTransientDownloadError } from "../retry";
-import {
-  findDownloadedFile,
-  fitBaseFilename,
-  formatBytesPerSec,
-  parseSpeedToBytesPerSec,
-  sanitizeFileName,
-} from "../util";
+import { computeBackoffMs, isTransientDownloadError } from "../retry";
+import { buildDownloadPlan, jobBaseFilename } from "../download-args";
+import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
 import { abortController, activeProcs, isPaused, stats, workerStatuses } from "../state";
 import { logError } from "../logger";
-import { QUALITY_FORMATS, type Config } from "../config";
+import type { Config } from "../config";
 
 export const aliveDownloadWorkers = new Set<number>();
 
@@ -73,77 +67,20 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 
 /** One download attempt for `job`. Throws on any failure. */
 async function runDownload(id: number, job: Job, config: Config): Promise<void> {
-  updateWorkerLine(id, `⬇️ Starting... | ${job.title}`, config);
-  const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
-  const baseFilename = fitBaseFilename(
-    job.output_directory,
-    `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`,
-    job.id,
-  );
-  const outTemplate = join(job.output_directory, `${baseFilename}.%(ext)s`);
-
-  const args = [
-    ytDlp(),
-    job.url,
-    ...cookiesArgs(config),
-    "--format",
-    format,
-    "--concurrent-fragments",
-    "16",
-    "-o",
-    outTemplate,
-    // --newline/--no-colors keep progress lines parseable from a pipe.
-    "--progress",
-    "--newline",
-    "--no-colors",
-    "--progress-template",
-    "download:PROGRESS:%(progress.percent).1f|%(progress.speed)f|%(progress.eta)f|%(progress.total_bytes)s|%(progress.downloaded_bytes)s",
-    // Print the final path after all post-processing so we can record it.
-    // --print implies --simulate, so --no-simulate is required to actually write files.
-    "--print",
-    "after_move:%(filepath)s",
-    "--no-simulate",
-    "--socket-timeout",
-    "15",
-    "--retries",
-    "10",
-    "--retry-sleep",
-    "5",
-    "--fragment-retries",
-    "10",
-    "--extractor-retries",
-    "5",
-    // --continue is what makes retries cheap: yt-dlp picks the existing .part
-    // file up instead of starting the transfer over.
-    "--continue",
-    "--no-overwrites",
-  ];
-
-  // Real bandwidth cap: --limit-rate applies per yt-dlp process, so the
-  // configured global cap is split across the currently active slots.
-  if (config.maxBandwidthKBps > 0) {
-    const perWorkerKBps = Math.max(64, Math.floor(config.maxBandwidthKBps / Math.max(1, activeDlSlots.size)));
-    args.push("--limit-rate", `${perWorkerKBps}K`);
-  }
-  // yt-dlp's own idempotence layer: ids already in the archive file are
-  // never re-downloaded, even if a job is re-queued after a DB reset.
-  if (config.archiveFile) args.push("--download-archive", config.archiveFile);
-  // "Wait for VOD" mode: never grab a stream while it is still live — the
-  // job is parked as waiting_live and re-queued by the next full scan.
-  if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
-
-  // Sidecar files (subs/thumbnail/description/info.json) are fetched by the
-  // metadata worker once the download completes; the download phase only
-  // enriches the container itself (embedded art/metadata/chapters).
-  if (config.embedMetadata) args.push("--embed-thumbnail", "--embed-metadata", "--embed-chapters");
-
-  // Duration-aware watchdog: long videos legitimately take a long time on a
-  // slow connection, so the timeout scales with the real duration (3×
-  // realtime + 5 min slack) between the configured floor and ceiling.
-  const timeoutMs = computeDownloadTimeoutMs(job.duration, {
-    minMinutes: config.downloadTimeoutMinutes,
-    maxMinutes: config.maxDownloadMinutes,
+  // One plan per attempt: downloader engine, connection/fragment tuning,
+  // bandwidth split across the currently active slots, and the watchdog.
+  const plan = buildDownloadPlan({
+    job,
+    config,
+    activeSlots: activeDlSlots.size,
+    aria2cAvailable: !!aria2cPath(),
   });
+  const { baseFilename, outTemplate, timeoutMs } = plan;
+  const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
+
+  updateWorkerLine(id, `⬇️ Starting [${engineTag}]... | ${job.title}`, config);
+  const args = [ytDlp(), ...plan.args];
+
   let timedOut = false;
   const downloadCtl = new AbortController();
   const downloadTimer = setTimeout(() => {
@@ -369,7 +306,7 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
 
 /** The on-disk base name used for a job's files (no extension). */
 function baseNameOf(job: Job): string {
-  return `${String(job.index).padStart(3, "0")} - ${sanitizeFileName(job.title)}`;
+  return jobBaseFilename(job);
 }
 
 /** Record progress, keeping best_progress as the high-water mark. */

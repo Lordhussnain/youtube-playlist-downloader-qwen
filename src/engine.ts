@@ -7,7 +7,7 @@
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { loadConfig } from "./config";
-import { checkDependencies, validateCookies } from "./tools";
+import { aria2cPath, checkDependencies, validateCookies } from "./tools";
 import { initDatabase } from "./db";
 import {
   cleanOrphanedFiles,
@@ -52,6 +52,17 @@ export async function main(): Promise<void> {
   const config = await loadConfig();
   setConfig(config);
   await checkDependencies(config);
+
+  // 1b) Report which downloader engine the downloads will actually use.
+  if (config.useAria2c && aria2cPath()) {
+    console.log(
+      `🚀 Download engine: aria2c (${config.connectionsPerDownload} connections/download, ${config.maxBandwidthKBps > 0 ? `cap ${config.maxBandwidthKBps} KB/s split across slots` : "uncapped"})`,
+    );
+  } else if (config.useAria2c && !aria2cPath()) {
+    console.log("🚀 Download engine: yt-dlp native (aria2c not installed — install it for multi-connection speed)");
+  } else {
+    console.log("🚀 Download engine: yt-dlp native (aria2c disabled in config)");
+  }
 
   // 2) Open/migrate the central database, then self-heal anything the last
   //    run left behind (crash, hard kill, files moved behind our back).

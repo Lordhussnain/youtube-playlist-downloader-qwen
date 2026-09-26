@@ -68,7 +68,8 @@ src/
   config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save, QUALITY_FORMATS
   db.ts          SQLite schema, migrations, atomic claim transactions, helpers
   state.ts       shared mutable runtime state (leaf module — imports nothing)
-  tools.ts       yt-dlp/ffmpeg discovery, cookiesArgs, validateCookies
+  tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
+  download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs)
@@ -94,7 +95,7 @@ tests/           bun test suite (see section 9)
 ```
 state.ts ──────────────────────────────────────┐ (imports only config types)
 config.ts, util.ts, logger.ts, retry.ts,
-archive.ts, tools.ts                            │ (leaf modules, zero deps)
+archive.ts, tools.ts, download-args.ts          │ (leaf modules, zero deps)
 db.ts → config                                  │
 resilience.ts → config, db, logger, state       │
 reconcile.ts → archive, config, db, logger, retry│
@@ -102,12 +103,13 @@ scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
-web.ts → autoscale, config, db, logger, reconcile, report, resilience, retry, scanner, state, util
+download-args.ts → config, db (types), retry, tools, util    │ (pure)
+web.ts → autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
 rss.ts → config, logger, scanner, tools         │
 polling.ts → config, logger, scanner            │
 history.ts → db, logger, state                  │
 lifecycle.ts → dashboard, db, history, logger, resilience, state
-workers/* → config, dashboard, db, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile)
+workers/* → config, dashboard, db, download-args, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile)
 engine.ts → everything (composition root)
 ```
 
@@ -270,6 +272,41 @@ Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
 `downloadTimeoutMinutes`, `maxDownloadMinutes`.
 
+Performance keys: `useAria2c`, `connectionsPerDownload`, `minSplitSize`,
+`concurrentFragments`, `fragmentRetries`, `httpChunkSize`, `bufferSize`,
+`autoscaleRampStep`. See section 7.1 for how they reach yt-dlp.
+
+### 7.1 How downloads actually reach yt-dlp (`src/download-args.ts`)
+
+`buildDownloadPlan({ job, config, activeSlots, aria2cAvailable })` is the single
+place that builds the yt-dlp argv. It is pure and unit-tested — add new flags
+there, not in the worker. What it emits today:
+
+- `--downloader aria2c --downloader-args aria2c:"-x N -s N -j N"` when aria2c is
+  installed and `useAria2c` is true. yt-dlp's own baseline is
+  `-x16 -s16 -j16 --min-split-size 1M`, so `minSplitSize` is only emitted when
+  it differs from `1M`. The value is shlex-parsed by yt-dlp, so the whole list
+  is quoted and passed as ONE argv element.
+- `--limit-rate NK` when a cap is configured. yt-dlp maps this onto the external
+  downloader's own rate-limit flag (`aria2c --max-overall-download-limit`), so
+  the cap works on both engines. The value is the global cap divided by the
+  active slot count, floored at 64 KB/s.
+- Native tuning (`--concurrent-fragments`, `--fragment-retries`, and the opt-in
+  `--http-chunk-size` / `--buffer-size`) applies to DASH/HLS fragments and the
+  fallback path.
+
+Facts worth knowing before you touch it:
+
+- **aria2c only serves http/https/ftp.** For HLS, DASH-segment, and live streams
+  yt-dlp silently falls back to its native downloader — the engine does not need
+  to special-case those protocols.
+- **External downloads still land in yt-dlp's `<name>.part` temp file**, so
+  `partial_file_path` tracking and `--continue` resume behave identically. This
+  is why enabling aria2c does not regress resume.
+- `aria2c` is discovered in `tools.ts` (`resolvedTools.aria2cPath`, `null` when
+  absent) and is **optional** — a missing binary warns at startup and never
+  exits. `checkDependencies` takes the aria2c keys as optional config fields.
+
 ---
 
 ## 8. Web API (`src/web.ts`)
@@ -292,7 +329,7 @@ or `?token=`. Comparison is timing-safe. Default bind is `127.0.0.1`.
 | DELETE | `/api/jobs/<id>` | delete one job |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
-| GET | `/api/reliability` | pause state, kept partials, retryable count, active policy |
+| GET | `/api/reliability` | pause state, kept partials, retryable count, active policy, active downloader engine (`downloader.engine` / `.path` / `.connectionsPerDownload` / `.concurrentFragments`) |
 | GET | `/api/history?limit=20` | run history rows |
 | GET | `/api/logs?type=error\|report&limit=100` | error.log or the run report |
 
@@ -326,19 +363,26 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration) |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
+| `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling |
+| `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
 
-`tests/mocks/yt-dlp` and `tests/mocks/ffmpeg` are Bun scripts that implement
-just enough of each CLI for the engine to run its full pipeline. The integration
+`tests/mocks/yt-dlp`, `tests/mocks/ffmpeg`, and `tests/mocks/aria2c` are Bun
+scripts that implement just enough of each CLI for the engine to run its full
+pipeline. The mock yt-dlp honours `--downloader aria2c` by spawning the mock
+aria2c and recording the argv it received to `<out>.aria2-args`, which is how
+the aria2c integration test proves the connection tuning and the bandwidth cap
+actually reach the downloader. The integration
 test prepends `tests/mocks` to `PATH`, writes a `config.json` into a temp dir,
 and spawns the real `batch_playlist_downloader.ts`, then drives it over HTTP
 (`/api/status`, `/api/jobs`, `/api/reliability`) and asserts final job states.
 
 Scenarios: happy path (scan → download → metadata → convert), transient-failure
 retries with backoff, corrupt-partial resume, permanent failures (never
-requeued), and restart reconciliation after deleting files.
+requeued), restart reconciliation after deleting files, aria2c multi-connection
+downloads (args + cap verified), and the native fallback when aria2c is missing.
 
 Mock controls (environment variables):
 
@@ -402,6 +446,14 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 11. **Backwards compatibility.** Existing users have `archive.db` files from
     older versions. New columns go through `ensureColumn()`; never assume a
     fresh schema. The legacy-migration test in `tests/db.test.ts` is the guard.
+12. **`--downloader-args` value is one argv element.** The engine builds
+    `aria2c:"-x 16 -s 16 -j 16"` as a single string and yt-dlp shlex-splits it
+    itself. Splitting it into separate argv entries breaks parsing (the mock
+    yt-dlp in `tests/mocks/` strips the `aria2c:"…"` wrapper — keep that in sync
+    if you change the format).
+13. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
+    passes the URL first and the plan's args after it, so the mock's URL
+    detection (`argv[0]`) depends on that ordering.
 
 ---
 

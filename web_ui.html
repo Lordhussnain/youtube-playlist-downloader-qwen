@@ -493,6 +493,10 @@
         <div class="value" id="relWaiting">--</div>
       </div>
       <div class="reliability-item">
+        <div class="label">Download engine</div>
+        <div class="value" id="relDownloader">--</div>
+      </div>
+      <div class="reliability-item">
         <div class="label">Resume / backoff</div>
         <div class="value" id="relPolicy">--</div>
       </div>
@@ -794,6 +798,17 @@
       setText('relWaiting', `${rel.waitingLive ?? 0} job(s)`);
       const p = rel.policy || {};
       setText('relPolicy', `${p.maxResumeAttempts ?? '?'} resumes · ${p.retryBackoffBaseSeconds ?? '?'}-${p.retryBackoffMaxSeconds ?? '?'}s backoff`);
+      // Which downloader engine is actually moving the bytes.
+      const d = rel.downloader || {};
+      const engineEl = document.getElementById('relDownloader');
+      if (engineEl) {
+        engineEl.innerHTML = d.engine === 'aria2c'
+          ? `<span class="pill ok">aria2c ×${d.connectionsPerDownload ?? '?'}</span>`
+          : '<span class="pill">yt-dlp native</span>';
+        engineEl.title = d.engine === 'aria2c'
+          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}`
+          : 'yt-dlp built-in downloader (install aria2c for multi-connection speed)';
+      }
     }
     
     async function requeueFailed() {
