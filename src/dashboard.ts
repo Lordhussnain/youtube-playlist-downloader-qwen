@@ -68,14 +68,40 @@ export function renderDashboard(): void {
          SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
          SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
          SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-         COUNT(*) as total
+         COUNT(*) as total,
+         SUM(CASE WHEN partial_file_path IS NOT NULL
+                   AND download_status IN ('pending', 'paused', 'downloading')
+                  THEN 1 ELSE 0 END) as resumable
        FROM jobs`,
     )
     .get() as any;
+  updateAbsoluteLine(1, formatHeaderLine(statsData, agg, cap));
+}
+
+/** The aggregate row: global counters, bandwidth, and pause state. */
+export function formatHeaderLine(
+  stats: {
+    downloading?: number;
+    downloaded?: number;
+    failed?: number;
+    total?: number;
+    resumable?: number;
+  },
+  speed: string,
+  capSuffix: string,
+): string {
   const reason = isPaused() ? ` | ⏸️ PAUSED${getPauseReason() ? ` (${getPauseReason()})` : ""}` : "";
-  updateAbsoluteLine(
-    1,
-    `🚀 DL:${statsData.downloading || 0}/${autoscaler.targetWorkers} | ${agg}${cap} | Done:${statsData.downloaded || 0} Fail:${statsData.failed || 0} Tot:${statsData.total || 0}${reason}`,
+  // Jobs still holding a .part they will resume from. Shown only when non-zero:
+  // it is the terminal-side twin of the dashboard's "will resume" tile, and a
+  // quiet engine has nothing to report here. Kept terse (`Res:n`, not
+  // "n resumable") because the header already overflows an 80-column terminal
+  // and the pause reason has to stay readable at the end of the line.
+  const resumable = stats.resumable || 0;
+  const resumeNote = resumable > 0 ? ` Res:${resumable}` : "";
+  return (
+    `🚀 DL:${stats.downloading || 0}/${autoscaler.targetWorkers} | ${speed}${capSuffix}` +
+    ` | Done:${stats.downloaded || 0} Fail:${stats.failed || 0} Tot:${stats.total || 0}` +
+    `${resumeNote}${reason}`
   );
 }
 

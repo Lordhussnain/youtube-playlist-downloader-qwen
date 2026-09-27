@@ -269,7 +269,13 @@ transient → permanent/budget.
   maxDownloadMinutes ≥ downloadTimeoutMinutes, minDownloadWorkers ≤ maxDownloadWorkers.
 - **Adding a key:** add to `ConfigSchema`, add to `DEFAULT_CONFIG`, add a prompt
   to `update_config.ts` (menu 4 = download settings, menu 6 = reliability), and
-  add a test in `tests/config.test.ts`.
+  add a test in `tests/config.test.ts`. `tests/config-manager.test.ts` asserts
+  every schema key is reachable from the manager, so an un-prompted key fails
+  the suite rather than becoming hand-edit-only.
+- `update_config.ts` prompts for the download root, cookies, and the Shorts
+  toggles, and its reliability screen reads live resume state from the archive
+  database (read-only, best-effort — a locked or absent DB must never stop the
+  manager) plus the sweep thresholds from `STALE_CLAIM_THRESHOLDS`.
 
 Reliability keys: `maxResumeAttempts`, `retryBackoffBaseSeconds`,
 `retryBackoffMaxSeconds`, `requeueFailedAfterMinutes`, `verifyExistingFiles`,
@@ -395,6 +401,8 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/reconcile.test.ts` | `removePartialFiles`, `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
+| `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
+| `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
@@ -522,7 +530,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 | Task | Where |
 | --- | --- |
-| Add a config key | `src/config.ts` (schema + defaults) → `update_config.ts` prompt → test |
+| Add a config key | `src/config.ts` (schema + defaults) → `update_config.ts` prompt → test (coverage guard: `tests/config-manager.test.ts`) |
 | Add a failure class | `src/retry.ts` classifier → `src/workers/download.ts` handler branch → unit test |
 | Add an API endpoint | `src/web.ts handleRequest()` (after the auth gate) → `web_ui.html` caller |
 | Add a dashboard field | `src/web.ts` response → `web_ui.html` render function |
