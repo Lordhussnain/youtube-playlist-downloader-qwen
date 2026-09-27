@@ -345,7 +345,284 @@
       color: var(--text-secondary);
     }
     
+    .reliability-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 15px 18px;
+      margin-bottom: 18px;
+    }
+    
+    .reliability-panel h3 {
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .reliability-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+    
+    .reliability-item {
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    
+    .reliability-item .label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+    
+    .reliability-item .value {
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    
+    .pill {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+    }
+    
+    .pill.ok { color: #4ade80; border-color: #166534; }
+    .pill.warn { color: #fbbf24; border-color: #92400e; }
+    .pill.bad { color: #f87171; border-color: #991b1b; }
+    
+    .job-subnote {
+      font-size: 0.7rem;
+      color: var(--text-secondary);
+      margin-top: 3px;
+    }
+    
+
+    /* --- Settings modal ---------------------------------------------------- */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      z-index: 100;
+      padding: 24px 16px;
+      overflow-y: auto;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 720px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-header h3 { font-size: 1rem; }
+    .modal-body { padding: 6px 18px 18px; }
+    .modal-footer {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 14px 18px;
+      border-top: 1px solid var(--border);
+    }
+    .settings-group { margin-top: 16px; }
+    .settings-group > h4 {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+    }
+    .setting-row {
+      display: grid;
+      grid-template-columns: 1fr 190px;
+      gap: 12px;
+      align-items: center;
+      padding: 9px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .setting-row:last-child { border-bottom: none; }
+    .setting-row .desc { font-size: 0.8rem; }
+    .setting-row .desc .name { font-weight: 600; }
+    .setting-row .desc .help {
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      margin-top: 2px;
+      line-height: 1.35;
+    }
+    .setting-row.is-dirty .desc .name::after {
+      content: " *";
+      color: var(--accent);
+    }
+    .setting-row input[type="number"],
+    .setting-row input[type="text"],
+    .setting-row select {
+      width: 100%;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      padding: 7px 9px;
+      font-size: 0.85rem;
+      font-family: inherit;
+    }
+    .setting-row input:focus, .setting-row select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .setting-row .unit {
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      margin-left: 5px;
+    }
+    .switch {
+      position: relative;
+      width: 42px;
+      height: 22px;
+      flex-shrink: 0;
+      justify-self: start;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .track {
+      position: absolute;
+      inset: 0;
+      background: var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .switch .track::before {
+      content: "";
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 3px;
+      top: 3px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.15s;
+    }
+    .switch input:checked + .track { background: var(--accent); }
+    .switch input:checked + .track::before { transform: translateX(20px); }
+
+    /* --- Job detail drawer ------------------------------------------------- */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      display: none;
+      z-index: 90;
+    }
+    .drawer-backdrop.open { display: block; }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 100%;
+      max-width: 460px;
+      background: var(--bg-card);
+      border-left: 1px solid var(--border);
+      transform: translateX(100%);
+      transition: transform 0.2s ease;
+      z-index: 95;
+      display: flex;
+      flex-direction: column;
+      box-shadow: -12px 0 40px rgba(0, 0, 0, 0.45);
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .drawer-header h3 { font-size: 0.95rem; line-height: 1.35; }
+    .drawer-body { padding: 14px 16px 24px; overflow-y: auto; }
+    .detail-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .detail-row {
+      display: grid;
+      grid-template-columns: 118px 1fr;
+      gap: 10px;
+      font-size: 0.8rem;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .detail-row .k { color: var(--text-secondary); }
+    .detail-row .v { word-break: break-all; }
+    .detail-row .v.mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+    }
+    .jobs-table tbody tr { cursor: pointer; }
+    .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
+    .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
+    .kbd {
+      display: inline-block;
+      min-width: 18px;
+      text-align: center;
+      padding: 1px 5px;
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      background: var(--bg-secondary);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.7rem;
+      color: var(--text-primary);
+    }
+    .shortcut-hint {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      align-items: center;
+      font-size: 0.72rem;
+      color: var(--text-secondary);
+      margin-bottom: 14px;
+    }
+    .shortcut-hint span { display: inline-flex; align-items: center; gap: 5px; }
+
+    /* --- Self-healing sweep list ------------------------------------------- */
+    .sweep-list { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+    .sweep-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 7px;
+      align-items: center;
+      font-size: 0.74rem;
+      padding: 3px 6px;
+      background: var(--bg-secondary);
+      border-radius: 5px;
+    }
+    .sweep-row .sweep-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sweep-row .sweep-cadence { color: var(--text-secondary); font-size: 0.68rem; white-space: nowrap; }
+    .sweep-row .pill { font-size: 0.66rem; padding: 1px 7px; }
+
+
     @media (max-width: 768px) {
+      .setting-row { grid-template-columns: 1fr; gap: 6px; }
+      .drawer { max-width: 100%; }
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
       .controls { flex-direction: column; }
       .btn { width: 100%; }
@@ -412,9 +689,80 @@
     <button class="btn btn-primary" onclick="scanUrl()">📡 Scan & Add to Queue</button>
   </div>
   
+  <div class="reliability-panel">
+    <h3>🛡️ Reliability &amp; Resume</h3>
+    <div class="reliability-grid">
+      <div class="reliability-item">
+        <div class="label">Engine</div>
+        <div class="value" id="relEngine">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Kept partials</div>
+        <div class="value" id="relPartials">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Retryable failures</div>
+        <div class="value" id="relResumableFailed">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Waiting for VOD</div>
+        <div class="value" id="relWaiting">--</div>
+      </div>
+
+      <div class="reliability-item">
+        <div class="label">Download engine</div>
+        <div class="value" id="relDownloader">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Connections</div>
+        <div class="value" id="relConnections">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Fragments</div>
+        <div class="value" id="relFragments">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Bandwidth cap</div>
+        <div class="value" id="relBandwidth">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Autoscale ramp</div>
+        <div class="value" id="relRamp">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Will resume</div>
+        <div class="value" id="relResumable">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Interrupted</div>
+        <div class="value" id="relInterrupted">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Stale claims</div>
+        <div class="value" id="relStaleClaims">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Resume / backoff</div>
+        <div class="value" id="relPolicy">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Self-healing sweeps</div>
+        <div class="value" id="relSweeps">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Actions</div>
+        <div class="value">
+          <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.72rem;" onclick="requeueFailed()">♻️ Requeue failed</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  
   <div class="controls">
     <button class="btn btn-warning" id="pauseBtn" onclick="togglePause()">⏸️ Pause All</button>
     <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
+    <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
     <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
     <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search jobs... (Press / to focus)" onkeyup="filterJobs()" />
   </div>
@@ -426,6 +774,14 @@
     <button class="btn btn-danger" onclick="bulkDelete()">🗑️ Delete Selected</button>
   </div>
   
+  <div class="shortcut-hint">
+    <span><span class="kbd">/</span> search</span>
+    <span><span class="kbd">s</span> settings</span>
+    <span><span class="kbd">p</span> pause / resume</span>
+    <span><span class="kbd">r</span> refresh</span>
+    <span><span class="kbd">Esc</span> close</span>
+  </div>
+
   <div class="tabs">
     <button class="tab active" onclick="switchTab('jobs', this)">📋 Jobs</button>
     <button class="tab" onclick="switchTab('failed', this)">❌ Failed</button>
@@ -452,6 +808,10 @@
   </div>
   
   <div id="failedTab" class="tab-content">
+    <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center;">
+      <button class="btn btn-success" onclick="requeueFailed()">♻️ Requeue All Failed</button>
+      <small style="color: var(--text-secondary);">Transient failures are retried automatically after their cooldown — permanent ones (private / removed / age-gated) are never re-queued.</small>
+    </div>
     <div id="failedItems"></div>
   </div>
   
@@ -470,6 +830,35 @@
     <div class="log-viewer" id="logViewer">Loading logs...</div>
   </div>
   
+
+  <div class="modal-backdrop" id="settingsModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>⚙️ Downloader Settings</h3>
+        <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.72rem;" onclick="closeSettings()">✕ Close</button>
+      </div>
+      <div class="modal-body" id="settingsBody">
+        <div class="shortcut-hint">
+          <span>Changes apply to the next download — no restart needed.</span>
+        </div>
+        <div id="settingsFields"></div>
+      </div>
+      <div class="modal-footer">
+        <span id="settingsStatus" style="margin-right: auto; font-size: 0.78rem; color: var(--text-secondary);"></span>
+        <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
+        <button class="btn btn-primary" id="settingsSaveBtn" onclick="saveSettings()">💾 Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="drawer-backdrop" id="drawerBackdrop" onclick="closeJobDetail()"></div>
+  <div class="drawer" id="jobDrawer">
+    <div class="drawer-header">
+      <h3 id="drawerTitle">Job</h3>
+      <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.72rem;" onclick="closeJobDetail()">✕</button>
+    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+  </div>
   <div class="notification-container" id="notifications"></div>
   
   <script>
@@ -624,12 +1013,14 @@
     // Main data fetching — status stats and the jobs table come from two endpoints.
     async function fetchStatus() {
       try {
-        const [res, jobsRes] = await Promise.all([
+        const [res, jobsRes, relRes] = await Promise.all([
           fetch('/api/status'),
-          fetch('/api/jobs')
+          fetch('/api/jobs'),
+          fetch('/api/reliability').catch(() => null)
         ]);
         const data = await res.json();
         const jobsData = jobsRes.ok ? await jobsRes.json() : { jobs: [] };
+        if (relRes && relRes.ok) renderReliability(await relRes.json());
 
         document.getElementById('downloadingCount').textContent = data.stats?.downloading || 0;
         document.getElementById('completedCount').textContent = data.stats?.downloaded || 0;
@@ -673,9 +1064,99 @@
         lastFailedCount = data.stats?.failed || 0;
         wasPaused = data.isPaused || false;
 
-        renderJobs(jobsData.jobs || []);
+        lastJobs = jobsData.jobs || [];
+        renderJobs(lastJobs);
       } catch (err) {
         console.error('Failed to fetch status:', err);
+      }
+    }
+    
+    // Reliability & resume panel.
+    function renderReliability(rel) {
+      const engine = document.getElementById('relEngine');
+      if (engine) {
+        if (rel.paused) {
+          engine.innerHTML = `<span class="pill warn">⏸️ paused</span> <small style="color: var(--text-secondary);">${escapeHtml(rel.pauseReason || '')}</small>`;
+        } else {
+          engine.innerHTML = '<span class="pill ok">▶️ running</span>';
+        }
+      }
+      const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+      setText('relPartials', `${rel.partialFiles?.count ?? 0} file(s)`);
+      setText('relResumableFailed', `${rel.resumableFailed ?? 0} job(s)`);
+      setText('relWaiting', `${rel.waitingLive ?? 0} job(s)`);
+      const p = rel.policy || {};
+      setText('relPolicy', `${p.maxResumeAttempts ?? '?'} resumes · ${p.retryBackoffBaseSeconds ?? '?'}-${p.retryBackoffMaxSeconds ?? '?'}s backoff`);
+
+      // --- Resume + self-healing state --------------------------------------
+      // What will actually pick up where it left off, and what each sweep
+      // currently has in scope. A partial only counts while its job is still
+      // in play, so this is smaller than the raw "kept partials" count.
+      const r = rel.resume || {};
+      const resumableEl = document.getElementById('relResumable');
+      if (resumableEl) {
+        const n = r.resumablePartials ?? 0;
+        resumableEl.innerHTML = n > 0
+          ? `<span class="pill ok">${n} will resume</span>`
+          : '<span class="pill">nothing to resume</span>';
+        resumableEl.title = 'Jobs holding a .part (+ .aria2 control file) that the next attempt resumes from';
+      }
+      setText('relInterrupted', `${r.interrupted ?? 0} job(s)`);
+      setText('relStaleClaims', `${r.staleClaims ?? 0} job(s)`);
+
+      // --- Downloader tuning ------------------------------------------------
+      const d = rel.downloader || {};
+      const engineEl = document.getElementById('relDownloader');
+      if (engineEl) {
+        engineEl.innerHTML = d.engine === 'aria2c'
+          ? `<span class="pill ok">aria2c ×${d.connectionsPerDownload ?? '?'}</span>`
+          : '<span class="pill">yt-dlp native</span>';
+        engineEl.title = d.engine === 'aria2c'
+          ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}`
+          : 'yt-dlp built-in downloader (install aria2c for multi-connection speed)';
+      }
+      setText('relConnections', d.engine === 'aria2c' ? `${d.connectionsPerDownload ?? '?'} / download` : 'n/a (native)');
+      setText('relFragments', `${d.concurrentFragments ?? '?'} parallel`);
+      setText('relBandwidth', d.maxBandwidthKBps ? `${d.maxBandwidthKBps} KB/s` : 'uncapped');
+      setText('relRamp', `+${d.autoscaleRampStep ?? '?'} / tick`);
+
+      // --- Self-healing sweeps ---------------------------------------------
+      const sweepsEl = document.getElementById('relSweeps');
+      if (sweepsEl) {
+        const sweeps = rel.sweeps || [];
+        sweepsEl.innerHTML = sweeps.length
+          ? `<div class="sweep-list">${sweeps.map(sw => {
+              const pending = sw.pending;
+              const badge = pending === null || pending === undefined
+                ? '<span class="pill">–</span>'
+                : pending > 0
+                  ? `<span class="pill warn">${pending}</span>`
+                  : '<span class="pill ok">0</span>';
+              return `<div class="sweep-row" title="${escapeHtml(sw.detail || '')}">
+                  <span class="sweep-name">${escapeHtml(sw.label || '')}</span>
+                  <span class="sweep-cadence">${escapeHtml(sw.cadence || '')}</span>
+                  ${badge}
+                </div>`;
+            }).join('')}</div>`
+          : '--';
+      }
+    }
+    
+    async function requeueFailed() {
+      try {
+        const res = await fetch('/api/failed/requeue', { method: 'POST' });
+        const data = await res.json();
+        const r = data.requeued || {};
+        const total = (r.downloads || 0) + (r.conversions || 0) + (r.metadata || 0);
+        showNotification(
+          total > 0
+            ? `♻️ Re-queued ${total} job(s) — permanent failures are skipped`
+            : '♻️ Nothing to re-queue (permanent failures are never retried)',
+          total > 0 ? 'success' : 'warning'
+        );
+        refreshData();
+      } catch {
+        showNotification('❌ Failed to re-queue failed jobs', 'error');
       }
     }
     
@@ -713,6 +1194,26 @@
         const badgeText = status === 'paused' && job.pause_reason === 'waiting_live' ? 'waiting for VOD'
           : status === 'paused' && job.pause_reason === 'interrupted' ? 'paused (resume)'
           : statusLabel;
+        // Retry/resume bookkeeping — visible so a struggling video is
+        // distinguishable from one that simply has not started yet.
+        const attempts = [];
+        if (job.retry_count) attempts.push(`${job.retry_count} retry${job.retry_count === 1 ? '' : 's'}`);
+        if (job.resume_count) attempts.push(`${job.resume_count} resume${job.resume_count === 1 ? '' : 's'}`);
+        const attemptNote = attempts.length
+          ? `<div class="job-subnote">🔁 ${attempts.join(' · ')}${job.partial_file_path ? ' · partial kept' : ''}</div>`
+          : '';
+        // Resumable-partial indicator: a .part is on disk AND this job is still
+        // in play, so the next attempt continues from it rather than restarting.
+        // With aria2c that partial is paired with a .aria2 control file — both
+        // are shown in the tooltip so the resume state is legible.
+        const willResume = !!job.partial_file_path &&
+          ['pending', 'paused', 'downloading'].includes(job.download_status);
+        const resumeNote = willResume
+          ? `<div class="job-subnote"><span class="pill ok" title="${escapeHtml(job.partial_file_path)}\naria2c control: ${escapeHtml(`${job.partial_file_path}.aria2`)}">⏸️ partial · will resume</span></div>`
+          : '';
+        const errorNote = job.last_error && (status === 'failed' || status === 'paused')
+          ? `<div class="job-subnote" title="${escapeHtml(job.last_error)}">⚠️ ${escapeHtml(job.last_error.slice(0, 90))}</div>`
+          : '';
         const isChecked = selectedJobs.has(job.id) ? 'checked' : '';
         const location = job.file_path || job.output_directory || job.folder || '';
         const meta = job.metadata_status || 'not_needed';
@@ -722,7 +1223,7 @@
         }[meta] || escapeHtml(meta);
 
         return `
-          <tr data-job-id="${job.id}">
+          <tr data-job-id="${job.id}" onclick="openJobDetailById('${job.id}', event)" title="Click for details">
             <td><input type="checkbox" class="job-checkbox" data-id="${job.id}" ${isChecked} onchange="toggleJobSelection('${job.id}')" /></td>
             <td>
               ${escapeHtml(job.title || 'Unknown')}
@@ -738,7 +1239,7 @@
             </td>
             <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
             <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
-            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span></td>
+            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
               ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}
@@ -836,7 +1337,7 @@
             <p style="color: var(--danger); margin: 10px 0;">${escapeHtml(job.last_error || 'Unknown error')}</p>
             <div class="history-meta">
               <span>Folder: ${escapeHtml(job.folder)}</span>
-              <span>Retries: ${job.retry_count || 0}</span>
+              <span>Retries: ${job.retry_count || 0} · meta: ${job.metadata_retry_count || 0} · convert: ${job.conversion_retry_count || 0}</span>
               <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>
               <button class="btn btn-warning" style="padding: 4px 10px; font-size: 0.75rem;" onclick="resetFailCount('${job.id}')">🔢 Reset Count</button>
             </div>
@@ -938,23 +1439,243 @@
       fetchStatus();
     }
     
-    // Keyboard shortcuts
+
+    // ---------------------------------------------------------------------
+    // Downloader settings (GET/POST /api/settings).
+    //
+    // The server owns the allow-list of editable keys and re-validates the
+    // whole config on save, so this panel is a thin form over that contract.
+    // ---------------------------------------------------------------------
+    let settingsSnapshot = null;   // { fields, values, nonDefault }
+    let settingsDraft = {};        // key -> edited value
+    let settingsSaving = false;
+
+    function settingsInputId(key) { return `setting-${key}`; }
+
+    async function openSettings() {
+      const modal = document.getElementById('settingsModal');
+      modal.classList.add('open');
+      document.getElementById('settingsStatus').textContent = 'Loading…';
+      try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to load settings');
+        settingsSnapshot = data;
+        settingsDraft = {};
+        renderSettings();
+        document.getElementById('settingsStatus').textContent = '';
+      } catch (err) {
+        document.getElementById('settingsStatus').textContent = `❌ ${err.message}`;
+      }
+    }
+
+    function closeSettings() {
+      document.getElementById('settingsModal').classList.remove('open');
+      settingsDraft = {};
+    }
+
+    function renderSettings() {
+      const host = document.getElementById('settingsFields');
+      if (!settingsSnapshot) { host.innerHTML = ''; return; }
+
+      const groups = [
+        ['downloader', '🚀 Downloader'],
+        ['concurrency', '⚡ Concurrency'],
+        ['reliability', '🛡️ Reliability & resume'],
+      ];
+      const byGroup = new Map(groups.map(g => [g[0], []]));
+      for (const f of settingsSnapshot.fields) byGroup.get(f.group)?.push(f);
+
+      host.innerHTML = groups.map(([key, title]) => {
+        const rows = byGroup.get(key) || [];
+        if (!rows.length) return '';
+        return `<div class="settings-group"><h4>${title}</h4>${rows.map(renderSettingRow).join('')}</div>`;
+      }).join('');
+      updateSaveButton();
+    }
+
+    function renderSettingRow(f) {
+      const value = settingsDraft[f.key] !== undefined ? settingsDraft[f.key] : settingsSnapshot.values[f.key];
+      const dirty = settingsDraft[f.key] !== undefined ? ' is-dirty' : '';
+      const unit = f.unit ? `<span class="unit">${escapeHtml(f.unit)}</span>` : '';
+      let control = '';
+
+      if (f.type === 'boolean') {
+        control = `<label class="switch">
+            <input type="checkbox" id="${settingsInputId(f.key)}" ${value ? 'checked' : ''}
+                   onchange="onSettingChange('${f.key}', this.checked)" />
+            <span class="track"></span>
+          </label>`;
+      } else if (f.type === 'number') {
+        control = `<div style="display:flex; align-items:center;">
+            <input type="number" id="${settingsInputId(f.key)}" value="${escapeHtml(String(value))}"
+                   ${f.min !== undefined ? `min="${f.min}"` : ''} ${f.max !== undefined ? `max="${f.max}"` : ''}
+                   oninput="onSettingChange('${f.key}', this.value)" />${unit}
+          </div>`;
+      } else if (f.type === 'select') {
+        control = `<select id="${settingsInputId(f.key)}" onchange="onSettingChange('${f.key}', this.value)">
+            ${(f.options || []).map(o => `<option value="${escapeHtml(o.value)}" ${o.value === value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+          </select>`;
+      } else {
+        control = `<input type="text" id="${settingsInputId(f.key)}" value="${escapeHtml(String(value ?? ''))}"
+                   placeholder="(off)" oninput="onSettingChange('${f.key}', this.value)" />`;
+      }
+
+      return `<div class="setting-row${dirty}" data-key="${f.key}">
+          <div class="desc">
+            <div class="name">${escapeHtml(f.label)}</div>
+            <div class="help">${escapeHtml(f.help)}</div>
+          </div>
+          <div>${control}</div>
+        </div>`;
+    }
+
+    function onSettingChange(key, raw) {
+      const field = settingsSnapshot.fields.find(f => f.key === key);
+      if (!field) return;
+      // Normalise to the field's declared type so the draft mirrors what the
+      // server will coerce and validate.
+      if (field.type === 'boolean') settingsDraft[key] = !!raw;
+      else if (field.type === 'number') {
+        const n = Number(String(raw).trim());
+        settingsDraft[key] = Number.isFinite(n) ? n : raw;
+      } else settingsDraft[key] = String(raw);
+
+      const row = document.querySelector(`.setting-row[data-key="${key}"]`);
+      if (row) row.classList.add('is-dirty');
+      updateSaveButton();
+    }
+
+    function updateSaveButton() {
+      const btn = document.getElementById('settingsSaveBtn');
+      const n = Object.keys(settingsDraft).length;
+      btn.disabled = n === 0;
+      btn.textContent = n === 0 ? '💾 No changes' : `💾 Save ${n} change${n === 1 ? '' : 's'}`;
+      btn.style.opacity = n === 0 ? '0.55' : '1';
+    }
+
+    async function saveSettings() {
+      if (Object.keys(settingsDraft).length === 0) return;
+      const btn = document.getElementById('settingsSaveBtn');
+      const status = document.getElementById('settingsStatus');
+      btn.disabled = true;
+      status.textContent = 'Saving…';
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(settingsDraft),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
+        settingsSnapshot = { fields: data.fields, values: data.values, nonDefault: data.nonDefault };
+        settingsDraft = {};
+        renderSettings();
+        const changed = (data.changed || []).length;
+        status.textContent = changed > 0
+          ? `✅ Applied ${changed} change${changed === 1 ? '' : 's'} to running downloads`
+          : '✅ Saved (values already current)';
+        showNotification(
+          changed > 0 ? `⚙️ Applied ${changed} setting${changed === 1 ? '' : 's'}` : '⚙️ Settings already current',
+          'success'
+        );
+        fetchStatus(); // refresh the reliability panel / downloader tile
+      } catch (err) {
+        status.textContent = `❌ ${err.message}`;
+        showNotification(`❌ ${err.message}`, 'error');
+        btn.disabled = false;
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-job detail drawer.
+    // ---------------------------------------------------------------------
+    let lastJobs = [];
+
+    function openJobDetailById(id, event) {
+      if (event && event.target && event.target.closest('input,button,a')) return;
+      const job = lastJobs.find(j => j.id === id);
+      if (!job) return;
+      openJobDetail(job);
+    }
+
+    function detailRow(k, v, mono) {
+      if (v === undefined || v === null || v === '') return '';
+      return `<div class="detail-row"><div class="k">${escapeHtml(k)}</div><div class="v${mono ? ' mono' : ''}">${escapeHtml(String(v))}</div></div>`;
+    }
+
+    function openJobDetail(job) {
+      document.getElementById('drawerTitle').textContent = job.title || 'Job';
+      const parts = job.partial_file_path || '';
+      // aria2c keeps a control file beside the partial; show it so the resume
+      // state is legible rather than a mystery.
+      const control = parts ? `${parts}.aria2` : '';
+      const body = document.getElementById('drawerBody');
+
+      body.innerHTML = `<div class="detail-grid">
+          ${detailRow('Video ID', job.id, true)}
+          ${detailRow('URL', job.url, true)}
+          ${detailRow('Folder', job.folder)}
+          ${detailRow('Output dir', job.output_directory, true)}
+          ${detailRow('Download', job.download_status)}
+          ${detailRow('Conversion', job.conversion_status)}
+          ${detailRow('Metadata', job.metadata_status)}
+          ${detailRow('File', job.file_path, true)}
+          ${detailRow('Size', job.file_size ? formatBytes(job.file_size) : null)}
+          ${detailRow('Duration', job.duration ? formatETA(job.duration) : null)}
+          ${detailRow('Progress', `${(Number(job.progress) || 0).toFixed(1)}%`)}
+          ${detailRow('Best progress', job.best_progress ? `${Number(job.best_progress).toFixed(1)}%` : null)}
+          ${detailRow('Retries', job.retry_count || 0)}
+          ${detailRow('Resumes', job.resume_count || 0)}
+          ${detailRow('Kept partial', parts, true)}
+          ${detailRow('aria2c control', control, true)}
+          ${detailRow('Last error', job.last_error)}
+        </div>
+        ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
+        <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>
+          <button class="btn btn-secondary" style="padding:6px 12px; font-size:0.75rem;" onclick="closeJobDetail()">Close</button>
+        </div>`;
+
+      document.getElementById('jobDrawer').classList.add('open');
+      document.getElementById('drawerBackdrop').classList.add('open');
+    }
+
+    function closeJobDetail() {
+      document.getElementById('jobDrawer').classList.remove('open');
+      document.getElementById('drawerBackdrop').classList.remove('open');
+    }
+    // Keyboard shortcuts. Plain keys work when focus is not in a field; the
+    // Ctrl variants are kept for anyone who already uses them. Escape always
+    // backs out of the topmost overlay first.
+    const anyOverlayOpen = () =>
+      document.getElementById('settingsModal').classList.contains('open') ||
+      document.getElementById('jobDrawer').classList.contains('open');
+
     document.addEventListener('keydown', (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-      
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+      if (e.key === 'Escape') {
+        if (document.getElementById('settingsModal').classList.contains('open')) { closeSettings(); return; }
+        if (document.getElementById('jobDrawer').classList.contains('open')) { closeJobDetail(); return; }
+        document.getElementById('searchInput').blur();
+        return;
+      }
+      if (anyOverlayOpen()) return;
+
       switch(e.key) {
         case 'p':
-          if (e.ctrlKey) { e.preventDefault(); togglePause(); }
+          e.preventDefault(); togglePause();
           break;
         case 'r':
-          if (e.ctrlKey) { e.preventDefault(); refreshData(); }
+          e.preventDefault(); refreshData();
+          break;
+        case 's':
+          e.preventDefault(); openSettings();
           break;
         case '/':
           e.preventDefault();
           document.getElementById('searchInput').focus();
-          break;
-        case 'Escape':
-          document.getElementById('searchInput').blur();
           break;
       }
     });

@@ -3,36 +3,56 @@
 Batch YouTube playlist downloader and converter, built with Bun + TypeScript.
 Feed it a list of playlist or video links and it handles fetching, format
 selection, subtitle/thumbnail/description extraction, and conversion — with
-a terminal UI to watch it all happen.
+a terminal UI and a web dashboard to watch it all happen.
 
 ## Features
 
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
-- **Concurrent worker pools** for downloading, metadata fetching, and format conversion
-- **Automatic retries** with exponential backoff on failed downloads
+- **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
+- **aria2c multi-connection downloads** — up to 64 parallel connections per file (16 by default), with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams
+- **Bandwidth-aware scaling** — an optional global cap is split across the active download slots, and the autoscaler grows the pool while the queue has backlog and bandwidth headroom
+- **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
+- **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
+- **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
+- **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
+- **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit
-- **CLI argument support** for one-off overrides without editing the config file
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
-- **YouTube signature challenge solving** via an embedded Deno JS runtime
 - Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
+- **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
 ## Tech Stack
 
 - [Bun](https://bun.sh) + TypeScript — runtime and application logic
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — video and metadata extraction
-- [aria2c](https://aria2.github.io) — multi-connection downloading
+- [aria2c](https://aria2.github.io/) — optional multi-connection downloading
 - [ffmpeg](https://ffmpeg.org) — format conversion
 
 ## Requirements
 
 - Bun ≥ 1.0
-- `yt-dlp`, `aria2c`, and `ffmpeg` available on `PATH`
+- `yt-dlp` and `ffmpeg` available on `PATH` (or configured explicitly)
+- [aria2c](https://aria2.github.io/) **optional** — enables multi-connection downloads; without it the engine uses yt-dlp's native downloader
 - Tested on Windows 11
 
 Dependencies are checked automatically on startup; the app exits with a clear
-error if anything required is missing.
+error if anything required is missing. A missing aria2c is reported as a
+warning and never blocks startup.
+
+## Development
+
+```bash
+bun install
+bun run typecheck   # tsc --noEmit
+bun test            # unit + end-to-end suite (mocked yt-dlp/ffmpeg, no network needed)
+bun run check       # both
+```
+
+The end-to-end tests (`tests/integration.test.ts`) run the real engine against
+the mock binaries in `tests/mocks/`, covering the happy path, transient-failure
+retries, corrupt-partial resume, permanent failures, and restart reconciliation.
 
 ## Installation
 
@@ -65,6 +85,99 @@ Define your batch in `config.json`:
 Per-link overrides (format, output folder, subtitle/thumbnail flags) are
 supported alongside these global defaults.
 
+### Reliability settings
+
+```json
+{
+  "maxResumeAttempts": 5,
+  "retryBackoffBaseSeconds": 30,
+  "retryBackoffMaxSeconds": 900,
+  "requeueFailedAfterMinutes": 30,
+  "verifyExistingFiles": true,
+  "downloadTimeoutMinutes": 15,
+  "maxDownloadMinutes": 180
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `maxResumeAttempts` | How many times one video may resume from its `.part` file before the partial is discarded and the download restarts from scratch |
+| `retryBackoffBaseSeconds` / `retryBackoffMaxSeconds` | Exponential backoff window (with jitter) for transient failures — base doubles per retry, capped at the max |
+| `requeueFailedAfterMinutes` | Cooldown before failed jobs are retried automatically (`0` disables the sweep). Permanent failures are never re-queued |
+| `verifyExistingFiles` | On startup, verify that files recorded as downloaded still exist; missing ones are scrubbed from the yt-dlp archive and queued again |
+| `downloadTimeoutMinutes` | Minimum per-video download timeout |
+| `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
+
+Edit these interactively with `bun run config` → **Change Reliability & Resume**.
+
+### Download performance settings
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `useAria2c` | `true` | Download through aria2c for multi-connection transfers. Falls back to yt-dlp's native downloader when the binary is missing, or for HLS/live streams which aria2c cannot serve. |
+| `connectionsPerDownload` | `16` | aria2c `-x`/`-s`/`-j` — connections per download (1–64). Higher is faster on healthy CDNs; lower is gentler on throttled ones. |
+| `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. |
+| `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. |
+| `fragmentRetries` | `10` | Retries per fragment before a download fails. |
+| `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
+| `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
+| `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
+| `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+### Tuning from the dashboard
+
+The **⚙️ Settings** button opens an editor for the downloader, concurrency, and
+reliability knobs. Changes are validated against the same Zod schema the engine
+uses, written to , and applied to the running engine — the next
+download picks them up without a restart. The panel deliberately exposes only
+tuning keys: playlists, credentials, and the network binding are not editable
+from the browser, and a request naming anything outside the allow-list is
+rejected rather than silently ignored.
+
+Click any job row for its detail view (file paths, sizes, duration, retry/resume
+counts, the kept partial and its aria2c control file, and the last error).
+Keyboard: <kbd>/</kbd> search, <kbd>s</kbd> settings, <kbd>p</kbd> pause/resume,
+<kbd>r</kbd> refresh, <kbd>Esc</kbd> close.
+
+### The reliability panel
+
+The panel is a live read of what the engine is actually doing about failures,
+not a static list of settings:
+
+- **Downloader** — engine in use, connections per download, concurrent
+  fragments, the bandwidth cap, and the autoscale ramp step.
+- **Will resume** — jobs that still hold a `.part` file and are therefore still
+  in play (`pending`, `paused`, or `downloading`). Their job rows carry a
+  `⏸️ partial · will resume` pill whose tooltip shows the `.part` path and its
+  `.aria2` control file.
+- **Interrupted** — jobs parked as `paused` + `interrupted`, i.e. the ones the
+  crashed-jobs sweep will re-claim and continue rather than restart.
+- **Stale claims** — what the reaper would reclaim right now: claims older than
+  the thresholds in `STALE_CLAIM_THRESHOLDS` (20 min download / 3 h conversion /
+  15 min metadata). The panel imports those constants, so it cannot advertise a
+  timeout the sweep does not enforce.
+- **Self-healing sweeps** — the four sweeps with their cadence and a pending
+  count. Deleted-files is `startup`-only and stats every recorded file, so its
+  count is reported as unknown rather than guessed.
+
+Every count comes from `GET /api/reliability`, which reads the live config (not
+a startup snapshot) and the job table.
+
+The terminal UI carries the same signal: the header line gains a `Res:n` field
+whenever jobs are holding a partial they will resume from, so a paused engine
+reports its resume state without needing the browser open.
+
+**How resume works with aria2c.** aria2c keeps a *control file* next to every
+in-progress download (`<name>.part.aria2`) recording which pieces have arrived.
+An interrupted transfer leaves both files, and the next attempt resumes from
+them — so enabling aria2c does not weaken resume. When the engine decides a
+partial is unusable it deletes the `.part` **and** its control file: aria2c
+defaults to `--allow-overwrite=false`, under which a control file whose data is
+gone makes it neither resume nor restart, wedging the job permanently.
+
+Edit these interactively with `bun run config` → **Change Download Settings**.
+Settings**, or from the web dashboard's reliability panel.
+
 ## Usage
 
 ```bash
@@ -77,14 +190,56 @@ With CLI overrides:
 bun run start --config ./my-config.json --format mkv
 ```
 
-The TUI shows live status for every video across all active workers.
+The TUI shows live status for every video across all active workers. The web
+dashboard (`http://127.0.0.1:3000` by default) adds bulk actions, the failed-job
+tab, run history, and a live reliability panel.
+
+## Architecture
+
+```
+batch_playlist_downloader.ts     entry point (bun run start / build:win)
+update_config.ts                 interactive config manager (shares src/config.ts)
+web_ui.html                      dashboard frontend (served by src/web.ts)
+src/
+  config.ts        Zod schema + defaults + load/save (single source of truth)
+  db.ts            SQLite schema, migrations, atomic job claims
+  state.ts         shared mutable runtime state (pause, stats, workers)
+  tools.ts         yt-dlp/ffmpeg/aria2c discovery + cookies helpers
+  download-args.ts pure yt-dlp command construction (downloader engine, tuning)
+  retry.ts         pure retry policy: backoff, watchdogs, error classification
+  resilience.ts    pause/resume, circuit breaker, network + disk guards
+  reconcile.ts     self-healing sweeps (crashes, stale claims, missing files, failed jobs)
+  scanner.ts       playlist/channel scanning + deduplicated ingestion
+  workers/         download, metadata, and conversion worker loops
+  autoscale.ts     dynamic download-slot autoscaling
+  rss.ts           cheap per-channel RSS new-upload watcher
+  polling.ts       daemon-mode full rescans
+  dashboard.ts     TUI
+  report.ts        human-readable run report
+  web.ts           dashboard server + JSON API + token auth
+  history.ts       heartbeated run history
+  lifecycle.ts     worker supervision + graceful shutdown
+  engine.ts        orchestration (main)
+tests/             bun test suite (unit + end-to-end with mocked tools)
+```
 
 ## How It Works
 
-1. **Startup** — checks dependencies, then loads and parses `config.json`
-2. **Download workers** — pull videos into the configured output directory, retrying on failure with exponential backoff
-3. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
-4. **Converter workers** — convert completed downloads into the target format
+1. **Startup** — load config, verify dependencies, open/migrate the database,
+   then self-heal: reconcile crashed jobs, re-queue jobs whose files vanished,
+   clean up unusable partials
+2. **Scan** — every configured playlist/channel is listed (yt-dlp flat scan or
+   cheap RSS polling) and deduplicated into the jobs table by video id
+3. **Download workers** — pull videos into the configured output directory
+   through aria2c (multi-connection) when available, otherwise yt-dlp's native
+   downloader. Failures keep the `.part` file and retry with exponential
+   backoff; the retry budget only shrinks while the video makes no forward
+   progress
+4. **Metadata workers** — fetch subtitles, thumbnails, and descriptions per video, based on config flags
+5. **Converter workers** — convert completed downloads into the target format,
+   optionally moving them (with sidecars) to a secondary storage path
+6. **Sweeps** — every minute: reclaim stale claims, re-queue cooled-down
+   transient failures, heartbeat the run history
 
 ## Security & operations
 
@@ -113,6 +268,10 @@ The TUI shows live status for every video across all active workers.
   `--download-archive` as a second idempotence layer; if a downloaded file
   disappears (moved/deleted by hand) the archive entry is scrubbed and the
   video is fetched again on the next attempt.
+- **Startup file reconciliation** — with `verifyExistingFiles` (default on) the
+  engine checks that every file it recorded as downloaded still exists on
+  disk; anything missing is scrubbed from the archive and re-queued instead of
+  being silently skipped forever.
 - **Wait for VOD** — with `archiveLiveStreams` enabled, currently-live
   streams are never grabbed mid-broadcast: the job parks as
   `waiting for VOD` and is re-queued by the next scan/RSS pass once the
@@ -120,12 +279,17 @@ The TUI shows live status for every video across all active workers.
 
 ## Roadmap
 
-- [ ] Central SQLite job database — persist per-video status (`pending` →
+- [x] Central SQLite job database — persist per-video status (`pending` →
       `downloading` → `downloaded` → `converted`) so downloads survive
       crashes and restarts, and workers claim jobs atomically instead of
       relying on in-memory state
-- [ ] Resume interrupted downloads from exactly where they left off
-- [ ] Fully independent, parallel metadata and conversion pipelines
+- [x] Resume interrupted downloads from exactly where they left off
+      (`.part` files kept, `--continue`, bounded resume budget)
+- [x] Fully independent, parallel metadata and conversion pipelines
+- [x] Modular architecture with a unit + end-to-end test suite
+- [ ] Deduplicate identical videos across playlists by content hash
+- [ ] Per-link quality/format overrides in the web dashboard
+- [ ] Desktop notifications (Discord/webhook) on completion and failures
 
 ## Windows 11
 
@@ -137,13 +301,16 @@ The engine is fully supported on Windows 11. Recommended setup:
 # 1. Build the standalone exe (requires Bun once, on any machine)
 bun run build:win          # → dist\youtube-archive.exe
 
-# 2. Copy dist\youtube-archive.exe into this folder, then double-click:
+# 2. Double-click:
 start-archive.bat
 ```
 
 `start-archive.bat` sets UTF-8 codepage, puts the app folder first on `PATH`
 (so a local `yt-dlp.exe` / `ffmpeg.exe` sitting next to the app is picked up
-automatically), and prefers the compiled exe over a source checkout.
+automatically), and prefers the compiled exe over a source checkout. It looks
+for the exe in `dist\youtube-archive.exe` first and in the app folder second,
+so copying it out of `dist\` is optional — either layout works. If neither
+the exe nor Bun is available it says so and names the build command.
 
 **Dependency auto-detection** — at startup the engine searches, in order:
 
