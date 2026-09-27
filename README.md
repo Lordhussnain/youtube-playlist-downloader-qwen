@@ -301,13 +301,16 @@ The engine is fully supported on Windows 11. Recommended setup:
 # 1. Build the standalone exe (requires Bun once, on any machine)
 bun run build:win          # → dist\youtube-archive.exe
 
-# 2. Copy dist\youtube-archive.exe into this folder, then double-click:
+# 2. Double-click:
 start-archive.bat
 ```
 
 `start-archive.bat` sets UTF-8 codepage, puts the app folder first on `PATH`
 (so a local `yt-dlp.exe` / `ffmpeg.exe` sitting next to the app is picked up
-automatically), and prefers the compiled exe over a source checkout.
+automatically), and prefers the compiled exe over a source checkout. It looks
+for the exe in `dist\youtube-archive.exe` first and in the app folder second,
+so copying it out of `dist\` is optional — either layout works. If neither
+the exe nor Bun is available it says so and names the build command.
 
 **Dependency auto-detection** — at startup the engine searches, in order:
 

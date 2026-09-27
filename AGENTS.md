@@ -43,6 +43,8 @@ bun run typecheck      # tsc --noEmit
 bun test               # full suite: unit + end-to-end (~45s, no network needed)
 bun run check          # typecheck + tests
 bun run build:win      # cross-compile dist/youtube-archive.exe (Windows)
+                         start-archive.bat runs it from dist\ first, then the
+                         app folder, then falls back to `bun run`
 ```
 
 Runtime requirements: `yt-dlp` and `ffmpeg` on `PATH` (or `ytDlpPath` /
