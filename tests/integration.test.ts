@@ -739,6 +739,69 @@ describe("integration: aria2c resume + self-healing", () => {
     }
   }, TEST_TIMEOUT);
 
+  test("a graceful shutdown records the partial so the job really resumes", async () => {
+    // The dashboard promises "interrupted jobs resume from their partial". For
+    // that to be true rather than just a status, the shutdown path has to
+    // freeze each in-flight download's .part path into its job row before it
+    // stops being 'downloading' — otherwise the job is paused+interrupted with
+    // partial_file_path = NULL and the next start re-downloads from scratch.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3989,
+      BASE_CONFIG(3989, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 16,
+        maxConcurrentDownloads: 1,
+        maxDownloadWorkers: 1,
+        maxRetryAttempts: 10,
+        maxFailuresPerVideo: 10,
+        maxFailures: 50,
+      }),
+      { FAKE_ARIA2C_INFLIGHT_MS: "20000" },
+    );
+
+    const folder = join(dir, "downloads", "Mock Playlist");
+    try {
+      await waitFor("an in-flight aria2c transfer", async () => {
+        const files = await readdir(folder).catch(() => [] as string[]);
+        return files.some((f) => f.endsWith(".part")) && files.some((f) => f.endsWith(".aria2"));
+      });
+      // Graceful stop: the shutdown path must record the partial first.
+      engine.proc.kill("SIGTERM");
+      await engine.proc.exited;
+    } finally {
+      await engine.stop();
+    }
+
+    const rows = readDb(dir)
+      .query("SELECT id, download_status, pause_reason, partial_file_path FROM jobs")
+      .all() as any[];
+    const partials = rows.filter((r) => r.partial_file_path);
+    expect(partials.length).toBeGreaterThan(0);
+    for (const r of partials) {
+      expect(r.download_status).toBe("paused");
+      // The recorded path must be the real .part on disk, not a guess.
+      // (The .aria2 control-file pair surviving is covered by the SIGKILL
+      // test below — this mock finishes its in-flight window on its own, so
+      // asserting it here would test the mock's timing, not the engine.)
+      expect(existsSync(r.partial_file_path)).toBe(true);
+    }
+
+    // And the reliability endpoint must now report it as resumable, which is
+    // what drives the "will resume" pill in the dashboard.
+    const engine2 = await startEngine(dir, 3988, BASE_CONFIG(3988, { videoQuality: "audio", useAria2c: true }));
+    try {
+      await waitFor("the resume block to report the partial", async () => {
+        const rel = await engine2.api("/api/reliability");
+        return (rel.resume?.resumablePartials ?? 0) > 0;
+      });
+    } finally {
+      await engine2.stop();
+    }
+  }, TEST_TIMEOUT);
+
   test("deleted downloads are re-fetched, and failed jobs retry after cooldown", async () => {
     const dir = await makeRunDir();
     const engine = await startEngine(

@@ -603,6 +603,23 @@
     }
     .shortcut-hint span { display: inline-flex; align-items: center; gap: 5px; }
 
+    /* --- Self-healing sweep list ------------------------------------------- */
+    .sweep-list { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+    .sweep-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 7px;
+      align-items: center;
+      font-size: 0.74rem;
+      padding: 3px 6px;
+      background: var(--bg-secondary);
+      border-radius: 5px;
+    }
+    .sweep-row .sweep-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sweep-row .sweep-cadence { color: var(--text-secondary); font-size: 0.68rem; white-space: nowrap; }
+    .sweep-row .pill { font-size: 0.66rem; padding: 1px 7px; }
+
+
     @media (max-width: 768px) {
       .setting-row { grid-template-columns: 1fr; gap: 6px; }
       .drawer { max-width: 100%; }
@@ -685,19 +702,52 @@
       </div>
       <div class="reliability-item">
         <div class="label">Retryable failures</div>
-        <div class="value" id="relResumable">--</div>
+        <div class="value" id="relResumableFailed">--</div>
       </div>
       <div class="reliability-item">
         <div class="label">Waiting for VOD</div>
         <div class="value" id="relWaiting">--</div>
       </div>
+
       <div class="reliability-item">
         <div class="label">Download engine</div>
         <div class="value" id="relDownloader">--</div>
       </div>
       <div class="reliability-item">
+        <div class="label">Connections</div>
+        <div class="value" id="relConnections">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Fragments</div>
+        <div class="value" id="relFragments">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Bandwidth cap</div>
+        <div class="value" id="relBandwidth">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Autoscale ramp</div>
+        <div class="value" id="relRamp">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Will resume</div>
+        <div class="value" id="relResumable">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Interrupted</div>
+        <div class="value" id="relInterrupted">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Stale claims</div>
+        <div class="value" id="relStaleClaims">--</div>
+      </div>
+      <div class="reliability-item">
         <div class="label">Resume / backoff</div>
         <div class="value" id="relPolicy">--</div>
+      </div>
+      <div class="reliability-item">
+        <div class="label">Self-healing sweeps</div>
+        <div class="value" id="relSweeps">--</div>
       </div>
       <div class="reliability-item">
         <div class="label">Actions</div>
@@ -705,6 +755,7 @@
           <button class="btn btn-success" style="padding: 4px 10px; font-size: 0.72rem;" onclick="requeueFailed()">♻️ Requeue failed</button>
         </div>
       </div>
+
     </div>
   </div>
   
@@ -1032,11 +1083,28 @@
       }
       const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
       setText('relPartials', `${rel.partialFiles?.count ?? 0} file(s)`);
-      setText('relResumable', `${rel.resumableFailed ?? 0} job(s)`);
+      setText('relResumableFailed', `${rel.resumableFailed ?? 0} job(s)`);
       setText('relWaiting', `${rel.waitingLive ?? 0} job(s)`);
       const p = rel.policy || {};
       setText('relPolicy', `${p.maxResumeAttempts ?? '?'} resumes · ${p.retryBackoffBaseSeconds ?? '?'}-${p.retryBackoffMaxSeconds ?? '?'}s backoff`);
-      // Which downloader engine is actually moving the bytes.
+
+      // --- Resume + self-healing state --------------------------------------
+      // What will actually pick up where it left off, and what each sweep
+      // currently has in scope. A partial only counts while its job is still
+      // in play, so this is smaller than the raw "kept partials" count.
+      const r = rel.resume || {};
+      const resumableEl = document.getElementById('relResumable');
+      if (resumableEl) {
+        const n = r.resumablePartials ?? 0;
+        resumableEl.innerHTML = n > 0
+          ? `<span class="pill ok">${n} will resume</span>`
+          : '<span class="pill">nothing to resume</span>';
+        resumableEl.title = 'Jobs holding a .part (+ .aria2 control file) that the next attempt resumes from';
+      }
+      setText('relInterrupted', `${r.interrupted ?? 0} job(s)`);
+      setText('relStaleClaims', `${r.staleClaims ?? 0} job(s)`);
+
+      // --- Downloader tuning ------------------------------------------------
       const d = rel.downloader || {};
       const engineEl = document.getElementById('relDownloader');
       if (engineEl) {
@@ -1046,6 +1114,31 @@
         engineEl.title = d.engine === 'aria2c'
           ? `aria2c at ${d.path || 'PATH'} — ${d.connectionsPerDownload ?? '?'} connections per download, ${d.maxBandwidthKBps ? d.maxBandwidthKBps + ' KB/s cap' : 'uncapped'}`
           : 'yt-dlp built-in downloader (install aria2c for multi-connection speed)';
+      }
+      setText('relConnections', d.engine === 'aria2c' ? `${d.connectionsPerDownload ?? '?'} / download` : 'n/a (native)');
+      setText('relFragments', `${d.concurrentFragments ?? '?'} parallel`);
+      setText('relBandwidth', d.maxBandwidthKBps ? `${d.maxBandwidthKBps} KB/s` : 'uncapped');
+      setText('relRamp', `+${d.autoscaleRampStep ?? '?'} / tick`);
+
+      // --- Self-healing sweeps ---------------------------------------------
+      const sweepsEl = document.getElementById('relSweeps');
+      if (sweepsEl) {
+        const sweeps = rel.sweeps || [];
+        sweepsEl.innerHTML = sweeps.length
+          ? `<div class="sweep-list">${sweeps.map(sw => {
+              const pending = sw.pending;
+              const badge = pending === null || pending === undefined
+                ? '<span class="pill">–</span>'
+                : pending > 0
+                  ? `<span class="pill warn">${pending}</span>`
+                  : '<span class="pill ok">0</span>';
+              return `<div class="sweep-row" title="${escapeHtml(sw.detail || '')}">
+                  <span class="sweep-name">${escapeHtml(sw.label || '')}</span>
+                  <span class="sweep-cadence">${escapeHtml(sw.cadence || '')}</span>
+                  ${badge}
+                </div>`;
+            }).join('')}</div>`
+          : '--';
       }
     }
     
@@ -1109,6 +1202,15 @@
         const attemptNote = attempts.length
           ? `<div class="job-subnote">🔁 ${attempts.join(' · ')}${job.partial_file_path ? ' · partial kept' : ''}</div>`
           : '';
+        // Resumable-partial indicator: a .part is on disk AND this job is still
+        // in play, so the next attempt continues from it rather than restarting.
+        // With aria2c that partial is paired with a .aria2 control file — both
+        // are shown in the tooltip so the resume state is legible.
+        const willResume = !!job.partial_file_path &&
+          ['pending', 'paused', 'downloading'].includes(job.download_status);
+        const resumeNote = willResume
+          ? `<div class="job-subnote"><span class="pill ok" title="${escapeHtml(job.partial_file_path)}\naria2c control: ${escapeHtml(`${job.partial_file_path}.aria2`)}">⏸️ partial · will resume</span></div>`
+          : '';
         const errorNote = job.last_error && (status === 'failed' || status === 'paused')
           ? `<div class="job-subnote" title="${escapeHtml(job.last_error)}">⚠️ ${escapeHtml(job.last_error.slice(0, 90))}</div>`
           : '';
@@ -1137,7 +1239,7 @@
             </td>
             <td>${job.download_status === 'downloading' && job.speed ? formatBytesPerSec(job.speed) : '-'}</td>
             <td>${job.download_status === 'downloading' && job.eta ? formatETA(job.eta) : '-'}</td>
-            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${errorNote}</td>
+            <td><span class="status-badge ${statusClass}">${escapeHtml(badgeText)}</span>${attemptNote}${resumeNote}${errorNote}</td>
             <td style="font-size: 0.78rem;">${metaBadge}</td>
             <td>
               ${status === 'failed' ? `<button class="btn btn-success" style="padding: 4px 10px; font-size: 0.75rem;" onclick="retryJob('${job.id}')">🔄 Retry</button>` : '-'}

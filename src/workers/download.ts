@@ -12,7 +12,7 @@ import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
-import { findPartialFile, removePartialFiles } from "../reconcile";
+import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
 import { computeBackoffMs, isTransientDownloadError } from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
@@ -148,7 +148,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   activeProcs.delete(id);
 
   if (isPaused()) {
-    parkPaused(job.id);
+    parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
@@ -199,7 +199,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
  */
 async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
   if (isPaused()) {
-    parkPaused(job.id);
+    parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
@@ -342,11 +342,15 @@ function readProgressState(id: string): { retryCount: number; bestProgress: numb
   };
 }
 
-function parkPaused(id: string): void {
+function parkPaused(job: Job): void {
   db.run(
     `UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [id],
+    [job.id],
   );
+  // Freeze the resume point: the .part is on disk, and without recording it the
+  // job is paused with no resumable partial, so the next attempt restarts the
+  // video from zero instead of continuing.
+  recordJobPartial(job);
 }
 
 function resetForRetry(id: string, opts: { incrementRetry?: boolean; clearPartial?: boolean } = {}): void {

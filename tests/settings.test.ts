@@ -12,8 +12,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { getConfig, setConfig } from "../src/state";
-import { initDatabase } from "../src/db";
+import { db, initDatabase } from "../src/db";
 import { EDITABLE_SETTINGS, applySettings, isEditableSetting, readSettings } from "../src/settings";
+import { STALE_CLAIM_THRESHOLDS } from "../src/reconcile";
 import { handleRequest } from "../src/web";
 
 const tmpDirs: string[] = [];
@@ -205,6 +206,80 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), {}, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(result.changed).toEqual([]);
+  });
+});
+
+describe("GET /api/reliability — resume + self-healing state", () => {
+  /** Insert a job row directly for state-machine assertions. */
+  function insertJob(id: string, overrides: Record<string, unknown> = {}): void {
+    const cols = Object.keys(overrides);
+    const row: Record<string, unknown> = {
+      id,
+      url: `https://www.youtube.com/watch?v=${id}`,
+      title: `Video ${id}`,
+      output_directory: "/tmp/out",
+      ...overrides,
+    };
+    db.run(
+      `INSERT INTO jobs (${["id", "url", "title", "output_directory", ...cols].map((c) => `"${c}"`).join(", ")})
+       VALUES (${[...Object.keys(row)].map(() => "?").join(", ")})`,
+      Object.values(row) as any,
+    );
+  }
+
+  test("reports which jobs will resume from a partial", async () => {
+    // A partial only counts while the job is still in play — a failed job's
+    // partial may be discarded once the resume budget is spent.
+    insertJob("a", { download_status: "pending", partial_file_path: "/tmp/a.part" });
+    insertJob("b", { download_status: "paused", pause_reason: "interrupted", partial_file_path: "/tmp/b.part" });
+    insertJob("c", { download_status: "failed", partial_file_path: "/tmp/c.part" });
+    insertJob("d", { download_status: "downloaded", partial_file_path: null });
+
+    const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
+    const body = await res.json();
+    expect(body.resume.resumablePartials).toBe(2); // a + b, not the failed one
+    expect(body.resume.interrupted).toBe(1); // b
+    expect(body.partialFiles.count).toBe(3); // raw count includes the failed job
+  });
+
+  test("reports what the stale-claim reaper would reclaim right now", async () => {
+    // A recent timestamp keeps a claim alive; a NULL one cannot be proven fresh,
+    // which is exactly how the reaper treats it too.
+    const now = new Date().toISOString().slice(0, 19).replace("T", " ");
+    insertJob("fresh", { download_status: "downloading", download_claimed_by: "dl-1", download_claimed_at: now });
+    insertJob("stale", {
+      download_status: "downloading",
+      download_claimed_by: "dl-2",
+      download_claimed_at: "2000-01-01 00:00:00",
+    });
+
+    const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
+    const body = await res.json();
+    expect(body.resume.staleClaims).toBe(1);
+  });
+
+  test("describes all four self-healing sweeps with a pending count", async () => {
+    const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
+    const body = await res.json();
+    const ids = body.sweeps.map((s: any) => s.id);
+    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed"]);
+    for (const s of body.sweeps) {
+      expect(s.label.length).toBeGreaterThan(0);
+      expect(s.cadence.length).toBeGreaterThan(0);
+      expect(s.detail.length).toBeGreaterThan(0);
+      // pending is a count, or null when the sweep is too expensive to poll.
+      expect(s.pending === null || typeof s.pending === "number").toBe(true);
+    }
+    // The missing-files sweep stats every recorded file, so it is not counted.
+    const missing = body.sweeps.find((s: any) => s.id === "missingFiles");
+    expect(missing.pending).toBeNull();
+  });
+
+  test("the sweep thresholds match the ones the reaper enforces", async () => {
+    // Guards against the dashboard promising recovery the engine never performs.
+    expect(STALE_CLAIM_THRESHOLDS.download).toBe("-20 minutes");
+    expect(STALE_CLAIM_THRESHOLDS.conversion).toBe("-3 hours");
+    expect(STALE_CLAIM_THRESHOLDS.metadata).toBe("-15 minutes");
   });
 });
 

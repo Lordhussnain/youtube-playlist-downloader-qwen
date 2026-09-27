@@ -15,7 +15,7 @@ import { autoscaler, activeDlSlots } from "./autoscale";
 import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
 import { triggerPause, triggerResume } from "./resilience";
-import { requeueFailedJobs } from "./reconcile";
+import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
@@ -403,6 +403,76 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
     const waitingLive = db
       .query(`SELECT COUNT(*) as count FROM jobs WHERE download_status = 'waiting_live'`)
       .get() as any;
+
+    // --- Resume + self-healing state ---------------------------------------
+    // What will actually pick up where it left off. A partial only matters
+    // while its job is still in play: a failed job's partial may be discarded
+    // once the resume budget is spent, so it is not counted here.
+    const resumablePartials = db
+      .query(
+        `SELECT COUNT(*) as count FROM jobs
+          WHERE partial_file_path IS NOT NULL
+            AND download_status IN ('pending', 'paused', 'downloading')`,
+      )
+      .get() as any;
+    // Crashed jobs: parked as paused/interrupted so they are re-claimed and
+    // resume from their partial rather than restarting.
+    const interrupted = db
+      .query(
+        `SELECT COUNT(*) as count FROM jobs
+          WHERE download_status = 'paused' AND pause_reason = 'interrupted'`,
+      )
+      .get() as any;
+    // What the stale-claim reaper would reclaim right now — same thresholds the
+    // sweep enforces (imported, so they cannot drift apart).
+    const t = STALE_CLAIM_THRESHOLDS;
+    const staleClaims = db
+      .query(
+        `SELECT
+           (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
+              AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')))
+         + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
+              AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
+         + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
+              AND updated_at < datetime('now', '${t.metadata}'))
+         AS count`,
+      )
+      .get() as any;
+
+    // The four self-healing sweeps, with what each currently has in scope.
+    // `pending: null` means "not counted here" — the missing-files sweep has to
+    // stat every recorded file, which is far too expensive to run per poll.
+    const sweeps = [
+      {
+        id: "crashed",
+        label: "Crashed jobs resume",
+        cadence: "startup",
+        detail: "Jobs interrupted mid-flight are re-queued and resume from their partial.",
+        pending: interrupted?.count || 0,
+      },
+      {
+        id: "staleClaims",
+        label: "Stale claims reclaimed",
+        cadence: "every 60s",
+        detail: "Claims orphaned by a dead worker are re-queued after a timeout.",
+        pending: staleClaims?.count || 0,
+      },
+      {
+        id: "missingFiles",
+        label: "Deleted files re-fetched",
+        cadence: "startup",
+        detail: "Files recorded as downloaded but no longer on disk are queued again.",
+        pending: null,
+      },
+      {
+        id: "requeueFailed",
+        label: "Failed jobs retried",
+        cadence: "every 60s",
+        detail: "Failed jobs retry after a cooldown; permanent failures never do.",
+        pending: resumableFailed,
+      },
+    ];
+
     return Response.json({
       ok: true,
       paused: isPaused(),
@@ -410,6 +480,12 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
       partialFiles: { count: partials?.count || 0, bytes: partials?.bytes || 0 },
       resumableFailed,
       waitingLive: waitingLive?.count || 0,
+      resume: {
+        resumablePartials: resumablePartials?.count || 0,
+        interrupted: interrupted?.count || 0,
+        staleClaims: staleClaims?.count || 0,
+      },
+      sweeps,
       policy: {
         maxResumeAttempts: config.maxResumeAttempts,
         retryBackoffBaseSeconds: config.retryBackoffBaseSeconds,

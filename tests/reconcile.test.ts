@@ -10,7 +10,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile, mkdir, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { db, initDatabase } from "../src/db";
 import {
   ARIA2_CONTROL_SUFFIX,
@@ -18,6 +18,7 @@ import {
   findPartialFile,
   partialSidecars,
   removePartialFiles,
+  recordPartialPaths,
 } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
@@ -102,6 +103,67 @@ describe("findPartialFile", () => {
     const dir = await makeDir();
     await writeFile(join(dir, "001 - Video.part.aria2"), "control-bytes");
     expect(await findPartialFile(dir, "001 - Video")).toBe("");
+  });
+});
+
+describe("recordPartialPaths", () => {
+  // Regression: an interrupted job used to be marked paused+interrupted with
+  // partial_file_path = NULL, so "interrupted jobs resume from their partial"
+  // was a status the next start silently re-downloaded from scratch.
+  test("writes the on-disk .part path into a downloading job with none recorded", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    writeFileSync(join(dir, "001 - First Mock Video.f137.mp4.part"), "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v1', 'https://y', 'First Mock Video', 1, ?, 'downloading', NULL)`,
+      [dir],
+    );
+
+    const recorded = recordPartialPaths();
+    expect(recorded).toBe(1);
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v1'").get() as any;
+    expect(row.partial_file_path).toBe(join(dir, "001 - First Mock Video.f137.mp4.part"));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("leaves a job alone when no partial is on disk", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v2', 'https://y', 'Second Mock Video', 2, ?, 'downloading', NULL)`,
+      [dir],
+    );
+    expect(recordPartialPaths()).toBe(0);
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v2'").get() as any;
+    expect(row.partial_file_path).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does not overwrite a partial that is already recorded", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    const known = join(dir, "001 - Third Mock Video.part");
+    writeFileSync(known, "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v3', 'https://y', 'Third Mock Video', 3, ?, 'downloading', ?)`,
+      [dir, known],
+    );
+    recordPartialPaths();
+    const row = db.query("SELECT partial_file_path FROM jobs WHERE id = 'v3'").get() as any;
+    expect(row.partial_file_path).toBe(known);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("ignores jobs that are not downloading (a paused job keeps its state)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rec-"));
+    writeFileSync(join(dir, "001 - Paused Video.part"), "bytes");
+    db.run(
+      `INSERT INTO jobs (id, url, title, "index", output_directory, download_status, partial_file_path)
+       VALUES ('v4', 'https://y', 'Paused Video', 4, ?, 'paused', NULL)`,
+      [dir],
+    );
+    expect(recordPartialPaths()).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 
