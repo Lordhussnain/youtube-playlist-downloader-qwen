@@ -52,6 +52,14 @@ export const ConfigSchema = z
     cookiesFile: z.string(),
     deleteSourceAfterConvert: z.boolean(),
     videoQuality: z.enum(["highest", "1080p", "720p", "480p", "audio"]),
+    // --- Multi-audio tracks --------------------------------------------------
+    // YouTube multi-language audio (the player's "Audio track" menu: an
+    // original language plus auto-dubbed tracks). "off" keeps the classic
+    // single-track download; "all" muxes every audio track into one file
+    // (switchable in any player, like on YouTube); "languages" keeps only the
+    // codes in audioTrackLanguages.
+    multiAudioMode: z.enum(["off", "all", "languages"]),
+    audioTrackLanguages: z.array(z.string()),
     downloadSubtitles: z.boolean(),
     embedMetadata: z.boolean(),
     writeInfoJson: z.boolean(),
@@ -110,6 +118,7 @@ export const ConfigSchema = z
   });
 
 export type Config = z.infer<typeof ConfigSchema>;
+export type MultiAudioMode = Config["multiAudioMode"];
 
 export const DEFAULT_CONFIG: Config = {
   playlists: [],
@@ -138,6 +147,8 @@ export const DEFAULT_CONFIG: Config = {
   cookiesFile: "cookies.txt",
   deleteSourceAfterConvert: true,
   videoQuality: "1080p",
+  multiAudioMode: "off",
+  audioTrackLanguages: [],
   downloadSubtitles: true,
   embedMetadata: true,
   writeInfoJson: true,

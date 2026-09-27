@@ -16,6 +16,13 @@ import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconc
 import { removeFromArchive } from "../archive";
 import { computeBackoffMs, isTransientDownloadError } from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
+import {
+  parseSelectionJson,
+  parseTracksJson,
+  probeAudioTracks,
+  selectAudioTracks,
+  type AudioTrack,
+} from "../audio-tracks";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
 import { abortController, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
@@ -71,6 +78,18 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
 
 /** One download attempt for `job`. Throws on any failure. */
 async function runDownload(id: number, job: Job, config: Config): Promise<void> {
+  // Multi-audio support: know what the video offers (original + auto-dubbed
+  // tracks) and which tracks this job wants, then hand the selection to the
+  // plan so every wanted language is downloaded into one switchable file.
+  const discovered = await resolveJobAudioTracks(job, config);
+  const audioTracks = discovered
+    ? selectAudioTracks(
+        discovered,
+        config.multiAudioMode,
+        config.audioTrackLanguages,
+        parseSelectionJson(job.audio_selection),
+      )
+    : [];
   // One plan per attempt: downloader engine, connection/fragment tuning,
   // bandwidth split across the currently active slots, and the watchdog.
   const plan = buildDownloadPlan({
@@ -78,11 +97,13 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     config,
     activeSlots: activeDlSlots.size,
     aria2cAvailable: !!aria2cPath(),
+    audioTracks,
   });
   const { baseFilename, outTemplate, timeoutMs } = plan;
   const engineTag = plan.engine === "aria2c" ? `aria2c×${config.connectionsPerDownload}` : "native";
+  const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
-  updateWorkerLine(id, `⬇️ Starting [${engineTag}]... | ${job.title}`, config);
+  updateWorkerLine(id, `⬇️ Starting [${engineTag}${audioTag}]... | ${job.title}`, config);
   const args = [ytDlp(), ...plan.args];
 
   let timedOut = false;
@@ -308,6 +329,35 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
 }
 
 // --- small DB helpers --------------------------------------------------------
+
+/**
+ * Discover the video's audio tracks once per job (persisted in
+ * `jobs.audio_tracks`) so multi-audio selection and the dashboard's track
+ * picker know what YouTube offers. Only runs when something will consume the
+ * result, and a probe failure never fails the download — we just fall back to
+ * the classic single-track plan.
+ */
+async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTrack[] | null> {
+  if (config.videoQuality === "audio") return null;
+  const known = parseTracksJson(job.audio_tracks);
+  if (known) return known;
+  const selection = parseSelectionJson(job.audio_selection) || [];
+  if (config.multiAudioMode === "off" && selection.length === 0) return null;
+  try {
+    const tracks = await probeAudioTracks(job.url, config);
+    db.run(`UPDATE jobs SET audio_tracks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+      JSON.stringify(tracks),
+      job.id,
+    ]);
+    return tracks;
+  } catch (err: any) {
+    logError(
+      "download",
+      `${job.id} audio-track probe failed (falling back to single audio): ${String(err?.message || err).slice(0, 200)}`,
+    );
+    return null;
+  }
+}
 
 /** The on-disk base name used for a job's files (no extension). */
 function baseNameOf(job: Job): string {

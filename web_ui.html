@@ -576,6 +576,17 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.74rem;
     }
+    .audio-tracks-box {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .audio-tracks-box .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.72rem;
+    }
     .jobs-table tbody tr { cursor: pointer; }
     .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
     .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
@@ -1480,6 +1491,7 @@
 
       const groups = [
         ['downloader', '🚀 Downloader'],
+        ['media', '🎵 Media & audio'],
         ['concurrency', '⚡ Concurrency'],
         ['reliability', '🛡️ Reliability & resume'],
       ];
@@ -1516,6 +1528,9 @@
         control = `<select id="${settingsInputId(f.key)}" onchange="onSettingChange('${f.key}', this.value)">
             ${(f.options || []).map(o => `<option value="${escapeHtml(o.value)}" ${o.value === value ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
           </select>`;
+      } else if (f.type === 'list') {
+        control = `<input type="text" id="${settingsInputId(f.key)}" value="${escapeHtml(Array.isArray(value) ? value.join(', ') : String(value ?? ''))}"
+                   placeholder="en, ja, es" oninput="onSettingChange('${f.key}', this.value)" />`;
       } else {
         control = `<input type="text" id="${settingsInputId(f.key)}" value="${escapeHtml(String(value ?? ''))}"
                    placeholder="(off)" oninput="onSettingChange('${f.key}', this.value)" />`;
@@ -1604,6 +1619,99 @@
       return `<div class="detail-row"><div class="k">${escapeHtml(k)}</div><div class="v${mono ? ' mono' : ''}">${escapeHtml(String(v))}</div></div>`;
     }
 
+    // ------------------------------------------------------------------
+    // Audio track picker — YouTube's "Audio track" menu, per downloaded
+    // video: original + auto-dubbed tracks, saved per job and applied on
+    // the next download attempt.
+    // ------------------------------------------------------------------
+    function renderAudioTrackSection(job) {
+      const tracks = Array.isArray(job.audio_tracks) ? job.audio_tracks : [];
+      const sel = Array.isArray(job.audio_selection) ? job.audio_selection : null;
+      if (!tracks.length) {
+        return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Audio tracks</div>
+          <div style="font-size:0.74rem; color: var(--text-secondary); margin-bottom:8px;">
+            Not discovered yet. Find what YouTube offers (original + auto-dubbed tracks), then pick which to keep.
+          </div>
+          <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔍 Find audio tracks</button>
+        </div>`;
+      }
+      const rows = tracks.map((t) => {
+        const checked = sel ? sel.includes(t.language) : true;
+        const badge = t.isDefault ? ' <span style="opacity:0.65;">· original</span>' : '';
+        const tbr = t.tbr ? ` <span style="opacity:0.55;">· ${Math.round(t.tbr)} kbps</span>` : '';
+        return `<label style="display:flex; align-items:center; gap:8px; margin:4px 0; font-size:0.76rem; cursor:pointer;">
+            <input type="checkbox" class="audio-track-check" data-lang="${escapeHtml(t.language)}" ${checked ? 'checked' : ''} />
+            <span>${escapeHtml(t.label)} <span class="mono" style="opacity:0.55;">(${escapeHtml(t.language)} · ${escapeHtml(t.formatId)})</span>${badge}${tbr}</span>
+          </label>`;
+      }).join('');
+      const modeNote = sel
+        ? 'Per-video selection saved. It is applied on the next download attempt.'
+        : 'Following the global multi-audio setting until you save a per-video selection.';
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Audio tracks (${tracks.length})</div>
+          ${rows}
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">${escapeHtml(modeNote)} Use <b>Retry job</b> to re-download with the saved tracks.</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="saveAudioSelection('${job.id}')">💾 Save selection</button>
+            ${sel ? `<button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="resetAudioSelection('${job.id}')">↩️ Use global setting</button>` : ''}
+            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="probeJobAudioTracks('${job.id}')">🔄 Re-scan</button>
+          </div>
+        </div>`;
+    }
+
+    async function probeJobAudioTracks(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-probe`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Audio-track scan failed');
+        const job = lastJobs.find(j => j.id === id);
+        if (job) { job.audio_tracks = data.tracks; openJobDetail(job); }
+        showNotification(`🎧 Found ${data.tracks.length} audio track(s)`, 'success');
+        refreshData();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
+    async function saveAudioSelection(id) {
+      const boxes = document.querySelectorAll('.audio-track-check');
+      const tracks = [...boxes].filter(b => b.checked).map(b => b.dataset.lang);
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tracks }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Save failed');
+        const job = lastJobs.find(j => j.id === id);
+        if (job) { job.audio_selection = data.audio_selection; openJobDetail(job); }
+        showNotification(`🎧 Saved ${tracks.length} audio track(s) for the next download`, 'success');
+        refreshData();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
+    async function resetAudioSelection(id) {
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/audio-tracks`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tracks: null }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Reset failed');
+        const job = lastJobs.find(j => j.id === id);
+        if (job) { job.audio_selection = null; openJobDetail(job); }
+        showNotification('🎧 Following the global multi-audio setting', 'success');
+        refreshData();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
     function openJobDetail(job) {
       document.getElementById('drawerTitle').textContent = job.title || 'Job';
       const parts = job.partial_file_path || '';
@@ -1631,6 +1739,7 @@
           ${detailRow('aria2c control', control, true)}
           ${detailRow('Last error', job.last_error)}
         </div>
+        ${renderAudioTrackSection(job)}
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-success" style="padding:6px 12px; font-size:0.75rem;" onclick="retryJob('${job.id}'); closeJobDetail();">🔄 Retry job</button>

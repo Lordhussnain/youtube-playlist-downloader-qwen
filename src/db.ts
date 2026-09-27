@@ -32,6 +32,10 @@ export interface Job {
   resume_count: number;
   best_progress: number;
   last_error: string | null;
+  /** JSON array of discovered AudioTracks (null = not probed yet). */
+  audio_tracks: string | null;
+  /** JSON array of selected language codes (null = follow global mode). */
+  audio_selection: string | null;
   folder: string;
   index: number;
   duration: number | null;
@@ -127,6 +131,10 @@ export function initDatabase(path: string = "archive.db"): void {
   ensureColumn("jobs", "resume_count", "resume_count INTEGER DEFAULT 0");
   ensureColumn("jobs", "best_progress", "best_progress REAL DEFAULT 0");
   ensureColumn("jobs", "duration", "duration REAL");
+  // Multi-audio tracks (YouTube multi-language audio): what the video offers,
+  // and which languages the user picked for this specific job.
+  ensureColumn("jobs", "audio_tracks", "audio_tracks TEXT");
+  ensureColumn("jobs", "audio_selection", "audio_selection TEXT");
   db.run(
     `UPDATE jobs SET metadata_status = CASE
        WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'

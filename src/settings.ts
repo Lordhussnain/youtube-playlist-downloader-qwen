@@ -12,7 +12,7 @@
 import { CONFIG_PATH, ConfigSchema, DEFAULT_CONFIG, saveConfig, type Config } from "./config";
 import { setConfig } from "./state";
 
-export type SettingType = "number" | "boolean" | "text" | "select";
+export type SettingType = "number" | "boolean" | "text" | "select" | "list";
 
 export interface SettingField {
   key: keyof Config;
@@ -24,7 +24,7 @@ export interface SettingField {
   options?: { value: string; label: string }[];
   /** Rough unit hint for the UI (KB/s, minutes, …). */
   unit?: string;
-  group: "downloader" | "concurrency" | "reliability";
+  group: "downloader" | "media" | "concurrency" | "reliability";
 }
 
 /**
@@ -107,6 +107,26 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     max: 10,
     group: "downloader",
     help: "Download slots added per autoscale tick while the queue has backlog.",
+  },
+  // --- media ----------------------------------------------------------------
+  {
+    key: "multiAudioMode",
+    label: "Multi-audio tracks",
+    type: "select",
+    group: "media",
+    options: [
+      { value: "off", label: "Off — single audio track" },
+      { value: "all", label: "All tracks — every audio language" },
+      { value: "languages", label: "Selected languages only" },
+    ],
+    help: "YouTube multi-language audio (the player's \"Audio track\" menu): mux every audio track into one MKV so the audio is switchable in any player, or restrict to the language list below. Per-video selection lives in each job's detail panel.",
+  },
+  {
+    key: "audioTrackLanguages",
+    label: "Audio track languages",
+    type: "list",
+    group: "media",
+    help: "Comma-separated language codes kept when Multi-audio tracks is \"Selected languages only\" (e.g. en, ja, es). Empty = just the default track.",
   },
   // --- concurrency ----------------------------------------------------------
   {
@@ -289,6 +309,14 @@ export async function applySettings(
     } else if (field.type === "boolean") {
       coerced[field.key] =
         typeof raw === "boolean" ? raw : ["true", "1", "yes", "on"].includes(String(raw).toLowerCase());
+    } else if (field.type === "list") {
+      // A string of comma-separated values ("en, ja") or a real array both
+      // normalize to a clean string array.
+      const items = Array.isArray(raw) ? raw : String(raw ?? "").split(",");
+      const cleaned = items
+        .filter((x: any) => typeof x === "string" && x.trim())
+        .map((x: string) => x.trim());
+      coerced[field.key] = cleaned;
     } else {
       coerced[field.key] = typeof raw === "string" ? raw.trim() : String(raw);
     }

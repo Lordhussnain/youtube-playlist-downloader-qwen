@@ -212,3 +212,61 @@ describe("buildDownloadPlan", () => {
     }
   });
 });
+
+// --- multi-audio tracks -------------------------------------------------------
+// YouTube's multi-language audio: selected tracks arrive from the worker and
+// must splice into the format selector plus switch yt-dlp into multistream
+// MKV mode. A single track is a classic download; the audio-only preset is
+// exempt (an mp3 cannot carry several tracks).
+describe("buildDownloadPlan with audio tracks", () => {
+  const build = (over: Partial<Config> = {}) =>
+    buildDownloadPlan({ job, config: cfg(over), activeSlots: 3, aria2cAvailable: true });
+  const tracks = [
+    { formatId: "251-0", language: "en", label: "English", tbr: 160, acodec: "opus", isDefault: true },
+    { formatId: "251-1", language: "es", label: "Spanish", tbr: 150, acodec: "opus", isDefault: false },
+  ];
+  const buildWithTracks = (over: Partial<Config> = {}) =>
+    buildDownloadPlan({ job, config: cfg(over), activeSlots: 3, aria2cAvailable: true, audioTracks: tracks });
+
+  test("splices the track ids into the quality preset", () => {
+    expect(flagValue(buildWithTracks({ videoQuality: "1080p" }).args, "--format")).toBe(
+      "bv[height<=1080]+251-0+251-1/b[height<=1080]",
+    );
+  });
+
+  test("enables audio multistreams and the MKV container for 2+ tracks", () => {
+    const plan = buildWithTracks();
+    expect(plan.args).toContain("--audio-multistreams");
+    expect(flagValue(plan.args, "--merge-output-format")).toBe("mkv");
+  });
+
+  test("a single selected track pins exactly that track, without multistreams", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: true,
+      audioTracks: [tracks[0]],
+    });
+    expect(flagValue(plan.args, "--format")).toBe("bv[height<=1080]+251-0/b[height<=1080]");
+    expect(plan.args).not.toContain("--audio-multistreams");
+    expect(plan.args).not.toContain("--merge-output-format");
+  });
+
+  test("no tracks means the untouched preset", () => {
+    expect(flagValue(build().args, "--format")).toBe("bv[height<=1080]+ba/b[height<=1080]");
+    expect(build().args).not.toContain("--audio-multistreams");
+  });
+
+  test("the audio-only preset ignores tracks (mp3 has one stream)", () => {
+    const plan = buildWithTracks({ videoQuality: "audio" });
+    expect(flagValue(plan.args, "--format")).toBe("ba/bestaudio");
+    expect(plan.args).not.toContain("--audio-multistreams");
+  });
+
+  test("multistream flags survive alongside the aria2c downloader args", () => {
+    const plan = buildWithTracks({ useAria2c: true });
+    expect(flagValue(plan.args, "--downloader")).toBe("aria2c");
+    expect(plan.args).toContain("--audio-multistreams");
+  });
+});

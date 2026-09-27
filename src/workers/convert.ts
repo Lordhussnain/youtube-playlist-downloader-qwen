@@ -34,6 +34,30 @@ export async function runFfmpeg(
   }
 }
 
+/**
+ * How many audio streams a media file carries (ffprobe-style via ffmpeg's
+ * banner). Used to recognise multi-audio archives, which must keep their
+ * container instead of being remuxed to mp4. 0 on any probe failure — the
+ * caller then behaves exactly like before multi-audio support.
+ */
+export async function countAudioStreams(path: string): Promise<number> {
+  try {
+    const proc = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const banner = `${out}\n${err}`;
+    return (banner.match(/^\s*Stream #\d+:\d+[^\n]*:\s*Audio/gm) || []).length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function converterWorker(id: number, config: Config): Promise<void> {
   const workerId = `cv-${id}`;
   while (!abortController.signal.aborted) {
@@ -80,18 +104,27 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
     finalPath = mp3Path;
   } else if (!wantsMp3 && !sourcePath.endsWith(".mp4")) {
-    const mp4Path = sourcePath.replace(/\.[^.]+$/, ".mp4");
-    const res = await runFfmpeg(
-      ["-y", "-i", sourcePath, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", mp4Path],
-      30 * 60 * 1000,
-    );
-    if (res.code !== 0) {
-      throw new Error(
-        `FFmpeg remux ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+    // Multi-audio archives land as MKV holding every selected track. MP4
+    // cannot carry them without re-encoding each dub, so a file with more
+    // than one audio stream is kept exactly as yt-dlp muxed it.
+    const audioStreams = await countAudioStreams(sourcePath);
+    if (audioStreams >= 2) {
+      finalPath = sourcePath;
+      updateConvertWorkerLine(id, `🎧 Keeping ${audioStreams} audio tracks (no remux) | ${job.title}`, config);
+    } else {
+      const mp4Path = sourcePath.replace(/\.[^.]+$/, ".mp4");
+      const res = await runFfmpeg(
+        ["-y", "-i", sourcePath, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", mp4Path],
+        30 * 60 * 1000,
       );
+      if (res.code !== 0) {
+        throw new Error(
+          `FFmpeg remux ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+        );
+      }
+      if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
+      finalPath = mp4Path;
     }
-    if (config.deleteSourceAfterConvert) await unlink(sourcePath).catch(() => {});
-    finalPath = mp4Path;
   }
   if (config.secondaryStoragePath) {
     const destDir = join(config.secondaryStoragePath, job.folder);

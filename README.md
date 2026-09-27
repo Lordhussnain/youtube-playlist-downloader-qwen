@@ -20,6 +20,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Graceful shutdown** — safely stops in-flight downloads on exit
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
+- **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
 - Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
@@ -123,6 +124,33 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+### Multi-audio tracks (YouTube multi-language audio)
+
+YouTube now ships many videos with several audio tracks — the original language
+plus auto-dubbed ones, exactly what the player's **Audio track** menu lists.
+The engine can download them the same way:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `multiAudioMode` | `"off"` | `off` = classic single-track download. `all` = keep every audio track the video offers. `languages` = keep only the codes in `audioTrackLanguages`. |
+| `audioTrackLanguages` | `[]` | Language codes kept in `languages` mode (e.g. `["en", "ja"]`). |
+
+How it works: before a download the worker asks yt-dlp which audio tracks the
+video offers (one cheap metadata pass, cached per job), picks the best stream of
+each wanted track (DRC duplicates are ignored), and hands the selection to
+yt-dlp as `bv…+<track1>+<track2>… --audio-multistreams --merge-output-format mkv`.
+The result is one MKV whose audio tracks you switch in VLC/mpv/Plex just like on
+YouTube. Multi-track files are never remuxed to mp4 (that would drop the dubs);
+a single selected track merges exactly like a classic download. `videoQuality:
+"audio"` (mp3) always stays single-track.
+
+Per-video override: open a job in the dashboard and use the **Audio tracks**
+section — *Find audio tracks* lists what YouTube offers (original + dubs, with
+language and bitrate), checkboxes pick what the next attempt keeps, and *Use
+global setting* returns the job to the mode above. The selection applies to the
+next download attempt (use **Retry job** to re-fetch an already downloaded
+video with different tracks).
 
 ### Tuning from the dashboard
 
