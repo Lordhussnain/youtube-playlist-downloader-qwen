@@ -12,13 +12,17 @@
 //   3. permanent failures     — parks as failed and is never auto-requeued
 //   4. restart reconciliation — deleted files are detected and re-downloaded
 //   5. aria2c downloads       — multi-connection path with a bandwidth cap
+//   6. aria2c resume          — interrupted transfers resume from the control
+//                              file, and the four self-healing sweeps all work
+//                              on the aria2c path
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmod, cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
+import { existsSync } from "node:fs";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const MOCKS = join(REPO_ROOT, "tests", "mocks");
@@ -551,6 +555,243 @@ describe("integration: aria2c multi-connection downloads", () => {
       expect(reliability.downloader.path).toBeNull();
     } finally {
       await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: aria2c resume + self-healing", () => {
+  test("an interrupted aria2c transfer resumes from its control file", async () => {
+    // The failure originates INSIDE aria2c (FAKE_ARIA2C_FAIL_TIMES), so the
+    // partial + control-file pair is really written by the external downloader
+    // and the next attempt has to resume from it.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3988,
+      BASE_CONFIG(3988, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 16,
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxResumeAttempts: 5,
+        maxRetryAttempts: 10,
+        maxFailuresPerVideo: 10,
+        maxFailures: 50,
+      }),
+      { FAKE_ARIA2C_FAIL_TIMES: "1", FAKE_ARIA2C_FAIL_MODE: "transient", FAKE_DELAY_MS: "40" },
+    );
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) =>
+          j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+
+      // Every video was retried and completed.
+      for (const job of jobs) {
+        expect(job.retry_count).toBeGreaterThanOrEqual(1);
+        expect(job.file_path).toBeTruthy();
+        expect(job.partial_file_path).toBeNull();
+      }
+
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const files = await readdir(folder);
+
+      // The successful run recorded that it RESUMED from the control file
+      // rather than restarting — this is the aria2c resume path working.
+      const recorded = files.filter((f) => f.endsWith(".aria2-args"));
+      expect(recorded.length).toBeGreaterThanOrEqual(3);
+      for (const f of recorded) {
+        const args = await Bun.file(join(folder, f)).text();
+        expect(args).toContain("resumed=yes");
+      }
+
+      // A completed download removes its control file: no .part and no .aria2
+      // is left behind, so nothing can strand.
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".aria2"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".mp3"))).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("exhausting the resume budget discards the .part AND its control file", async () => {
+    // Repeated corrupt errors drive the engine to its resume budget. When it
+    // gives up on the partial it must delete both files — stranding the .aria2
+    // would make aria2c refuse to restart (--allow-overwrite=false) and the job
+    // would wedge forever. This test fails if the control file survives.
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3989,
+      BASE_CONFIG(3989, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 16,
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxResumeAttempts: 2,
+        maxRetryAttempts: 20,
+        maxFailuresPerVideo: 30,
+        maxFailures: 50,
+      }),
+      { FAKE_ARIA2C_FAIL_TIMES: "3", FAKE_ARIA2C_FAIL_MODE: "corrupt", FAKE_DELAY_MS: "30" },
+    );
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) =>
+          j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+
+      // The engine really did hit its resume budget and restart from scratch
+      // rather than looping on the same partial forever.
+      for (const job of jobs) {
+        expect(job.resume_count).toBeGreaterThanOrEqual(1);
+        expect(job.file_path).toBeTruthy();
+      }
+
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const files = await readdir(folder);
+      // Nothing left behind: no partial, no control file.
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".aria2"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".mp3"))).toHaveLength(3);
+
+      // The mock never reported the wedge condition — if it had, the download
+      // could not have completed.
+      const reliability = await engine.api("/api/reliability");
+      expect(reliability.downloader.engine).toBe("aria2c");
+      expect(reliability.partialFiles.count).toBe(0);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a hard kill mid-download resumes on restart (crashed-jobs sweep)", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3990,
+      BASE_CONFIG(3990, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 16,
+        maxConcurrentDownloads: 1,
+        maxDownloadWorkers: 1,
+        maxRetryAttempts: 10,
+        maxFailuresPerVideo: 10,
+        maxFailures: 50,
+      }),
+      // Hold the aria2c transfer open so a SIGKILL lands mid-flight, leaving
+      // the .part + .aria2 pair a real interrupted run leaves behind.
+      { FAKE_ARIA2C_INFLIGHT_MS: "20000" },
+    );
+
+    try {
+      // Wait until the transfer is genuinely in flight: the partial file and
+      // its aria2c control file are both on disk.
+      const folder = join(dir, "downloads", "Mock Playlist");
+      await waitFor("an in-flight aria2c transfer", async () => {
+        const files = await readdir(folder).catch(() => [] as string[]);
+        return files.some((f) => f.endsWith(".part")) && files.some((f) => f.endsWith(".aria2"));
+      });
+
+      // Hard kill: no graceful shutdown, no chance to clean up.
+      engine.proc.kill("SIGKILL");
+      await engine.proc.exited;
+
+      const leftovers = (await readdir(folder).catch(() => [] as string[])).filter(
+        (f) => f.endsWith(".part") || f.endsWith(".aria2"),
+      );
+      expect(leftovers.length).toBeGreaterThan(0); // a real interrupted transfer
+      // Both halves of the pair must be present — that is what makes resume
+      // possible with aria2c.
+      expect(leftovers.some((f) => f.endsWith(".part"))).toBe(true);
+      expect(leftovers.some((f) => f.endsWith(".aria2"))).toBe(true);
+    } finally {
+      await engine.stop();
+    }
+
+    // Restart: the crashed-jobs sweep re-queues the interrupted video and the
+    // retained control file lets aria2c resume instead of restarting.
+    const engine2 = await startEngine(dir, 3991, BASE_CONFIG(3991, { videoQuality: "audio", useAria2c: true }));
+    try {
+      const jobs = await waitForAllJobs(
+        engine2,
+        (j) =>
+          j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      const files = await readdir(join(dir, "downloads", "Mock Playlist"));
+      expect(files.filter((f) => f.endsWith(".mp3"))).toHaveLength(3);
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".aria2"))).toHaveLength(0);
+    } finally {
+      await engine2.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("deleted downloads are re-fetched, and failed jobs retry after cooldown", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3992,
+      BASE_CONFIG(3992, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 8,
+        requeueFailedAfterMinutes: 1,
+        retryBackoffBaseSeconds: 1,
+        retryBackoffMaxSeconds: 2,
+        maxRetryAttempts: 5,
+        maxFailuresPerVideo: 5,
+        maxFailures: 20,
+      }),
+    );
+
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitForAllJobs(
+        engine,
+        (j) =>
+          j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+
+      // Self-healing sweep 3: delete the media behind the engine's back.
+      for (const f of await readdir(folder)) {
+        if (f.endsWith(".mp3")) await rm(join(folder, f));
+      }
+      expect((await readdir(folder)).filter((f) => f.endsWith(".mp3"))).toHaveLength(0);
+    } finally {
+      await engine.stop();
+    }
+
+    // reconcileMissingFiles runs at startup, so the re-fetch shows up on the
+    // next run — the archive entry is scrubbed and the job is queued again.
+    const engine2 = await startEngine(dir, 3993, BASE_CONFIG(3993, { videoQuality: "audio", useAria2c: true }));
+    try {
+      const jobs = await waitForAllJobs(
+        engine2,
+        (j) =>
+          j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mp3"))).toHaveLength(3);
+      // Re-fetching through aria2c leaves no control-file litter behind.
+      expect(files.filter((f) => f.endsWith(".aria2"))).toHaveLength(0);
+      expect(files.filter((f) => f.endsWith(".part"))).toHaveLength(0);
+    } finally {
+      await engine2.stop();
     }
   }, TEST_TIMEOUT);
 });

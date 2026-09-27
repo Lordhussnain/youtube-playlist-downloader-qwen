@@ -219,9 +219,46 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
 }
 
 /**
+ * Suffix aria2c appends to a partial file to store its resume state.
+ *
+ * aria2 keeps a *control file* next to every in-progress download — "its
+ * filename is the filename of downloading file with .aria2 appended" — holding
+ * which pieces arrived and how far the transfer got. yt-dlp's native
+ * downloader has no equivalent, so this only exists when `useAria2c` picked
+ * aria2c as the downloader.
+ */
+export const ARIA2_CONTROL_SUFFIX = ".aria2";
+
+/** A partial download plus every sidecar that must travel with it. */
+export function partialSidecars(partialPath: string): string[] {
+  return [partialPath, `${partialPath}${ARIA2_CONTROL_SUFFIX}`];
+}
+
+/**
+ * Delete a partial download and everything that belongs to it.
+ *
+ * The pairing is load-bearing, not tidiness. aria2c defaults to
+ * `--allow-overwrite=false`, whose documented behaviour is: *"if a file
+ * already exists but the corresponding control file doesn't exist, then aria2
+ * will not re-download the file."* So deleting the `.part` while stranding the
+ * `.aria2` leaves aria2c holding a control file for data that is gone — it can
+ * neither resume nor restart, and the job wedges and retries forever. (Exit
+ * status 10, *"piece length was different from one in .aria2 control file"*, is
+ * the other way this bites.) Always remove both together.
+ */
+export async function removePartialFiles(partialPath: string): Promise<void> {
+  for (const path of partialSidecars(partialPath)) {
+    await unlink(path).catch(() => {});
+  }
+}
+
+/**
  * Locate the in-progress download for a base filename: the `.part` file
  * (progressive and DASH both land here) or the `.ytdl` fragment directory.
  * Returns the newest match, or "" when there is nothing to resume.
+ *
+ * Note this deliberately matches only the data file: an aria2c control file on
+ * its own is not resumable state, it is litter (see `removePartialFiles`).
  */
 export async function findPartialFile(dir: string, baseFilename: string): Promise<string> {
   try {
@@ -249,6 +286,10 @@ export async function findPartialFile(dir: string, baseFilename: string): Promis
  *   • everything else — including in-flight downloads from a previous run and
  *     resume-able partials of failed-but-retryable jobs — is kept so
  *     `--continue` can pick up exactly where the download stopped
+ *
+ * Deleting a partial also deletes its aria2c control file, and control files
+ * whose data file is gone are swept on their own — a stranded `.aria2` makes
+ * aria2c refuse to restart the transfer (see `removePartialFiles`).
  */
 export async function cleanOrphanedFiles(rootDir: string, config?: Config): Promise<void> {
   try {
@@ -276,15 +317,36 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
         const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap;
         const ancient = ageMs > 7 * 24 * 60 * 60 * 1000;
         if (exhausted || ancient) {
-          await unlink(fullPath).catch(() => {});
+          // Take the aria2c control file with it, or the next attempt wedges.
+          await removePartialFiles(fullPath);
           removed++;
         }
       } else if (ageMs > 24 * 60 * 60 * 1000) {
         // Orphan: no job claims it — safe to clean once it is clearly stale.
-        await unlink(fullPath).catch(() => {});
+        await removePartialFiles(fullPath);
         removed++;
       }
     }
+
+    // Control files whose data file is gone (hand-deleted .part, an interrupted
+    // cleanup, a partial removed by an older build). Note a stranded control
+    // file is still named "<name>.part.aria2" — the suffix alone says nothing,
+    // so the data-file check below is what decides. Pure litter now, and
+    // actively harmful: aria2c sees a control file, cannot resume, and with
+    // --allow-overwrite=false will not start over.
+    for (const file of files) {
+      if (!file.endsWith(ARIA2_CONTROL_SUFFIX)) continue;
+      const fullPath = join(rootDir, file);
+      const s2 = await stat(fullPath).catch(() => null);
+      if (!s2) continue;
+      // Young enough that a download may just have started writing it.
+      if (Date.now() - s2.mtimeMs < 24 * 60 * 60 * 1000) continue;
+      // Its data file is still there — this is live resume state, keep it.
+      if (existsSync(fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length))) continue;
+      await unlink(fullPath).catch(() => {});
+      removed++;
+    }
+
     if (removed > 0) console.log(`🧹 Cleaned ${removed} stale partial file(s).`);
   } catch {}
 }

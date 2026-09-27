@@ -6,13 +6,13 @@
 // attempt resumes from it with --continue, and the per-video retry budget only
 // shrinks while the video is making no forward progress.
 
-import { stat, unlink } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
-import { findPartialFile } from "../reconcile";
+import { findPartialFile, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
 import { computeBackoffMs, isTransientDownloadError } from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
@@ -226,8 +226,9 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
         : await findPartialFile(job.output_directory, base);
     if (resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial) {
       // Budget spent (or nothing to resume): throw the partial away and
-      // restart this video from scratch.
-      if (partial) await unlink(partial).catch(() => {});
+      // restart this video from scratch. The aria2c control file goes too —
+      // stranding it makes aria2c refuse to restart (see removePartialFiles).
+      if (partial) await removePartialFiles(partial);
       resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
       updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
       return;

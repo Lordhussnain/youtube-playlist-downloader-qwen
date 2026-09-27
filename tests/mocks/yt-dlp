@@ -134,6 +134,23 @@ if (flagValue("--downloader") === "aria2c") {
     url,
   ];
   const proc = Bun.spawn(forwarded, { stdout: "inherit", stderr: "inherit" });
+
+  // A hard-killed engine takes the whole chain with it. Without this the mock
+  // survives as an orphan and finishes the download, so a crash test would see
+  // no partial file at all — unlike a real interrupted run.
+  const parentPid = process.ppid;
+  const watcher = (async () => {
+    while (true) {
+      if (process.ppid !== parentPid) {
+        try {
+          proc.kill(9);
+        } catch {}
+        return;
+      }
+      await Bun.sleep(50);
+    }
+  })();
+
   const code = await proc.exited;
   if (code !== 0) {
     console.error(`ERROR: aria2c mock exited ${code}`);

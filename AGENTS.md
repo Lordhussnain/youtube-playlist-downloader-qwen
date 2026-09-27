@@ -72,7 +72,7 @@ src/
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards
-  reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs)
+  reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
   workers/
@@ -307,6 +307,29 @@ Facts worth knowing before you touch it:
   absent) and is **optional** — a missing binary warns at startup and never
   exits. `checkDependencies` takes the aria2c keys as optional config fields.
 
+#### Control files: never delete a `.part` without its `.aria2`
+
+aria2c writes a *control file* beside every in-progress download
+(`<name>.part.aria2`) holding which pieces arrived. Two rules follow, and both
+are load-bearing:
+
+1. **Resume depends on the pair.** An interrupted transfer leaves
+   `<name>.part` + `<name>.part.aria2`; the next attempt resumes from them. This
+   is why enabling aria2c does not weaken the resume/reliability behaviour.
+2. **Discarding a partial must delete both.** aria2c defaults to
+   `--allow-overwrite=false`, whose documented behaviour is *"if a file already
+   exists but the corresponding control file doesn't exist, then aria2 will not
+   re-download the file."* A stranded control file therefore makes aria2c unable
+   to resume (the data is gone) *and* unwilling to restart — the job retries
+   forever. Exit status 10 (*"piece length was different from one in .aria2
+   control file"*) is the other way this bites.
+
+Always go through `removePartialFiles(path)` (`src/reconcile.ts`), never a bare
+`unlink()`. It removes the data file and the control file together, and
+`cleanOrphanedFiles()` also sweeps control files whose data file has vanished.
+`findPartialFile()` deliberately matches only the data file — a control file on
+its own is litter, not resumable state.
+
 ---
 
 ## 8. Web API (`src/web.ts`)
@@ -365,6 +388,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/report.test.ts` | run report contents |
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
+| `tests/reconcile.test.ts` | `removePartialFiles`, `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
@@ -382,7 +406,23 @@ and spawns the real `batch_playlist_downloader.ts`, then drives it over HTTP
 Scenarios: happy path (scan → download → metadata → convert), transient-failure
 retries with backoff, corrupt-partial resume, permanent failures (never
 requeued), restart reconciliation after deleting files, aria2c multi-connection
-downloads (args + cap verified), and the native fallback when aria2c is missing.
+downloads (args + cap verified), the native fallback when aria2c is missing, and
+four aria2c resume/self-healing scenarios: resume from the control file,
+discarding a partial *with* its control file when the resume budget runs out, a
+hard kill mid-transfer followed by a resume on restart, and deleted files being
+re-fetched.
+
+The mock aria2c reproduces the real control-file lifecycle (interrupted →
+`.part` + `.aria2`; resume → `resumed=yes`; success → control file removed) and
+**fails hard if it is handed a control file whose data file is missing** — that
+is the wedged state the engine must never create, so a regression in
+`removePartialFiles` fails the suite rather than hanging a download. Injection:
+`FAKE_ARIA2C_FAIL_TIMES` / `FAKE_ARIA2C_FAIL_MODE` (failure originates inside the
+external downloader, independently of the yt-dlp mock's own `FAKE_FAIL_TIMES`)
+and `FAKE_ARIA2C_INFLIGHT_MS` (hold a transfer open so a kill can interrupt it).
+The yt-dlp mock kills its aria2c child when its own parent dies, so a hard-killed
+engine leaves a realistic interrupted state instead of an orphan finishing the
+download.
 
 Mock controls (environment variables):
 
@@ -454,6 +494,11 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 13. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
     passes the URL first and the plan's args after it, so the mock's URL
     detection (`argv[0]`) depends on that ordering.
+14. **Never `unlink()` a partial directly.** With aria2c a partial is two files
+    (`.part` + `.part.aria2`); use `removePartialFiles()` or the next attempt
+    wedges forever. `tests/reconcile.test.ts` and the "exhausting the resume
+    budget" integration scenario both fail if this regresses — the latter was
+    verified to fail against the old single-file unlink.
 
 ---
 
