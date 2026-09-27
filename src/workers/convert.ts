@@ -12,7 +12,7 @@ import { claimConvertJob, db, perVideoCap, type Job } from "../db";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, isPaused, stats, workerStatuses } from "../state";
+import { abortController, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
@@ -37,6 +37,10 @@ export async function runFfmpeg(
 export async function converterWorker(id: number, config: Config): Promise<void> {
   const workerId = `cv-${id}`;
   while (!abortController.signal.aborted) {
+    // Re-read the config every iteration so settings changed from the dashboard
+    // (POST /api/settings) take effect on the next job without a restart. The
+    // parameter is only the initial value.
+    config = getConfig();
     if (isPaused()) {
       await Bun.sleep(2000);
       continue;

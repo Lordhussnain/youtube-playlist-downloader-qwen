@@ -18,7 +18,7 @@ import { computeBackoffMs, isTransientDownloadError } from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
 import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeProcs, isPaused, stats, workerStatuses } from "../state";
+import { abortController, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
@@ -28,6 +28,10 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
   const workerId = `dl-${id}`;
   aliveDownloadWorkers.add(id);
   while (!abortController.signal.aborted) {
+    // Re-read the config every iteration so settings changed from the dashboard
+    // (POST /api/settings) take effect on the next job without a restart. The
+    // parameter is only the initial value.
+    config = getConfig();
     if (isPaused()) {
       await Bun.sleep(2000);
       continue;
