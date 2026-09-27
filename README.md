@@ -14,7 +14,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
-- **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown
+- **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
 - **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit
@@ -123,6 +123,14 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+**How resume works with aria2c.** aria2c keeps a *control file* next to every
+in-progress download (`<name>.part.aria2`) recording which pieces have arrived.
+An interrupted transfer leaves both files, and the next attempt resumes from
+them — so enabling aria2c does not weaken resume. When the engine decides a
+partial is unusable it deletes the `.part` **and** its control file: aria2c
+defaults to `--allow-overwrite=false`, under which a control file whose data is
+gone makes it neither resume nor restart, wedging the job permanently.
 
 Edit these interactively with `bun run config` → **Change Download Settings**.
 Settings**, or from the web dashboard's reliability panel.
