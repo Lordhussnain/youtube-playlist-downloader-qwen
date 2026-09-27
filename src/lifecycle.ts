@@ -11,6 +11,7 @@ import { heartbeatRunHistory } from "./history";
 import { logError } from "./logger";
 import { resetTerminal } from "./dashboard";
 import { abortController, setPaused } from "./state";
+import { recordPartialPaths } from "./reconcile";
 
 let isShuttingDown = false;
 
@@ -28,6 +29,11 @@ export async function handleShutdown(sig: string, webServer: { stop: (closeActiv
   killActiveChildren();
 
   try {
+    // Freeze the resume state first: every in-flight download's `.part` path is
+    // written into its job while the worker loops are already stopped, so the
+    // "interrupted jobs resume from their partial" claim is actually true
+    // instead of just a status the next start re-downloads from scratch.
+    recordPartialPaths();
     // Persist an accurate picture of the interrupted pipeline:
     //  - in-flight downloads become 'paused' + 'interrupted' (auto-resumed
     //    and continued from where they left off on the next start)

@@ -10,13 +10,14 @@
 //   requeueFailedJobs      — failed jobs are retried after a cooldown, with
 //                            permanent errors (private/removed videos) skipped
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
-import { db, perVideoCap } from "./db";
+import { join, resolve } from "node:path";
+import { db, perVideoCap, type Job } from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
 import { isPermanentDownloadError } from "./retry";
+import { jobBaseFilename } from "./download-args";
 import type { Config } from "./config";
 
 /**
@@ -45,32 +46,50 @@ export function reconcileCrashedJobs(): void {
 }
 
 /**
+ * How long a claim may sit untouched before `reapStaleClaims` treats its owner
+ * as dead and re-queues the job. Exported so the dashboard's sweep status
+ * reports exactly the same thresholds the sweep itself enforces — if these
+ * drift, the UI would promise recovery the engine never performs.
+ */
+export const STALE_CLAIM_THRESHOLDS = {
+  download: "-20 minutes",
+  conversion: "-3 hours",
+  metadata: "-15 minutes",
+} as const;
+
+/**
  * Periodic safety net: if a worker process/thread dies mid-job the claim can
  * be left behind. Downloads have a duration-aware watchdog, so any claim older
- * than 20 minutes is definitely dead → mark paused+interrupted for
- * auto-resume. Conversion claims older than 3h and metadata older than 15m are
- * re-queued.
+ * than `STALE_CLAIM_THRESHOLDS.download` is definitely dead → mark
+ * paused+interrupted for auto-resume. Conversion and metadata claims past their
+ * thresholds are re-queued.
  */
 export function reapStaleClaims(): void {
   try {
+    // Freeze each in-flight download's `.part` path while the job is still
+    // 'downloading' (that is this function's own filter) — otherwise the
+    // reclaimed job resumes without a partial and restarts from scratch.
+    const recorded = recordPartialPaths();
     const dl = db.run(
       `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
          download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '-20 minutes'))`,
+         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}'))`,
     );
     const cv = db.run(
       `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE conversion_status = 'in_progress'
-         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '-3 hours'))`,
+         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.conversion}'))`,
     );
     const md = db.run(
       `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
-       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '-15 minutes')`,
+       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.metadata}')`,
     );
     const total = dl.changes + cv.changes + md.changes;
     if (total > 0) {
-      console.log(`🧟 Reclaimed ${dl.changes} stale download(s), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`);
+      console.log(
+        `🧟 Reclaimed ${dl.changes} stale download(s) (${recorded} partial(s) marked resumable), ${cv.changes} conversion(s), ${md.changes} metadata job(s).`,
+      );
       logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
     }
   } catch (e: any) {
@@ -271,10 +290,90 @@ export async function findPartialFile(dir: string, baseFilename: string): Promis
       if (s) matches.push({ path: join(dir, f), mtime: s.mtimeMs });
     }
     matches.sort((a, b) => b.mtime - a.mtime);
-    return matches[0]?.path || "";
+    // Absolute: the engine, the dashboard, and any post-mortem reader all need
+    // to resolve this regardless of their own working directory.
+    return matches[0] ? resolve(matches[0].path) : "";
   } catch {
     return "";
   }
+}
+
+/**
+ * Synchronous sibling of `findPartialFile`, for paths that cannot await
+ * (the shutdown handler and the worker's pause path run outside any async
+ * context).
+ */
+export function findPartialFileSync(dir: string, baseFilename: string): string {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return "";
+  }
+  let best = "";
+  let bestMtime = -1;
+  for (const f of entries) {
+    if (!f.startsWith(baseFilename + ".")) continue;
+    if (!f.endsWith(".part") && !f.endsWith(".ytdl")) continue;
+    const full = join(dir, f);
+    let mtime: number;
+    try {
+      mtime = statSync(full).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (mtime > bestMtime) {
+      bestMtime = mtime;
+      best = full;
+    }
+  }
+  return best ? resolve(best) : "";
+}
+
+/**
+ * Remember where each in-flight download's `.part` lives before the job stops
+ * being "downloading".
+ *
+ * Without this, a graceful shutdown or a reaped stale claim leaves the job
+ * paused+interrupted with `partial_file_path = NULL` even though the partial is
+ * sitting right there on disk. The next attempt then restarts the video from
+ * scratch, and the dashboard reports no resumable partial — the resume the
+ * sweep promises never actually happens. Synchronous so it can run from the
+ * shutdown path and from `reapStaleClaims` before the status is flipped.
+ */
+export function recordPartialPaths(): number {
+  const rows = db
+    .query(
+      `SELECT id, "index", title, output_directory, partial_file_path FROM jobs
+       WHERE download_status = 'downloading' AND partial_file_path IS NULL`,
+    )
+    .all() as any[];
+  let recorded = 0;
+  for (const r of rows) {
+    if (recordJobPartial(r)) recorded++;
+  }
+  return recorded;
+}
+
+/**
+ * Record a single job's on-disk partial, if it has one. Returns the path, or
+ * "" when there is nothing to resume.
+ *
+ * Used by the bulk sweep above and by the download worker's pause path, which
+ * parks an in-flight job as 'paused' — without this the partial on disk is
+ * orphaned from the job and the next attempt restarts the video from zero.
+ */
+export function recordJobPartial(
+  job: Pick<Job, "id" | "index" | "title" | "output_directory">,
+): string {
+  const partial = findPartialFileSync(job.output_directory || ".", jobBaseFilename(job));
+  if (partial) {
+    db.run(`UPDATE jobs SET partial_file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+      partial,
+      job.id,
+    ]);
+  }
+  return partial;
 }
 
 /**

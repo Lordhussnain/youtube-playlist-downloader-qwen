@@ -139,6 +139,30 @@ counts, the kept partial and its aria2c control file, and the last error).
 Keyboard: <kbd>/</kbd> search, <kbd>s</kbd> settings, <kbd>p</kbd> pause/resume,
 <kbd>r</kbd> refresh, <kbd>Esc</kbd> close.
 
+### The reliability panel
+
+The panel is a live read of what the engine is actually doing about failures,
+not a static list of settings:
+
+- **Downloader** — engine in use, connections per download, concurrent
+  fragments, the bandwidth cap, and the autoscale ramp step.
+- **Will resume** — jobs that still hold a `.part` file and are therefore still
+  in play (`pending`, `paused`, or `downloading`). Their job rows carry a
+  `⏸️ partial · will resume` pill whose tooltip shows the `.part` path and its
+  `.aria2` control file.
+- **Interrupted** — jobs parked as `paused` + `interrupted`, i.e. the ones the
+  crashed-jobs sweep will re-claim and continue rather than restart.
+- **Stale claims** — what the reaper would reclaim right now: claims older than
+  the thresholds in `STALE_CLAIM_THRESHOLDS` (20 min download / 3 h conversion /
+  15 min metadata). The panel imports those constants, so it cannot advertise a
+  timeout the sweep does not enforce.
+- **Self-healing sweeps** — the four sweeps with their cadence and a pending
+  count. Deleted-files is `startup`-only and stats every recorded file, so its
+  count is reported as unknown rather than guessed.
+
+Every count comes from `GET /api/reliability`, which reads the live config (not
+a startup snapshot) and the job table.
+
 **How resume works with aria2c.** aria2c keeps a *control file* next to every
 in-progress download (`<name>.part.aria2`) recording which pieces have arrived.
 An interrupted transfer leaves both files, and the next attempt resumes from

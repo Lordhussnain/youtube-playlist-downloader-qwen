@@ -158,7 +158,7 @@ dependency-free — it is the module that breaks every import cycle.
 | `conversion_retry_count`, `metadata_retry_count` | per-stage attempt budgets |
 | `resume_count` | `--continue` resumes spent for this job |
 | `best_progress` | high-water mark of progress % (drives budget forgiveness) |
-| `partial_file_path` | the `.part` file to resume from (NULL once complete) |
+| `partial_file_path` | the `.part` file to resume from (NULL once complete); always absolute, so it resolves from any cwd |
 | `file_path`, `file_size`, `integrity` | final location + SHA-256 |
 | `progress`, `speed`, `eta` | live values for the dashboard |
 | `last_error` | last failure message (classified by `retry.ts`) |
@@ -235,12 +235,14 @@ and restarted after 5s. Never let a worker loop exit on error.
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` | `retry_count` only increments when `progress <= best_progress` |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
+| Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
+| Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
 | Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
 | Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs |
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
 | Disk guard | `resilience.ts checkDiskSpace()` | statfs → PowerShell fallback → degraded mode (never bricks the engine) |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
-| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min |
+| Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | cooldown + per-video cap + permanent-error skip; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, deletes exhausted (>cap) and day-old orphans |
@@ -353,7 +355,7 @@ or `?token=`. Comparison is timing-safe. Default bind is `127.0.0.1`.
 | DELETE | `/api/jobs/<id>` | delete one job |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
-| GET | `/api/reliability` | pause state, kept partials, retryable count, active policy, active downloader engine (`downloader.engine` / `.path` / `.connectionsPerDownload` / `.concurrentFragments`) |
+| GET | `/api/reliability` | pause state, kept partials, retryable count, active policy, active downloader engine (`downloader.engine` / `.path` / `.connectionsPerDownload` / `.concurrentFragments` / `.maxBandwidthKBps` / `.autoscaleRampStep`), plus a `resume` block (`resumablePartials` / `interrupted` / `staleClaims`) and a `sweeps` array (`id` / `label` / `cadence` / `detail` / `pending`; `missingFiles.pending` is `null` because that sweep stats every file) |
 | GET | `/api/settings` | the dashboard-editable keys: `{fields, values, nonDefault}` where each field carries its label/type/range/help so the UI renders generically |
 | POST | `/api/settings` | apply a partial patch. Validates the **whole** config against `ConfigSchema` (so cross-field refinements hold), persists to `config.json`, and `setConfig()`s it live. Rejects (400) any key outside the allow-list, an out-of-range value, or a malformed body — and changes nothing when it rejects |
 | GET | `/api/history?limit=20` | run history rows |
