@@ -19,6 +19,7 @@ import { requeueFailedJobs } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
+import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
 import { formatBytesPerSec, formatDuration } from "./util";
 import { logError } from "./logger";
@@ -99,7 +100,10 @@ export function startWebServer(port: number, config: Config) {
       // Every request is wrapped: a handler crash returns JSON 500 instead of
       // hanging the socket, and the error lands in error.log.
       try {
-        return await handleRequest(req, config);
+        // Read the live config, not the one captured at startup: settings
+        // changed from the dashboard (POST /api/settings) must be reflected by
+        // every endpoint immediately, and setConfig() replaces the object.
+        return await handleRequest(req, getConfig());
       } catch (e: any) {
         logError("http", `${req.method} ${new URL(req.url).pathname}: ${e?.stack || e}`);
         return Response.json({ ok: false, error: "Internal server error" }, { status: 500 });
@@ -347,6 +351,33 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
   if (url.pathname === "/api/failed/requeue" && req.method === "POST") {
     const result = requeueFailedJobs(config, { ignoreCooldown: true });
     return Response.json({ ok: true, requeued: result });
+  }
+
+  // Dashboard settings: the editable downloader/concurrency/reliability knobs.
+  // GET is a read-only snapshot; POST validates, persists, and makes the change
+  // live. Both sit behind the same token gate as every other API route.
+  if (url.pathname === "/api/settings" && req.method === "GET") {
+    return Response.json({ ok: true, ...readSettings(config) });
+  }
+
+  if (url.pathname === "/api/settings" && req.method === "POST") {
+    let patch: unknown;
+    try {
+      patch = await req.json();
+    } catch {
+      return Response.json({ ok: false, error: "Expected a JSON body" }, { status: 400 });
+    }
+    const result = await applySettings(config, patch as Record<string, unknown>);
+    if (!result.ok) {
+      return Response.json({ ok: false, error: result.error }, { status: 400 });
+    }
+    // Echo back the fresh snapshot so the panel can re-render from the server's
+    // view of the world rather than what it thinks it sent.
+    return Response.json({
+      ok: true,
+      changed: result.changed,
+      ...readSettings(result.config ?? config),
+    });
   }
 
   // Reliability snapshot for the dashboard: what is paused, how many partial

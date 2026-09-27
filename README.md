@@ -21,7 +21,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
 - Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
-- **Web dashboard** with live job status, bulk actions, failed-job recovery, and a reliability panel
+- **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
 ## Tech Stack
 
@@ -123,6 +123,21 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+### Tuning from the dashboard
+
+The **⚙️ Settings** button opens an editor for the downloader, concurrency, and
+reliability knobs. Changes are validated against the same Zod schema the engine
+uses, written to , and applied to the running engine — the next
+download picks them up without a restart. The panel deliberately exposes only
+tuning keys: playlists, credentials, and the network binding are not editable
+from the browser, and a request naming anything outside the allow-list is
+rejected rather than silently ignored.
+
+Click any job row for its detail view (file paths, sizes, duration, retry/resume
+counts, the kept partial and its aria2c control file, and the last error).
+Keyboard: <kbd>/</kbd> search, <kbd>s</kbd> settings, <kbd>p</kbd> pause/resume,
+<kbd>r</kbd> refresh, <kbd>Esc</kbd> close.
 
 **How resume works with aria2c.** aria2c keeps a *control file* next to every
 in-progress download (`<name>.part.aria2`) recording which pieces have arrived.

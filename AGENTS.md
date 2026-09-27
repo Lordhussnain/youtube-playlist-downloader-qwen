@@ -70,6 +70,7 @@ src/
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
+  settings.ts    dashboard-editable config allow-list + validate/persist/apply
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
@@ -353,6 +354,8 @@ or `?token=`. Comparison is timing-safe. Default bind is `127.0.0.1`.
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
 | GET | `/api/reliability` | pause state, kept partials, retryable count, active policy, active downloader engine (`downloader.engine` / `.path` / `.connectionsPerDownload` / `.concurrentFragments`) |
+| GET | `/api/settings` | the dashboard-editable keys: `{fields, values, nonDefault}` where each field carries its label/type/range/help so the UI renders generically |
+| POST | `/api/settings` | apply a partial patch. Validates the **whole** config against `ConfigSchema` (so cross-field refinements hold), persists to `config.json`, and `setConfig()`s it live. Rejects (400) any key outside the allow-list, an out-of-range value, or a malformed body — and changes nothing when it rejects |
 | GET | `/api/history?limit=20` | run history rows |
 | GET | `/api/logs?type=error\|report&limit=100` | error.log or the run report |
 
@@ -389,6 +392,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/reconcile.test.ts` | `removePartialFiles`, `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
+| `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
 
 ### 9.3 End-to-end tests with mock tools
@@ -491,14 +495,24 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     itself. Splitting it into separate argv entries breaks parsing (the mock
     yt-dlp in `tests/mocks/` strips the `aria2c:"…"` wrapper — keep that in sync
     if you change the format).
-13. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
-    passes the URL first and the plan's args after it, so the mock's URL
-    detection (`argv[0]`) depends on that ordering.
 14. **Never `unlink()` a partial directly.** With aria2c a partial is two files
     (`.part` + `.part.aria2`); use `removePartialFiles()` or the next attempt
     wedges forever. `tests/reconcile.test.ts` and the "exhausting the resume
     budget" integration scenario both fail if this regresses — the latter was
     verified to fail against the old single-file unlink.
+15. **The web server must read the live config.** `startWebServer()` captures a
+    `Config` reference, and `setConfig()` *replaces* the object rather than
+    mutating it — so passing the captured reference into `handleRequest()` makes
+    every endpoint report stale values after a settings change. The fetch
+    handler passes `getConfig()`; keep it that way. The "reliability endpoint
+    reflects the new values" test in `tests/settings.test.ts` is the guard.
+16. **Workers re-read the config each loop iteration** (`config = getConfig()`
+    at the top of the while loop). That one line is what makes dashboard
+    settings changes take effect without a restart — the parameter is only the
+    initial value. Don't "optimise" it away by hoisting the read.
+17. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
+    passes the URL first and the plan's args after it, so the mock's URL
+    detection (`argv[0]`) depends on that ordering.
 
 ---
 

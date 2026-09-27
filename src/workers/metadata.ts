@@ -12,7 +12,7 @@ import { cookiesArgs, ytDlp } from "../tools";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
-import { abortController, activeMetadataProcs, isPaused, stats, workerStatuses } from "../state";
+import { abortController, activeMetadataProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import type { Config } from "../config";
@@ -20,6 +20,10 @@ import type { Config } from "../config";
 export async function metadataWorker(id: number, config: Config): Promise<void> {
   const workerId = `md-${id}`;
   while (!abortController.signal.aborted) {
+    // Re-read the config every iteration so settings changed from the dashboard
+    // (POST /api/settings) take effect on the next job without a restart. The
+    // parameter is only the initial value.
+    config = getConfig();
     if (isPaused()) {
       await Bun.sleep(2000);
       continue;
