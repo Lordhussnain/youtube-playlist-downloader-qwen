@@ -163,6 +163,10 @@ not a static list of settings:
 Every count comes from `GET /api/reliability`, which reads the live config (not
 a startup snapshot) and the job table.
 
+The terminal UI carries the same signal: the header line gains a `Res:n` field
+whenever jobs are holding a partial they will resume from, so a paused engine
+reports its resume state without needing the browser open.
+
 **How resume works with aria2c.** aria2c keeps a *control file* next to every
 in-progress download (`<name>.part.aria2`) recording which pieces have arrived.
 An interrupted transfer leaves both files, and the next attempt resumes from

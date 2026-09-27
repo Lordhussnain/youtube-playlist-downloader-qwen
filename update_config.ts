@@ -6,7 +6,10 @@
 // Run with: bun run update_config.ts   (or: bun run config)
 
 import { createInterface } from "node:readline/promises";
+import { existsSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import { CONFIG_PATH, loadConfigSafe, saveConfig, type Config } from "./src/config";
+import { STALE_CLAIM_THRESHOLDS } from "./src/reconcile";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -134,6 +137,41 @@ async function manageUrlList(
   }
 }
 
+// ---- Live resume state (read-only) ------------------------------------------
+/**
+ * Read the engine's current resume state straight from the archive database.
+ *
+ * Read-only and best-effort on purpose: the engine may be running and holding
+ * the database, or this may be a fresh install with no database yet. Either
+ * way the config manager must stay usable, so every failure returns null and
+ * the caller simply omits the live figures.
+ */
+function readResumeState(config: Config): { resumable: number; interrupted: number } | null {
+  try {
+    if (!config.archiveFile || !existsSync(config.archiveFile)) return null;
+    const ro = new Database(config.archiveFile, { readonly: true });
+    try {
+      const row = ro
+        .query(
+          `SELECT
+             SUM(CASE WHEN partial_file_path IS NOT NULL
+                       AND download_status IN ('pending', 'paused', 'downloading')
+                      THEN 1 ELSE 0 END) as resumable,
+             SUM(CASE WHEN download_status = 'paused'
+                       AND COALESCE(pause_reason, '') = 'interrupted'
+                      THEN 1 ELSE 0 END) as interrupted
+           FROM jobs`,
+        )
+        .get() as any;
+      return { resumable: row?.resumable || 0, interrupted: row?.interrupted || 0 };
+    } finally {
+      ro.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 // ---- Download Settings -----------------------------------------------------
 async function changeDownloadSettings(config: Config): Promise<Config> {
   console.clear();
@@ -246,6 +284,10 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
 
   // Storage Management
   console.log("\n— Storage Management —");
+  const rootAns = await ask(
+    `   Download root folder (where playlists/channels are created) [current: ${config.outputRoot}]: `,
+  );
+  if (rootAns.trim() !== "") config.outputRoot = rootAns.trim();
   config.minFreeSpaceGB = await askNumber("Min free space (GB) before pausing", config.minFreeSpaceGB, 1);
   const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || "none"}]: `);
   if (nasPath.trim() !== "") config.secondaryStoragePath = nasPath.trim();
@@ -277,6 +319,21 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   }
   config.rescanIntervalHours = await askNumber("Full rescan interval (hours, 0 = never)", config.rescanIntervalHours, 0, 24 * 30);
 
+  // Cookies (age-gated / members-only content)
+  console.log("\n— Cookies —");
+  const cookAns = await ask(
+    `   cookies.txt path (Netscape format; blank = none) [current: ${config.cookiesFile || "none"}]: `,
+  );
+  if (cookAns.trim() === "-") config.cookiesFile = "";
+  else if (cookAns.trim() !== "") config.cookiesFile = cookAns.trim();
+  config.validateCookiesOnStart = await askYesNo(
+    "Validate the cookie file on startup and warn when it is stale?",
+    config.validateCookiesOnStart,
+  );
+  if (config.cookiesFile && !existsSync(config.cookiesFile)) {
+    console.log(`   ⚠️ ${config.cookiesFile} does not exist yet — age-gated videos will fail until it does.`);
+  }
+
   console.log("\n— External Tools (Windows-friendly auto-detect) —");
   const ytdlpAns = await ask(
     `   yt-dlp path (blank = auto-detect: PATH / app folder / winget / scoop / choco) [current: ${config.ytDlpPath || "auto"}]: `,
@@ -297,6 +354,18 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
   console.log("These control what happens when a download is interrupted,\n");
   console.log("fails, or a file disappears. Defaults are sensible for most setups.\n");
 
+  // Live state, so the knobs below are read against what is actually on disk.
+  const live = readResumeState(config);
+  if (live) {
+    console.log(
+      `Right now: ${live.resumable} job(s) hold a .part they will resume from` +
+        (live.interrupted > 0 ? `, ${live.interrupted} parked as interrupted` : "") +
+        ".\n",
+    );
+  } else {
+    console.log("(No archive database yet — nothing to resume.)\n");
+  }
+
   console.log("— Resume —");
   config.maxResumeAttempts = await askNumber(
     "Max resume attempts per video before restarting it from scratch",
@@ -306,6 +375,11 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
   console.log(
     `   Interrupted downloads keep their .part file and continue with yt-dlp --continue;\n   after ${config.maxResumeAttempts} failed resumes the partial is discarded and the video restarts.`,
   );
+  if (live && live.resumable > 0) {
+    console.log(
+      `   Each of the ${live.resumable} partial(s) above may be resumed up to ${config.maxResumeAttempts} time(s).`,
+    );
+  }
 
   console.log("\n— Watchdogs —");
   config.downloadTimeoutMinutes = await askNumber(
@@ -333,6 +407,17 @@ async function changeReliabilitySettings(config: Config): Promise<Config> {
     config.verifyExistingFiles,
   );
 
+  console.log("\n— Self-healing sweeps (run by the engine, not configurable here) —");
+  console.log(`   • Crashed jobs resume        on startup`);
+  console.log(
+    `   • Stale claims reclaimed      every 60s — downloads ${STALE_CLAIM_THRESHOLDS.download.replace("-", "older than ")}, conversions ${STALE_CLAIM_THRESHOLDS.conversion.replace("-", "")}, metadata ${STALE_CLAIM_THRESHOLDS.metadata.replace("-", "")}`,
+  );
+  console.log(`   • Deleted files re-fetched   on startup`);
+  console.log(
+    `   • Failed jobs retried         every 60s after a ${config.requeueFailedAfterMinutes} min cooldown` +
+      (config.requeueFailedAfterMinutes === 0 ? " (disabled)" : ""),
+  );
+
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;
 }
@@ -349,6 +434,10 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   config.writeThumbnail = await askYesNo("Write .jpg thumbnail sidecar files?", config.writeThumbnail);
   config.verifyIntegrity = await askYesNo("Verify file integrity (SHA256) after download?", config.verifyIntegrity);
   config.skipShorts = await askYesNo("Skip YouTube Shorts (< 60s)?", config.skipShorts);
+  config.downloadShorts = await askYesNo(
+    "Download Shorts into their own folder (when not skipped)?",
+    config.downloadShorts,
+  );
   config.archiveLiveStreams = await askYesNo("Archive Live Streams (wait for VOD)?", config.archiveLiveStreams);
   config.deleteSourceAfterConvert = await askYesNo("Delete source file after conversion?", config.deleteSourceAfterConvert);
 
