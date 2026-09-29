@@ -43,6 +43,29 @@ if (flag("-U")) {
   process.exit(0);
 }
 
+// --- single-JSON dump (audio-track probe / cookie validation) ---------------
+// Mirrors a YouTube video with multi-language audio: three audio tracks
+// (original + two dubs), each in two quality variants plus a -drc duplicate
+// the engine must ignore.
+if (flag("--dump-single-json")) {
+  console.log(
+    JSON.stringify({
+      id: "mockvid001",
+      title: "First Mock Video",
+      formats: [
+        { format_id: "137", vcodec: "avc1.640028", acodec: "none", tbr: 2500 },
+        { format_id: "251-0", vcodec: "none", acodec: "opus", tbr: 160, language: "en", audio_track: { id: "en.0", display_name: "English (original)" } },
+        { format_id: "249-0", vcodec: "none", acodec: "opus", tbr: 70, language: "en", audio_track: { id: "en.0", display_name: "English (original)" } },
+        { format_id: "251-0-drc", vcodec: "none", acodec: "opus", tbr: 160, language: "en" },
+        { format_id: "251-1", vcodec: "none", acodec: "opus", tbr: 150, language: "es", audio_track: { id: "es.1", display_name: "Spanish (auto-dubbed)" } },
+        { format_id: "249-1", vcodec: "none", acodec: "opus", tbr: 65, language: "es" },
+        { format_id: "251-2", vcodec: "none", acodec: "opus", tbr: 140, language: "hi", audio_track: { id: "hi.2", display_name: "Hindi (auto-dubbed)" } },
+      ],
+    }),
+  );
+  process.exit(0);
+}
+
 // --- metadata-only pass (sidecar fetching) -----------------------------------
 if (flag("--skip-download")) {
   const outTemplate = flagValue("-o") || "./video.%(ext)s";
@@ -74,8 +97,14 @@ if (flag("--flat-playlist")) {
 // --- download -----------------------------------------------------------------
 const outTemplate = flagValue("-o") || "./video.%(ext)s";
 const base = outTemplate.replace(/\.%\(ext\)s$/, "");
-const finalPath = `${base}.mp4`;
+// --audio-multistreams + --merge-output-format mkv means a multi-audio
+// download: the real yt-dlp would mux every track into one MKV, so the mock
+// produces (and the mock ffmpeg probes) an .mkv with two audio streams.
+const multiAudio = flag("--audio-multistreams");
+const finalPath = multiAudio ? `${base}.mkv` : `${base}.mp4`;
 const partPath = `${base}.f137.mp4.part`;
+// Record the argv so tests can assert which format selector / flags arrived.
+await Bun.write(`${base}.ytdlp-args`, argv.join(" "));
 
 const failTimes = num("FAKE_FAIL_TIMES", 0);
 const failMode = process.env.FAKE_FAIL_MODE || "transient";
@@ -153,7 +182,7 @@ if (flagValue("--downloader") === "aria2c") {
 
   const code = await proc.exited;
   if (code !== 0) {
-    console.error(`ERROR: aria2c mock exited ${code}`);
+    console.error(`ERROR: aria2c exited with code ${code}`);
     process.exit(1);
   }
   // aria2c downloaded into the .part file; adopt it as the media file so the

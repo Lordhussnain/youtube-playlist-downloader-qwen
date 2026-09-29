@@ -858,3 +858,185 @@ describe("integration: aria2c resume + self-healing", () => {
     }
   }, TEST_TIMEOUT);
 });
+
+// ---------------------------------------------------------------------------
+describe("integration: multi-audio tracks", () => {
+  test("all mode muxes every audio track into one MKV and keeps it through conversion", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3994, BASE_CONFIG(3994, { multiAudioMode: "all" }));
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      // mp4-quality jobs mark conversion 'not_needed' (nothing to remux), so
+      // the pipeline is done once download + metadata settle.
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+
+      // 1) Every job landed as a multi-track MKV (never remuxed to mp4).
+      for (const job of jobs) {
+        expect(job.file_path!.endsWith(".mkv")).toBe(true);
+      }
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mkv"))).toHaveLength(3);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(0);
+
+      // 2) The format selector really carried all three track ids, and the
+      //    multistream/MKV flags reached yt-dlp.
+      const argsFile = join(folder, "001 - First Mock Video.ytdlp-args");
+      const args = await Bun.file(argsFile).text();
+      expect(args).toContain("--audio-multistreams");
+      expect(args).toContain("--merge-output-format mkv");
+      expect(args).toContain("bv[height<=1080]+251-0+251-1+251-2/b[height<=1080]");
+
+      // 3) The discovered tracks are visible through the API for the picker.
+      const apiJobs = await getJobs(engine);
+      for (const j of apiJobs as any[]) {
+        expect(j.audio_tracks).toHaveLength(3);
+        expect(j.audio_tracks.map((t: any) => t.language)).toEqual(["en", "es", "hi"]);
+        expect(j.audio_selection).toBeNull();
+      }
+
+      // 4) A per-job selection overrides the global mode on the next attempt:
+      //    keep only Spanish → single track → classic mp4 download.
+      const target = apiJobs.find((j: any) => j.id === "mockvid001") as any;
+      const save = await engine.api(`/api/jobs/${target.id}/audio-tracks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tracks: ["es"] }),
+      });
+      expect(save.ok).toBe(true);
+      expect(save.audio_selection).toEqual(["es"]);
+      await engine.api(`/api/retry/${target.id}`, { method: "POST" });
+
+      await waitFor("job re-downloaded with the single selected track", async () => {
+        const rows = await getJobs(engine);
+        const j = rows.find((r) => r.id === "mockvid001") as any;
+        return (
+          j &&
+          j.download_status === "downloaded" &&
+          j.metadata_status === "done" &&
+          String(j.file_path || "").endsWith(".mp4")
+        );
+      });
+      const retryArgs = await Bun.file(argsFile).text();
+      expect(retryArgs).toContain("bv[height<=1080]+251-1/b[height<=1080]");
+      expect(retryArgs).not.toContain("--audio-multistreams");
+
+      // 5) Resetting the selection returns the job to the global mode.
+      const reset = await engine.api(`/api/jobs/${target.id}/audio-tracks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tracks: null }),
+      });
+      expect(reset.ok).toBe(true);
+      expect(reset.audio_selection).toBeNull();
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("languages mode keeps only the configured languages", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      3995,
+      BASE_CONFIG(3995, { multiAudioMode: "languages", audioTrackLanguages: ["en", "hi"] }),
+    );
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      const args = await Bun.file(join(folder, "002 - Second Mock Video.ytdlp-args")).text();
+      expect(args).toContain("bv[height<=1080]+251-0+251-2/b[height<=1080]");
+      expect(args).toContain("--audio-multistreams");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("off mode stays a classic single-audio download and never probes", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3996, BASE_CONFIG(3996));
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      const args = await Bun.file(join(folder, "001 - First Mock Video.ytdlp-args")).text();
+      expect(args).toContain("--format bv[height<=1080]+ba/b[height<=1080]");
+      expect(args).not.toContain("--audio-multistreams");
+      const apiJobs = (await getJobs(engine)) as any[];
+      for (const j of apiJobs) expect(j.audio_tracks).toEqual([]); // no probe ran
+      const files = await readdir(folder);
+      expect(files.filter((f) => f.endsWith(".mp4"))).toHaveLength(3);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+describe("integration: aria2c option validation", () => {
+  test("connections above aria2c's -x cap of 16 are clamped, not fatal", async () => {
+    const dir = await makeRunDir();
+    // aria2c's --max-connection-per-server only accepts 1-16; an unclamped 32
+    // used to make every download die with exit 28 before transferring a byte.
+    const engine = await startEngine(dir, 3997, BASE_CONFIG(3997, { connectionsPerDownload: 32 }));
+    const folder = join(dir, "downloads", "Mock Playlist");
+
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done",
+      );
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs) expect(job.retry_count).toBe(0);
+
+      // The recorded aria2c argv shows the clamp: -x pinned at 16 while the
+      // split/concurrency settings keep the configured 32.
+      const recorded = (await readdir(folder)).filter((f) => f.endsWith(".aria2-args"));
+      expect(recorded.length).toBeGreaterThanOrEqual(3);
+      for (const f of recorded) {
+        const args = await Bun.file(join(folder, f)).text();
+        expect(args).toContain("-x 16");
+        expect(args).toContain("-s 32");
+        expect(args).toContain("-j 32");
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("a malformed downloader option pauses the engine instead of burning the playlist", async () => {
+    const dir = await makeRunDir();
+    // "banana" is not an aria2c size: the real binary (and the mock) answers
+    // exit 28 with the option's help block. Every job would fail identically,
+    // so the engine must pause itself with an actionable reason instead of
+    // spending retry budgets until the circuit breaker trips.
+    const engine = await startEngine(dir, 3998, BASE_CONFIG(3998, { minSplitSize: "banana" }));
+
+    try {
+      await waitFor("engine pauses with BAD_DOWNLOADER_ARGS", async () => {
+        const s = await engine.api("/api/status");
+        return s.isPaused === true && String(s.pauseReason || "").includes("BAD_DOWNLOADER_ARGS");
+      }, 30_000);
+
+      // No job was marked failed: they are parked (paused/pending) so a
+      // resume after fixing the config picks them up again.
+      const jobs = await getJobs(engine);
+      expect(jobs.length).toBeGreaterThan(0);
+      for (const j of jobs) {
+        expect(j.download_status).not.toBe("failed");
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});

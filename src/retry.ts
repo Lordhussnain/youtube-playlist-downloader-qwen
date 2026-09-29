@@ -104,3 +104,25 @@ export function isTransientDownloadError(message: string): boolean {
     "write error",
   ].some((e) => m.includes(e));
 }
+
+/**
+ * True when aria2c rejected the command line itself instead of downloading:
+ * exit 28 is "bad/unrecognized option was given or unexpected option argument
+ * was given", and aria2c prints the offending option's help block (e.g.
+ * "Possible Values: 1-16" for `-x`) right before dying.
+ *
+ * That is a global misconfiguration (a `-x` above aria2c's cap, a malformed
+ * `--min-split-size`, …), not a video problem: every download in the batch
+ * fails identically in about a second, so retrying videos only burns retry
+ * budgets until the circuit breaker trips. The engine pauses itself with an
+ * actionable reason instead (see workers/download.ts).
+ */
+export function isDownloaderArgsError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return (
+    m.includes("exited with code 28") ||
+    m.includes("unrecognized option") ||
+    m.includes("possible values:")
+  );
+}

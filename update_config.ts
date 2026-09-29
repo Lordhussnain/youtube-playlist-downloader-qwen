@@ -184,6 +184,26 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
     config.videoQuality,
   )) as Config["videoQuality"];
 
+  // Multi-language audio tracks (YouTube's "Audio track" menu)
+  console.log("\n— Multi-audio tracks (YouTube multi-language audio) —");
+  config.multiAudioMode = (await askChoice(
+    "Multi-audio tracks:",
+    ["off", "all", "languages"],
+    config.multiAudioMode,
+  )) as Config["multiAudioMode"];
+  if (config.multiAudioMode !== "off") {
+    console.log("   Selected tracks are muxed into one MKV — players switch audio like on YouTube.");
+    if (config.multiAudioMode === "languages") {
+      const langsAns = await ask(
+        `   Languages to keep, comma-separated codes e.g. en, ja [current: ${config.audioTrackLanguages.join(", ") || "none"}]: `,
+      );
+      config.audioTrackLanguages = langsAns
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+  }
+
   // Concurrency
   console.log("\n— Concurrency —");
   config.maxConcurrentDownloads = await askNumber("Starting download workers", config.maxConcurrentDownloads, 1, 20);
@@ -222,7 +242,7 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   );
   if (config.useAria2c) {
     config.connectionsPerDownload = await askNumber(
-      "Connections per download (aria2c -x/-s/-j)",
+      "Connections per download (aria2c -s/-j; -x is clamped to aria2c's cap of 16)",
       config.connectionsPerDownload,
       1,
       64,

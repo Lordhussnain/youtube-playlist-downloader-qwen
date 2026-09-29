@@ -21,6 +21,7 @@ import { cookiesArgs } from "./tools";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
 import { QUALITY_FORMATS, type Config } from "./config";
+import { multiAudioFormatSelector, type AudioTrack } from "./audio-tracks";
 import type { Job } from "./db";
 
 export type DownloaderEngine = "aria2c" | "native";
@@ -36,10 +37,21 @@ export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean
  * yt-dlp already defaults aria2c to `-x16 -s16 -j16 --min-split-size 1M`, so we
  * only emit what differs from that baseline — fewer moving parts, and an
  * explicit `-k` only when the operator changed the split threshold.
+ *
+ * aria2c hard-caps `--max-connection-per-server` (`-x`) at **16** — its own
+ * help says "Possible Values: 1-16" — and answers anything else with exit 28
+ * ("bad/unrecognized option") *before transferring a byte*, printing that
+ * help block. Passing an unclamped config value therefore fails every single
+ * download in the batch identically, so `-x` is clamped here while `-s`/`-j`
+ * (no such cap) keep the configured value: a higher setting still splits the
+ * file finer, it just cannot open a 17th connection to one server.
  */
+export const ARIA2C_MAX_CONNECTIONS_PER_SERVER = 16;
+
 export function buildAria2cArgs(config: Config): string {
   const n = Math.max(1, Math.floor(config.connectionsPerDownload));
-  const parts = [`-x ${n}`, `-s ${n}`, `-j ${n}`];
+  const x = Math.min(n, ARIA2C_MAX_CONNECTIONS_PER_SERVER);
+  const parts = [`-x ${x}`, `-s ${n}`, `-j ${n}`];
   const split = (config.minSplitSize || "").trim();
   if (split && split !== "1M") parts.push(`--min-split-size ${split}`);
   return parts.join(" ");
@@ -84,6 +96,12 @@ export interface BuildDownloadPlanOptions {
   activeSlots: number;
   /** Whether aria2c was found on this machine. */
   aria2cAvailable: boolean;
+  /**
+   * Audio tracks selected for this job (multi-audio support). Empty/absent =
+   * classic single-track download. Two or more tracks are muxed into one MKV
+   * with `--audio-multistreams` so the audio is switchable in any player.
+   */
+  audioTracks?: AudioTrack[];
 }
 
 /** Build the complete yt-dlp invocation for one download attempt. */
@@ -92,6 +110,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
 
   const engine = resolveDownloaderEngine(config, aria2cAvailable);
   const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
+  // Multi-audio: splice the discovered track ids into the quality preset so
+  // every wanted language is downloaded (YouTube's "Audio track" menu). The
+  // audio-only preset is exempt — an mp3 cannot carry several tracks.
+  const audioTracks = config.videoQuality === "audio" ? [] : opts.audioTracks ?? [];
+  const effectiveFormat =
+    audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
   const baseFilename = fitBaseFilename(
     job.output_directory,
     jobBaseFilename(job),
@@ -104,7 +128,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
     job.url,
     ...cookiesArgs(config),
     "--format",
-    format,
+    effectiveFormat,
     // Parallel fragments for DASH/HLS (native path). Ignored when aria2c is
     // handling a whole-file transfer, which splits internally instead.
     "--concurrent-fragments",
@@ -152,6 +176,15 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   // "Wait for VOD" mode: never grab a stream while it is still live — the
   // job is parked as waiting_live and re-queued by the next full scan.
   if (config.archiveLiveStreams) args.push("--match-filters", "!is_live");
+
+  // Several audio tracks in one file: yt-dlp only keeps more than one audio
+  // stream with --audio-multistreams, and MKV is the container that holds any
+  // codec/track combination (with per-track language metadata). One selected
+  // track merges exactly like a classic download.
+  if (audioTracks.length >= 2) {
+    args.push("--audio-multistreams");
+    args.push("--merge-output-format", "mkv");
+  }
 
   // Sidecar files (subs/thumbnail/description/info.json) are fetched by the
   // metadata worker once the download completes; the download phase only

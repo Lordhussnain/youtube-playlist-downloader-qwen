@@ -9,7 +9,7 @@ a terminal UI and a web dashboard to watch it all happen.
 
 - **Batch downloads** from a list of YouTube playlist or video URLs defined in `config.json`
 - **Concurrent worker pools** for downloading, metadata fetching, and format conversion, all driven by job state in a central SQLite database
-- **aria2c multi-connection downloads** — up to 64 parallel connections per file (16 by default), with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams
+- **aria2c multi-connection downloads** — files split across up to 64 streams (16 by default) with automatic fallback to yt-dlp's native downloader when aria2c is not installed or for HLS/live streams. aria2c's own per-server connection cap (16) is clamped automatically, and a downloader argument aria2c rejects (exit 28) pauses the engine with a `BAD_DOWNLOADER_ARGS` reason instead of failing every video in the batch
 - **Bandwidth-aware scaling** — an optional global cap is split across the active download slots, and the autoscaler grows the pool while the queue has backlog and bandwidth headroom
 - **Resilient by design** — interrupted downloads keep their `.part` file and resume exactly where they stopped; the retry budget only shrinks while a video makes no forward progress
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
@@ -20,6 +20,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Graceful shutdown** — safely stops in-flight downloads on exit
 - **Terminal UI (TUI)** with live progress across all workers
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
+- **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
 - Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
@@ -115,14 +116,41 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | Key | Default | What it does |
 | --- | --- | --- |
 | `useAria2c` | `true` | Download through aria2c for multi-connection transfers. Falls back to yt-dlp's native downloader when the binary is missing, or for HLS/live streams which aria2c cannot serve. |
-| `connectionsPerDownload` | `16` | aria2c `-x`/`-s`/`-j` — connections per download (1–64). Higher is faster on healthy CDNs; lower is gentler on throttled ones. |
-| `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. |
+| `connectionsPerDownload` | `16` | aria2c `-s`/`-j` — how finely a file is split (1–64). aria2c hard-caps per-server connections (`-x`) at 16; the engine clamps it, so values above 16 split finer without opening impossible connections. |
+| `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. Must be an aria2c size (`512K`, `1M`, …) — a value aria2c rejects pauses the engine (`BAD_DOWNLOADER_ARGS`) rather than failing every download. |
 | `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. |
 | `fragmentRetries` | `10` | Retries per fragment before a download fails. |
 | `httpChunkSize` | `""` | Range-based chunked downloading on the native path (e.g. `"10M"`). Off by default — some CDNs mishandle `Range` requests. |
 | `bufferSize` | `""` | yt-dlp socket buffer size (e.g. `"16K"`); blank uses yt-dlp's default. |
 | `autoscaleRampStep` | `2` | Download slots added per autoscale tick while the queue has backlog. |
 | `maxBandwidthKBps` | `0` | Global bandwidth cap; split across the active download slots and forwarded to aria2c as `--max-overall-download-limit`. |
+
+### Multi-audio tracks (YouTube multi-language audio)
+
+YouTube now ships many videos with several audio tracks — the original language
+plus auto-dubbed ones, exactly what the player's **Audio track** menu lists.
+The engine can download them the same way:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `multiAudioMode` | `"off"` | `off` = classic single-track download. `all` = keep every audio track the video offers. `languages` = keep only the codes in `audioTrackLanguages`. |
+| `audioTrackLanguages` | `[]` | Language codes kept in `languages` mode (e.g. `["en", "ja"]`). |
+
+How it works: before a download the worker asks yt-dlp which audio tracks the
+video offers (one cheap metadata pass, cached per job), picks the best stream of
+each wanted track (DRC duplicates are ignored), and hands the selection to
+yt-dlp as `bv…+<track1>+<track2>… --audio-multistreams --merge-output-format mkv`.
+The result is one MKV whose audio tracks you switch in VLC/mpv/Plex just like on
+YouTube. Multi-track files are never remuxed to mp4 (that would drop the dubs);
+a single selected track merges exactly like a classic download. `videoQuality:
+"audio"` (mp3) always stays single-track.
+
+Per-video override: open a job in the dashboard and use the **Audio tracks**
+section — *Find audio tracks* lists what YouTube offers (original + dubs, with
+language and bitrate), checkboxes pick what the next attempt keeps, and *Use
+global setting* returns the job to the mode above. The selection applies to the
+next download attempt (use **Retry job** to re-fetch an already downloaded
+video with different tracks).
 
 ### Tuning from the dashboard
 
