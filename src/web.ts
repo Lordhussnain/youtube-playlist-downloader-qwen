@@ -23,7 +23,7 @@ import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
-import { logError } from "./logger";
+import { errorLogPath, logError } from "./logger";
 import type { Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
@@ -591,8 +591,8 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
     try {
       if (logType === "report") {
         logs = buildRunReport();
-      } else if (existsSync("error.log")) {
-        logs = readFileSync("error.log", "utf-8")
+      } else if (existsSync(errorLogPath())) {
+        logs = readFileSync(errorLogPath(), "utf-8")
           .split("\n")
           .filter((l) => l.trim())
           .slice(-limit);

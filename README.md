@@ -116,6 +116,7 @@ Edit these interactively with `bun run config` → **Change Reliability & Resume
 | Key | Default | What it does |
 | --- | --- | --- |
 | `useAria2c` | `true` | Download through aria2c for multi-connection transfers. Falls back to yt-dlp's native downloader when the binary is missing, or for HLS/live streams which aria2c cannot serve. |
+| `aria2cPath` | `""` | Where aria2c lives; blank auto-detects (PATH, app folder, winget/scoop/choco). Set to `"none"` to force-disable aria2c even when installed — the engine then always uses yt-dlp's native downloader. |
 | `connectionsPerDownload` | `16` | aria2c `-s`/`-j` — how finely a file is split (1–64). aria2c hard-caps per-server connections (`-x`) at 16; the engine clamps it, so values above 16 split finer without opening impossible connections. |
 | `minSplitSize` | `"1M"` | Smallest file size aria2c will split into multiple connections. Must be an aria2c size (`512K`, `1M`, …) — a value aria2c rejects pauses the engine (`BAD_DOWNLOADER_ARGS`) rather than failing every download. |
 | `concurrentFragments` | `16` | Parallel DASH/HLS fragments for yt-dlp's native downloader. |

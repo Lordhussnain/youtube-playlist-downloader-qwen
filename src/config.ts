@@ -45,6 +45,10 @@ export const ConfigSchema = z
     // --- External tools ------------------------------------------------------
     ytDlpPath: z.string(),
     ffmpegPath: z.string(),
+    // aria2c install location; blank = auto-detect. The special value "none"
+    // force-disables aria2c even when a binary is present on PATH — the
+    // engine then always downloads through yt-dlp's native downloader.
+    aria2cPath: z.string(),
     validateCookiesOnStart: z.boolean(),
     // --- Output --------------------------------------------------------------
     outputRoot: z.string(),
@@ -141,6 +145,7 @@ export const DEFAULT_CONFIG: Config = {
   bufferSize: "",
   ytDlpPath: "",
   ffmpegPath: "",
+  aria2cPath: "",
   validateCookiesOnStart: true,
   outputRoot: "./downloads",
   archiveFile: "downloaded_videos.txt",

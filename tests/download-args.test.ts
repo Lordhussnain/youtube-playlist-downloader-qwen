@@ -6,6 +6,7 @@
 // relies on, verified without spawning anything.
 
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   buildAria2cArgs,
   buildDownloadPlan,
@@ -109,11 +110,16 @@ describe("buildDownloadPlan", () => {
   const build = (over: Partial<Config> = {}, aria2cAvailable = true, activeSlots = 3) =>
     buildDownloadPlan({ job, config: cfg(over), activeSlots, aria2cAvailable });
 
-  test("uses aria2c with quoted downloader args when available", () => {
+  test("uses aria2c with unquoted downloader args when available", () => {
     const plan = build({ connectionsPerDownload: 12 });
     expect(plan.engine).toBe("aria2c");
     expect(flagValue(plan.args, "--downloader")).toBe("aria2c");
-    expect(flagValue(plan.args, "--downloader-args")).toBe('aria2c:"-x 12 -s 12 -j 12"');
+    // One argv element: yt-dlp shlex-splits the text after "aria2c:". Inner
+    // quotes are a Windows regression — they survive argv, the whole list
+    // becomes one token, and aria2c rejects `-x` with exit 28 before
+    // transferring a byte (the BAD_DOWNLOADER_ARGS engine pause).
+    expect(flagValue(plan.args, "--downloader-args")).toBe("aria2c:-x 12 -s 12 -j 12");
+    expect(flagValue(plan.args, "--downloader-args")).not.toContain('"');
     // argv[0] is the yt-dlp path, added by the worker — not part of the plan.
     expect(plan.args[0]).toBe(job.url);
   });
@@ -209,7 +215,8 @@ describe("buildDownloadPlan", () => {
   test("writes to the output template derived from the sanitized base name", () => {
     const plan = build();
     expect(plan.baseFilename).toBe("007 - Some Video");
-    expect(plan.outTemplate).toBe("/tmp/downloads/Playlist/007 - Some Video.%(ext)s");
+    // join() so the expectation holds on Windows separators too.
+    expect(plan.outTemplate).toBe(join(job.output_directory, "007 - Some Video.%(ext)s"));
   });
 
   test("keeps every argv entry free of newlines (spawn safety)", () => {

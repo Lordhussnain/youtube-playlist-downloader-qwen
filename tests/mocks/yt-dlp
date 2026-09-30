@@ -148,11 +148,15 @@ if (failTimes > 0 && attempts <= failTimes) {
 // --max-overall-download-limit, the .part temp file as --out, and the URL.
 if (flagValue("--downloader") === "aria2c") {
   const raw = flagValue("--downloader-args") || "";
-  // Strip the aria2c:"…" wrapper (a simplified shlex) and split into argv.
+  // Strip the aria2c: prefix (plus any legacy wrapping quotes — the engine no
+  // longer emits them) — a simplified shlex — and split into argv.
   const inner = raw.replace(/^aria2c:"?/, "").replace(/"?$/, "").split(/\s+/).filter(Boolean);
   const limit = flagValue("--limit-rate");
+  // FAKE_ARIA2C_BIN pins the sibling mock by absolute path (set by the
+  // integration harness) so this hop never depends on PATH lookups.
+  const aria2cBin = process.env.FAKE_ARIA2C_BIN || "aria2c";
   const forwarded = [
-    "aria2c",
+    aria2cBin,
     "--no-conf",
     ...inner,
     ...(limit ? ["--max-overall-download-limit", limit] : []),

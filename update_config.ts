@@ -361,6 +361,10 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   if (ytdlpAns.trim()) config.ytDlpPath = ytdlpAns.trim();
   const ffAns = await ask(`   ffmpeg path (blank = auto-detect) [current: ${config.ffmpegPath || "auto"}]: `);
   if (ffAns.trim()) config.ffmpegPath = ffAns.trim();
+  const ariaAns = await ask(
+    `   aria2c path (blank = auto-detect, "none" = force the native downloader) [current: ${config.aria2cPath || "auto"}]: `,
+  );
+  if (ariaAns.trim()) config.aria2cPath = ariaAns.trim();
 
   await ask("\n✅ Settings updated. Press Enter to return...");
   return config;

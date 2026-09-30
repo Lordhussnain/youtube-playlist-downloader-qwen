@@ -17,7 +17,7 @@
 //                              on the aria2c path
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmod, cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -28,15 +28,75 @@ const REPO_ROOT = resolve(import.meta.dir, "..");
 const MOCKS = join(REPO_ROOT, "tests", "mocks");
 const ENTRY = join(REPO_ROOT, "batch_playlist_downloader.ts");
 
+const WIN = process.platform === "win32";
+const PATH_SEP = WIN ? ";" : ":";
+const PARENT_PATH = process.env.PATH || process.env.Path || "";
+const MOCK_TOOLS = ["yt-dlp", "ffmpeg", "aria2c"];
+
 const TEST_TIMEOUT = 120_000;
 const tmpDirs: string[] = [];
 
 afterAll(async () => {
+  // Best-effort cleanup: on Windows a just-killed process or an antivirus
+  // scan can hold a handle for a moment (rm EBUSY/EPERM), so retry briefly
+  // and never fail the suite over a leftover temp dir.
   while (tmpDirs.length) {
     const d = tmpDirs.pop();
-    if (d) await rm(d, { recursive: true, force: true });
+    if (!d) continue;
+    try {
+      await rm(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+    } catch {
+      // stray temp dir — harmless
+    }
   }
 });
+
+/**
+ * Where the engine should find the mock tools for a given mocks directory.
+ *
+ * On POSIX the scripts run via their `#!/usr/bin/env bun` shebang. Windows is
+ * different in two hard ways: shebangs are not read there (Bun docs: "Shebangs
+ * at the top of a file are not read on Windows") and CreateProcess cannot
+ * launch extensionless files at all — so the raw mocks are unlaunchable. On
+ * win32 each mock is therefore compiled once into a real executable with
+ * `bun build --compile`. argv semantics are unchanged (a compiled app still
+ * sees `[exe, entry, …args]`, so the mocks' `process.argv.slice(2)` keeps
+ * working), and the engine's dependency probe sees a native .exe. Cached per
+ * source directory; the first test pays a few seconds of compile time.
+ */
+const toolsDirCache = new Map<string, Promise<string>>();
+
+function toolsDirFor(mocksDir: string): Promise<string> {
+  let cached = toolsDirCache.get(mocksDir);
+  if (!cached) {
+    cached = (async () => {
+      if (!WIN) return mocksDir;
+      const outDir = await mkdtemp(join(tmpdir(), "yta-mocks-exe-"));
+      tmpDirs.push(outDir);
+      for (const name of MOCK_TOOLS) {
+        const source = join(mocksDir, name);
+        if (!existsSync(source)) continue;
+        // Stage under a .ts name first: `bun build --compile` on an
+        // extensionless entry silently emits a no-op program.
+        const staged = join(outDir, `${name}.ts`);
+        await copyFile(source, staged);
+        const proc = Bun.spawn(
+          [process.execPath, "build", "--compile", staged, "--outfile", join(outDir, `${name}.exe`)],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        const [, errText, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        if (code !== 0) throw new Error(`compiling mock ${name} failed:\n${errText}`);
+      }
+      return outDir;
+    })();
+    toolsDirCache.set(mocksDir, cached);
+  }
+  return cached;
+}
 
 async function makeRunDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "yta-integration-"));
@@ -61,15 +121,42 @@ async function startEngine(
   env: Record<string, string> = {},
   mocksDir: string = MOCKS,
 ): Promise<EngineHandle> {
-  await writeFile(join(dir, "config.json"), JSON.stringify(config, null, 2));
+  const toolsDir = await toolsDirFor(mocksDir);
+  const mockTool = (name: string) => join(toolsDir, WIN ? `${name}.exe` : name);
+  const cfgStr = (v: unknown): string => (typeof v === "string" ? v : "");
 
-  const proc = Bun.spawn(["bun", "run", ENTRY], {
+  // Pin the tools to the mocks by absolute path. Discovery would otherwise
+  // walk PATH and package-manager shim locations, so on any machine with real
+  // yt-dlp/ffmpeg/aria2c installed — every working dev box — the real tools
+  // could answer instead of the mocks. Values a test set on purpose (e.g.
+  // aria2cPath: "none") are respected.
+  const engineConfig: Record<string, unknown> = {
+    ...config,
+    ytDlpPath: cfgStr(config.ytDlpPath) || mockTool("yt-dlp"),
+    ffmpegPath: cfgStr(config.ffmpegPath) || mockTool("ffmpeg"),
+  };
+  if (!cfgStr(config.aria2cPath) && existsSync(mockTool("aria2c"))) {
+    engineConfig.aria2cPath = mockTool("aria2c");
+  }
+  await writeFile(join(dir, "config.json"), JSON.stringify(engineConfig, null, 2));
+
+  // Rebuild the environment with exactly one PATH key: on Windows process.env
+  // has `Path`, and adding `PATH` alongside it yields a child env block with
+  // both — lookups then see a mangled duplicate. The mocks dir goes first
+  // (with the platform separator — the old code hardcoded ":"), so the mock
+  // yt-dlp's own bare `aria2c` spawn resolves to the mock too.
+  const childEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && k.toUpperCase() !== "PATH") childEnv[k] = v;
+  }
+  childEnv[WIN ? "Path" : "PATH"] = `${toolsDir}${PATH_SEP}${PARENT_PATH}`;
+  // Pin the mock yt-dlp → mock aria2c hop by absolute path too (the mock
+  // spawns it as a bare name by default).
+  if (existsSync(mockTool("aria2c"))) childEnv.FAKE_ARIA2C_BIN = mockTool("aria2c");
+
+  const proc = Bun.spawn([process.execPath, "run", ENTRY], {
     cwd: dir,
-    env: {
-      ...process.env,
-      PATH: `${mocksDir}:${process.env.PATH}`,
-      ...env,
-    },
+    env: { ...childEnv, ...env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -101,7 +188,21 @@ async function startEngine(
     stderr: () => err,
     stop: async () => {
       proc.kill("SIGTERM");
-      return await proc.exited;
+      const code = await proc.exited;
+      // A lingering child process can inherit the listening socket and keep
+      // the port open for a moment after the engine itself is gone, which
+      // makes the next engine on the same port die with EADDRINUSE. Wait
+      // until the port actually stops answering before handing it back.
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        try {
+          await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "HEAD", cache: "no-store" });
+          await Bun.sleep(150);
+        } catch {
+          break; // connection refused — port is free
+        }
+      }
+      return code;
     },
     api: async (path: string, init?: RequestInit) => {
       const res = await fetch(`http://127.0.0.1:${port}${path}`, { cache: "no-store", ...init });
@@ -247,7 +348,10 @@ describe("integration: happy path", () => {
       expect(logs.logs.join("\n")).toContain("Archive Engine Report");
     } finally {
       const code = await engine.stop();
-      expect(code).toBe(0);
+      // On Windows proc.kill is a forceful TerminateProcess — the engine's
+      // graceful SIGTERM handler never fires there, so only POSIX can assert
+      // the clean shutdown exit code.
+      if (!WIN) expect(code).toBe(0);
     }
 
     // 7) Graceful shutdown left a run-history row behind.
@@ -521,21 +625,20 @@ describe("integration: aria2c multi-connection downloads", () => {
   }, TEST_TIMEOUT);
 
   test("falls back to the native downloader when aria2c is missing", async () => {
-    // Same setup, but the mocks directory is stripped of aria2c by pointing
-    // PATH at a directory that only holds the yt-dlp/ffmpeg mocks.
+    // aria2c unavailable even though this machine may have a real one: the
+    // special "none" value for aria2cPath skips discovery entirely, exactly
+    // as if no binary had been found — the engine must fall back to yt-dlp's
+    // native downloader and still complete the batch.
     const dir = await makeRunDir();
-    const partial = join(dir, "mocks");
-    await mkdir(partial, { recursive: true });
-    for (const m of ["yt-dlp", "ffmpeg"]) {
-      await cp(join(MOCKS, m), join(partial, m));
-      await chmod(join(partial, m), 0o755);
-    }
     const engine = await startEngine(
       dir,
       3987,
-      BASE_CONFIG(3987, { videoQuality: "audio", useAria2c: true, connectionsPerDownload: 8 }),
-      {},
-      partial,
+      BASE_CONFIG(3987, {
+        videoQuality: "audio",
+        useAria2c: true,
+        connectionsPerDownload: 8,
+        aria2cPath: "none",
+      }),
     );
 
     try {
@@ -739,7 +842,9 @@ describe("integration: aria2c resume + self-healing", () => {
     }
   }, TEST_TIMEOUT);
 
-  test("a graceful shutdown records the partial so the job really resumes", async () => {
+  test.skipIf(WIN)(
+    "a graceful shutdown records the partial so the job really resumes",
+    async () => {
     // The dashboard promises "interrupted jobs resume from their partial". For
     // that to be true rather than just a status, the shutdown path has to
     // freeze each in-flight download's .part path into its job row before it
@@ -800,7 +905,9 @@ describe("integration: aria2c resume + self-healing", () => {
     } finally {
       await engine2.stop();
     }
-  }, TEST_TIMEOUT);
+    },
+    TEST_TIMEOUT,
+  );
 
   test("deleted downloads are re-fetched, and failed jobs retry after cooldown", async () => {
     const dir = await makeRunDir();

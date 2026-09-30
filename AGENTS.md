@@ -54,6 +54,12 @@ database opens and exits with install hints if missing.
 **Sandbox note:** YouTube is unreachable from this environment. The test suite
 therefore runs the real engine against mock binaries (`tests/mocks/`) — see
 section 9. Do not "fix" failing integration tests by adding network calls.
+**Windows note:** the mocks are shebang scripts, and Windows neither reads
+shebangs nor spawns extensionless files, so the integration harness compiles
+them into real executables with `bun build --compile` (cached per run, a few
+seconds once) and pins every tool path in the engine's config to the mocks —
+bare-name PATH discovery could otherwise pick up real yt-dlp/ffmpeg/aria2c
+installed on the machine.
 
 ---
 
@@ -513,6 +519,7 @@ Mock controls (environment variables):
 | `FAKE_FAIL_MODE` | `transient` \| `permanent` \| `corrupt` (which error message to emit) |
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
+| `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 
 **When adding an engine behavior, add an integration scenario rather than
 mocking internals** — the mocks are the contract boundary.
@@ -568,9 +575,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     older versions. New columns go through `ensureColumn()`; never assume a
     fresh schema. The legacy-migration test in `tests/db.test.ts` is the guard.
 12. **`--downloader-args` value is one argv element.** The engine builds
-    `aria2c:"-x 16 -s 16 -j 16"` as a single string and yt-dlp shlex-splits it
-    itself. Splitting it into separate argv entries breaks parsing (the mock
-    yt-dlp in `tests/mocks/` strips the `aria2c:"…"` wrapper — keep that in sync
+    `aria2c:-x 16 -s 16 -j 16` as a single string and yt-dlp shlex-splits the
+    text after `aria2c:` itself. **No inner quotes** — they survive argv on
+    Windows, the whole list becomes one shlex token, and aria2c rejects `-x`
+    with exit 28 before transferring a byte (the BAD_DOWNLOADER_ARGS pause).
+    Splitting it into separate argv entries breaks parsing too (the mock
+    yt-dlp in `tests/mocks/` strips the `aria2c:` prefix — keep that in sync
     if you change the format).
 14. **Never `unlink()` a partial directly.** With aria2c a partial is two files
     (`.part` + `.part.aria2`); use `removePartialFiles()` or the next attempt

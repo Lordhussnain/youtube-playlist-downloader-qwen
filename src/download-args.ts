@@ -7,8 +7,9 @@
 //
 // yt-dlp reference behaviour this encodes (verified against yt-dlp source):
 //   • `--downloader aria2c` makes yt-dlp hand the transfer to aria2c with
-//     `-x16 -s16 -j16 --min-split-size 1M` by default; extra args arrive via
-//     `--downloader-args aria2c:"…"` (shlex-parsed, so quote the whole list).
+//     `-x16 -s16 -j16 --min-split-size 1M` by default; extra args arrive as a
+//     single `--downloader-args aria2c:…` argv element (yt-dlp shlex-splits
+//     the text after `aria2c:` — see the quoting note at the call site).
 //   • yt-dlp maps `--limit-rate` to aria2c's `--max-overall-download-limit`,
 //     so the global bandwidth cap keeps working on both engines.
 //   • aria2c only speaks http/https/ftp — for HLS/live streams yt-dlp silently
@@ -32,7 +33,8 @@ export function resolveDownloaderEngine(config: Config, aria2cAvailable: boolean
 }
 
 /**
- * The value for yt-dlp's `--downloader-args aria2c:"…"`.
+ * The value for yt-dlp's `--downloader-args aria2c:…` — one argv element,
+ * without inner quotes (see the call site in `buildDownloadPlan` for why).
  *
  * yt-dlp already defaults aria2c to `-x16 -s16 -j16 --min-split-size 1M`, so we
  * only emit what differs from that baseline — fewer moving parts, and an
@@ -195,7 +197,14 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   // downloader inside yt-dlp automatically.
   if (engine === "aria2c") {
     args.push("--downloader", "aria2c");
-    args.push("--downloader-args", `aria2c:"${buildAria2cArgs(config)}"`);
+    // One argv element, NO inner quotes. The value reaches yt-dlp without a
+    // shell, so inner `"` would arrive literally; on Windows the re-quoted
+    // command line then makes yt-dlp's shlex treat the whole list as ONE
+    // token (`-x` gets `1 -s 1 …` as its value) and aria2c answers with
+    // "Bad number" + exit 28 before transferring a byte — the
+    // BAD_DOWNLOADER_ARGS pause. Unquoted, the post-`aria2c:` shlex split
+    // yields the right argv on Windows and POSIX alike.
+    args.push("--downloader-args", `aria2c:${buildAria2cArgs(config)}`);
   }
 
   // Native-downloader tuning. Range-based chunking can dramatically improve
