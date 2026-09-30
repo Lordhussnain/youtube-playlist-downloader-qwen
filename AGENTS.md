@@ -54,6 +54,12 @@ database opens and exits with install hints if missing.
 **Sandbox note:** YouTube is unreachable from this environment. The test suite
 therefore runs the real engine against mock binaries (`tests/mocks/`) — see
 section 9. Do not "fix" failing integration tests by adding network calls.
+**Windows note:** the mocks are shebang scripts, and Windows neither reads
+shebangs nor spawns extensionless files, so the integration harness compiles
+them into real executables with `bun build --compile` (cached per run, a few
+seconds once) and pins every tool path in the engine's config to the mocks —
+bare-name PATH discovery could otherwise pick up real yt-dlp/ffmpeg/aria2c
+installed on the machine.
 
 ---
 
@@ -72,6 +78,7 @@ src/
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
+  audio-tracks.ts PURE multi-audio track parsing/selection + the yt-dlp -J probe
   settings.ts    dashboard-editable config allow-list + validate/persist/apply
   retry.ts       PURE retry policy: backoff, watchdog, error classification
   resilience.ts  pause/resume, circuit breaker, network + disk guards
@@ -98,7 +105,8 @@ tests/           bun test suite (see section 9)
 ```
 state.ts ──────────────────────────────────────┐ (imports only config types)
 config.ts, util.ts, logger.ts, retry.ts,
-archive.ts, tools.ts, download-args.ts          │ (leaf modules, zero deps)
+archive.ts, tools.ts                             │ (leaf modules, zero deps)
+audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
 resilience.ts → config, db, logger, state       │
 reconcile.ts → archive, config, db, logger, retry│
@@ -106,13 +114,13 @@ scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
-download-args.ts → config, db (types), retry, tools, util    │ (pure)
-web.ts → autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
+download-args.ts → audio-tracks, config, db (types), retry, tools, util    │ (pure)
+web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
 rss.ts → config, logger, scanner, tools         │
 polling.ts → config, logger, scanner            │
 history.ts → db, logger, state                  │
 lifecycle.ts → dashboard, db, history, logger, resilience, state
-workers/* → config, dashboard, db, download-args, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile)
+workers/* → config, dashboard, db, download-args, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
 engine.ts → everything (composition root)
 ```
 
@@ -125,12 +133,17 @@ dependency-free — it is the module that breaks every import cycle.
 1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it)
 2. `checkDependencies()` — fails fast with install hints
 3. `initDatabase("archive.db")` — schema + migrations + claim transactions
-4. `reconcileCrashedJobs()` → `reconcileMissingFiles()`
-5. `startRunHistory()` + heartbeat interval
+4. `startWebServer()` — **before any sweep: the web port is the single-instance
+   lock**. A second instance (autostart task + a manual start) dies here with an
+   actionable error instead of re-queueing a live instance's in-flight work.
+5. `reconcileCrashedJobs()` → `reconcileMissingFiles()` (the latter skips jobs
+   with a conversion in progress — the converter legitimately has those files
+   in mid-transition under `deleteSourceAfterConvert`)
+9. `startRunHistory()` + heartbeat interval
 6. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
 7. cookie validation (if enabled)
 8. scan every configured playlist/channel into the jobs table
-9. `initDashboard()`, `startWebServer()`
+13. `initDashboard()`
 10. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
     `requeueFailedJobs` (60s), `startRssPolling()`
 11. supervised worker pools (download × N, metadata × N, convert × N)
@@ -234,6 +247,7 @@ and restarted after 5s. Never let a worker loop exit on error.
 | Exponential backoff + jitter | `retry.ts computeBackoffMs()` | base × 2^attempt, capped, +0–30% jitter; RNG injectable for tests |
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
 | Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright |
+| Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
 | Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` | `retry_count` only increments when `progress <= best_progress` |
 | Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
@@ -254,8 +268,14 @@ and restarted after 5s. Never let a worker loop exit on error.
 
 **Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
 unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
-in the right precedence order: signature → corrupt → archive-scrub → live →
-transient → permanent/budget.
+in the right precedence order: signature → downloader-args → corrupt →
+archive-scrub → live → transient → permanent/budget.
+
+The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
++ the option's help block) is a global misconfiguration, not a video problem:
+the handler parks the job and `triggerPause("BAD_DOWNLOADER_ARGS …")` so one
+bad knob cannot burn every retry budget in the playlist before the circuit
+breaker trips.
 
 ---
 
@@ -311,12 +331,48 @@ Facts worth knowing before you touch it:
 - **aria2c only serves http/https/ftp.** For HLS, DASH-segment, and live streams
   yt-dlp silently falls back to its native downloader — the engine does not need
   to special-case those protocols.
+- **aria2c hard-caps `-x/--max-connection-per-server` at 16** ("Possible Values:
+  1-16" in its help). A higher value makes it exit 28 — *bad/unrecognized
+  option* — before transferring a byte, so `buildAria2cArgs` clamps `-x` to
+  `ARIA2C_MAX_CONNECTIONS_PER_SERVER` while `-s`/`-j` keep the configured value.
+  Any other rejected option (e.g. a malformed `minSplitSize`) surfaces as the
+  `isDownloaderArgsError` class and pauses the engine instead of failing the
+  whole batch video by video.
 - **External downloads still land in yt-dlp's `<name>.part` temp file**, so
   `partial_file_path` tracking and `--continue` resume behave identically. This
   is why enabling aria2c does not regress resume.
 - `aria2c` is discovered in `tools.ts` (`resolvedTools.aria2cPath`, `null` when
   absent) and is **optional** — a missing binary warns at startup and never
   exits. `checkDependencies` takes the aria2c keys as optional config fields.
+
+### 7.2 Multi-audio tracks (YouTube multi-language audio)
+
+YouTube serves some videos with several audio tracks (original + auto-dubbed);
+yt-dlp exposes each as an audio-only format whose id carries the track index
+(`251-0`, `251-1`, …), repeats it per quality variant, and appends `-drc` to
+Dynamic Range Compression duplicates. `src/audio-tracks.ts` owns this:
+
+- `extractAudioTracks(info)` collapses a `-J` dump to one entry per track (best
+  stream by bitrate/codec, drc and progressive formats dropped).
+- `selectAudioTracks(tracks, mode, languages, jobSelection)` implements the
+  policy: per-job selection (JSON in `jobs.audio_selection`, set from the
+  dashboard) wins over the global `multiAudioMode` (`off` | `all` |
+  `languages` + `audioTrackLanguages`).
+- `multiAudioFormatSelector(base, tracks)` splices the track ids into the
+  QUALITY_FORMATS preset; `buildDownloadPlan` then adds `--audio-multistreams
+  --merge-output-format mkv` for 2+ tracks. One track = a normal merge with
+  that track pinned; `videoQuality: "audio"` never multi-streams.
+- `probeAudioTracks(url, config)` is the single `-J` call. The download worker
+  runs it once per job (only when a mode/selection will consume it), caches the
+  result in `jobs.audio_tracks`, and a probe failure logs and falls back to
+  single audio — it never fails a download.
+- `workers/convert.ts countAudioStreams()` keeps files with 2+ audio streams in
+  their container (remuxing an MKV to mp4 would drop/re-encode the dubs).
+
+Dashboard: `/api/jobs` returns `audio_tracks` / `audio_selection` as parsed
+arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
+`POST /api/jobs/<id>/audio-tracks` saves (`{tracks:[…]}`) or resets
+(`{tracks:null}`) the per-job selection, applied on the next attempt.
 
 #### Control files: never delete a `.part` without its `.aria2`
 
@@ -354,12 +410,14 @@ or `?token=`. Comparison is timing-safe. Default bind is `127.0.0.1`.
 | GET | `/` | dashboard (login page when a token is required) |
 | HEAD | `/api/ping` | liveness probe used by the UI |
 | GET | `/api/status` | stats, speed, ETA, disk, workers, pause state |
-| GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields |
+| GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` |
 | POST | `/api/scan` | `{url, folder?}` → scan & ingest |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
 | POST | `/api/retry/<id>` | re-queue one job (all stages, budgets reset) |
 | POST | `/api/failcount/reset/<id>` | zero the retry counters |
 | POST | `/api/jobs/pause` · `/api/jobs/delete` | bulk by `{ids: []}` |
+| POST | `/api/jobs/<id>/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
+| POST | `/api/jobs/<id>/audio-probe` | runs the yt-dlp `-J` probe for one job, stores + returns its audio tracks |
 | DELETE | `/api/jobs/<id>` | delete one job |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
@@ -384,7 +442,7 @@ bun test tests/retry.test.ts   # one file
 bunx tsc --noEmit              # typecheck (tsconfig covers *.ts, src/**, tests/**)
 ```
 
-100 tests across 8 files. Tests share one process, so any file that touches the
+224 tests across 15 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -399,7 +457,8 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration) |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
-| `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling |
+| `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
+| `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
 | `tests/reconcile.test.ts` | `removePartialFiles`, `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
@@ -422,7 +481,10 @@ and spawns the real `batch_playlist_downloader.ts`, then drives it over HTTP
 Scenarios: happy path (scan → download → metadata → convert), transient-failure
 retries with backoff, corrupt-partial resume, permanent failures (never
 requeued), restart reconciliation after deleting files, aria2c multi-connection
-downloads (args + cap verified), the native fallback when aria2c is missing, and
+downloads (args + cap verified), the native fallback when aria2c is missing,
+aria2c option validation (`-x` above the 16 cap is clamped; a malformed
+`--min-split-size` pauses the engine with `BAD_DOWNLOADER_ARGS` instead of
+failing the batch), and
 four aria2c resume/self-healing scenarios: resume from the control file,
 discarding a partial *with* its control file when the resume budget runs out, a
 hard kill mid-transfer followed by a resume on restart, and deleted files being
@@ -432,13 +494,27 @@ The mock aria2c reproduces the real control-file lifecycle (interrupted →
 `.part` + `.aria2`; resume → `resumed=yes`; success → control file removed) and
 **fails hard if it is handed a control file whose data file is missing** — that
 is the wedged state the engine must never create, so a regression in
-`removePartialFiles` fails the suite rather than hanging a download. Injection:
+`removePartialFiles` fails the suite rather than hanging a download. Like the
+real binary it also validates option values: `-x` outside 1-16 or a
+`--min-split-size` that is not a size dies with exit 28 and the option's help
+block, which is how the clamp and the `BAD_DOWNLOADER_ARGS` pause are tested.
+Injection:
 `FAKE_ARIA2C_FAIL_TIMES` / `FAKE_ARIA2C_FAIL_MODE` (failure originates inside the
 external downloader, independently of the yt-dlp mock's own `FAKE_FAIL_TIMES`)
 and `FAKE_ARIA2C_INFLIGHT_MS` (hold a transfer open so a kill can interrupt it).
 The yt-dlp mock kills its aria2c child when its own parent dies, so a hard-killed
 engine leaves a realistic interrupted state instead of an orphan finishing the
 download.
+
+The mock yt-dlp also speaks multi-audio: `--dump-single-json` answers with a
+three-track format list (en original + es/hi dubs, quality variants and `-drc`
+duplicates included, exactly the soup `extractAudioTracks` must clean), and a
+download carrying `--audio-multistreams` writes `<base>.mkv` instead of
+`<base>.mp4` while recording its whole argv to `<base>.ytdlp-args` — that file
+is how the integration test proves the format selector and the multistream/MKV
+flags really reached yt-dlp. The mock ffmpeg answers the stream probe
+(`ffmpeg -hide_banner -i <file>`, no output arg) with a two-audio-stream banner
+for `.mkv` inputs and one otherwise, which is what `countAudioStreams()` sees.
 
 Mock controls (environment variables):
 
@@ -448,6 +524,7 @@ Mock controls (environment variables):
 | `FAKE_FAIL_MODE` | `transient` \| `permanent` \| `corrupt` (which error message to emit) |
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
+| `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 
 **When adding an engine behavior, add an integration scenario rather than
 mocking internals** — the mocks are the contract boundary.
@@ -503,9 +580,12 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     older versions. New columns go through `ensureColumn()`; never assume a
     fresh schema. The legacy-migration test in `tests/db.test.ts` is the guard.
 12. **`--downloader-args` value is one argv element.** The engine builds
-    `aria2c:"-x 16 -s 16 -j 16"` as a single string and yt-dlp shlex-splits it
-    itself. Splitting it into separate argv entries breaks parsing (the mock
-    yt-dlp in `tests/mocks/` strips the `aria2c:"…"` wrapper — keep that in sync
+    `aria2c:-x 16 -s 16 -j 16` as a single string and yt-dlp shlex-splits the
+    text after `aria2c:` itself. **No inner quotes** — they survive argv on
+    Windows, the whole list becomes one shlex token, and aria2c rejects `-x`
+    with exit 28 before transferring a byte (the BAD_DOWNLOADER_ARGS pause).
+    Splitting it into separate argv entries breaks parsing too (the mock
+    yt-dlp in `tests/mocks/` strips the `aria2c:` prefix — keep that in sync
     if you change the format).
 14. **Never `unlink()` a partial directly.** With aria2c a partial is two files
     (`.part` + `.part.aria2`); use `removePartialFiles()` or the next attempt
@@ -525,6 +605,20 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 17. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
     passes the URL first and the plan's args after it, so the mock's URL
     detection (`argv[0]`) depends on that ordering.
+18. **One instance per `archive.db`.** The web port is the lock and `main()`
+    binds it before the sweeps; anything that mutates job state must stay
+    after `startWebServer()` in the startup order.
+19. **`removePartialFiles` removes the `.aria2` control file FIRST and
+    reports a `fatal` result when it is locked** (orphaned aria2c, antivirus).
+    Never delete the `.part` after a fatal — that strands the control file and
+    wedges aria2c. "Restart from scratch" paths must check `.fatal` and retry
+    later instead.
+20. **The converter guards every destructive step with
+    `stillOwnsConversion`** (source delete, secondary-storage move, the final
+    done-update) and updates `file_path` to the converted output BEFORE
+    unlinking the source. Deleting first is what made a crash in the
+    finalize window look like "file deleted before conversion finished" and
+    triggered a full re-download on the next startup sweep.
 
 ---
 

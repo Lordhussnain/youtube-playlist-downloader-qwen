@@ -126,12 +126,18 @@ export async function checkDependencies(config: {
 }): Promise<void> {
   console.log("🔎 Checking dependencies...");
   const missing: string[] = [];
+  // The special value "none" skips aria2c discovery entirely — an operator
+  // (or the test suite) can force yt-dlp's native downloader even when a
+  // real aria2c is installed on this machine.
+  const aria2Disabled = (config.aria2cPath || "").trim().toLowerCase() === "none";
   const [ytdlp, ffm, aria2] = await Promise.all([
     resolveTool(config.ytDlpPath, ["--version"], ["yt-dlp"], ["yt-dlp.exe"]),
     resolveTool(config.ffmpegPath, ["-version"], ["ffmpeg"], ["ffmpeg.exe"]),
     // aria2c is probed regardless of the flag so the status line can report
     // why it is (not) being used; a missing binary is never fatal.
-    resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"]),
+    aria2Disabled
+      ? Promise.resolve(null)
+      : resolveTool(config.aria2cPath || "", ["--version"], ["aria2c"], ["aria2c.exe"]),
   ]);
 
   if (ytdlp) {
@@ -158,7 +164,9 @@ export async function checkDependencies(config: {
   }
 
   resolvedTools.aria2cPath = aria2 ? aria2.path : null;
-  if (aria2) {
+  if (aria2Disabled) {
+    console.log(`  ⚪ aria2c: disabled (aria2cPath = "none") — using yt-dlp's native downloader`);
+  } else if (aria2) {
     if (config.useAria2c === false) {
       console.log(`  ⚪ aria2c: ${aria2.version || "ok"}  [disabled in config — using yt-dlp's native downloader]`);
     } else {

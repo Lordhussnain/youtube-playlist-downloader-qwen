@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import {
   computeBackoffMs,
   computeDownloadTimeoutMs,
+  isDownloaderArgsError,
   isPermanentDownloadError,
   isTransientDownloadError,
 } from "../src/retry";
@@ -110,5 +111,26 @@ describe("isTransientDownloadError", () => {
   test("does not flag permanent failures", () => {
     expect(isTransientDownloadError("Video unavailable")).toBe(false);
     expect(isTransientDownloadError("Private video")).toBe(false);
+  });
+});
+
+describe("isDownloaderArgsError", () => {
+  test("flags aria2c exit 28 and its option help block", () => {
+    // The exact shape of the production failure: aria2c prints the offending
+    // option's help, then yt-dlp reports the exit code.
+    expect(
+      isDownloaderArgsError(
+        "Possible Values: 1-16\nDefault: 1\nTags: #basic, #http, #ftp ERROR: aria2c exited with code 28",
+      ),
+    ).toBe(true);
+    expect(isDownloaderArgsError("ERROR: aria2c exited with code 28")).toBe(true);
+    expect(isDownloaderArgsError("aria2c: unrecognized option '--splitt'")).toBe(true);
+  });
+
+  test("does not flag network, corrupt, or permanent failures", () => {
+    expect(isDownloaderArgsError("Unable to download webpage: Connection reset by peer")).toBe(false);
+    expect(isDownloaderArgsError("unable to resume download, incomplete or corrupt data")).toBe(false);
+    expect(isDownloaderArgsError("This video is private")).toBe(false);
+    expect(isDownloaderArgsError(null)).toBe(false);
   });
 });

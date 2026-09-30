@@ -68,7 +68,7 @@ describe("the editable allow-list", () => {
     for (const f of EDITABLE_SETTINGS) {
       expect(f.label.length).toBeGreaterThan(0);
       expect(f.help.length).toBeGreaterThan(0);
-      expect(["downloader", "concurrency", "reliability"]).toContain(f.group);
+      expect(["downloader", "media", "concurrency", "reliability"]).toContain(f.group);
     }
   });
 
@@ -122,6 +122,38 @@ describe("applySettings", () => {
     const result = await applySettings(baseConfig(), { useAria2c: "false" }, join(dir, "config.json"));
     expect(result.ok).toBe(true);
     expect(getConfig().useAria2c).toBe(false);
+  });
+
+  test("coerces list fields from comma-separated strings and arrays", async () => {
+    const dir = await makeConfigDir();
+    const fromString = await applySettings(
+      baseConfig(),
+      { audioTrackLanguages: "en, ja , " },
+      join(dir, "config.json"),
+    );
+    expect(fromString.ok).toBe(true);
+    expect(getConfig().audioTrackLanguages).toEqual(["en", "ja"]);
+
+    const fromArray = await applySettings(
+      baseConfig(),
+      { audioTrackLanguages: ["es", "", "hi"] },
+      join(dir, "config.json"),
+    );
+    expect(fromArray.ok).toBe(true);
+    expect(getConfig().audioTrackLanguages).toEqual(["es", "hi"]);
+  });
+
+  test("the multi-audio mode is a select with the three schema values", async () => {
+    const field = EDITABLE_SETTINGS.find((f) => f.key === "multiAudioMode")!;
+    expect(field.type).toBe("select");
+    expect((field.options || []).map((o) => o.value)).toEqual(["off", "all", "languages"]);
+    const dir = await makeConfigDir();
+    const result = await applySettings(baseConfig(), { multiAudioMode: "all" }, join(dir, "config.json"));
+    expect(result.ok).toBe(true);
+    expect(getConfig().multiAudioMode).toBe("all");
+    const bad = await applySettings(baseConfig(), { multiAudioMode: "everything" }, join(dir, "config.json"));
+    expect(bad.ok).toBe(false);
+    expect(getConfig().multiAudioMode).toBe("all"); // unchanged on rejection
   });
 
   test("reports no change when the value is already current", async () => {

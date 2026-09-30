@@ -21,8 +21,9 @@ import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
 import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
+import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
-import { logError } from "./logger";
+import { errorLogPath, logError } from "./logger";
 import type { Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
@@ -229,11 +230,18 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
         `SELECT id, url, title, folder, output_directory, file_path, target_format,
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
-                file_size, progress, speed, eta, duration, partial_file_path
+                file_size, progress, speed, eta, duration, partial_file_path,
+                audio_tracks, audio_selection
          FROM jobs ORDER BY created_at DESC LIMIT 500`,
       )
-      .all();
-    return Response.json({ jobs: rows });
+      .all() as any[];
+    // Audio-track columns are JSON in SQLite; hand the dashboard real arrays.
+    const jobs = rows.map((r) => ({
+      ...r,
+      audio_tracks: parseTracksJson(r.audio_tracks) ?? [],
+      audio_selection: parseSelectionJson(r.audio_selection),
+    }));
+    return Response.json({ jobs });
   }
 
   if (url.pathname === "/api/scan" && req.method === "POST") {
@@ -331,6 +339,70 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
     const id = decodeURIComponent(url.pathname.replace("/api/jobs/", ""));
     db.run(`DELETE FROM jobs WHERE id = ?`, [id]);
     return Response.json({ ok: true });
+  }
+
+  // Per-job audio-track picker (YouTube multi-language audio): save which
+  // languages the next download attempt should keep. `tracks: null` resets the
+  // job to the global multi-audio mode. Takes effect on the next attempt —
+  // use Retry job to fetch an already-downloaded video again.
+  if (
+    url.pathname.startsWith("/api/jobs/") &&
+    url.pathname.endsWith("/audio-tracks") &&
+    req.method === "POST"
+  ) {
+    const id = decodeURIComponent(
+      url.pathname.slice("/api/jobs/".length, -"/audio-tracks".length),
+    );
+    const row = db.query("SELECT id FROM jobs WHERE id = ?").get(id);
+    if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+    const body = await req.json().catch(() => ({}));
+    const raw = body?.tracks;
+    if (raw !== null && raw !== undefined && !Array.isArray(raw)) {
+      return Response.json(
+        { ok: false, error: "tracks must be an array of language codes or null" },
+        { status: 400 },
+      );
+    }
+    const cleaned = Array.isArray(raw)
+      ? raw
+          .filter((t: any) => typeof t === "string" && t.trim())
+          .map((t: string) => t.trim().slice(0, 32))
+          .slice(0, 40)
+      : null;
+    db.run(`UPDATE jobs SET audio_selection = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+      cleaned ? JSON.stringify(cleaned) : null,
+      id,
+    ]);
+    return Response.json({ ok: true, audio_selection: cleaned });
+  }
+
+  // Discover (or refresh) the audio tracks YouTube offers for one job — the
+  // dashboard's track picker needs the list before a download has run.
+  if (
+    url.pathname.startsWith("/api/jobs/") &&
+    url.pathname.endsWith("/audio-probe") &&
+    req.method === "POST"
+  ) {
+    const id = decodeURIComponent(
+      url.pathname.slice("/api/jobs/".length, -"/audio-probe".length),
+    );
+    const job = db.query("SELECT id, url FROM jobs WHERE id = ?").get(id) as
+      | { id: string; url: string }
+      | null;
+    if (!job) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+    try {
+      const tracks = await probeAudioTracks(job.url, config);
+      db.run(`UPDATE jobs SET audio_tracks = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+        JSON.stringify(tracks),
+        id,
+      ]);
+      return Response.json({ ok: true, tracks });
+    } catch (e: any) {
+      return Response.json(
+        { ok: false, error: String(e?.message || e).slice(0, 300) },
+        { status: 502 },
+      );
+    }
   }
 
   if (url.pathname === "/api/failed" && req.method === "GET") {
@@ -519,8 +591,8 @@ export async function handleRequest(req: Request, config: Config): Promise<Respo
     try {
       if (logType === "report") {
         logs = buildRunReport();
-      } else if (existsSync("error.log")) {
-        logs = readFileSync("error.log", "utf-8")
+      } else if (existsSync(errorLogPath())) {
+        logs = readFileSync(errorLogPath(), "utf-8")
           .split("\n")
           .filter((l) => l.trim())
           .slice(-limit);

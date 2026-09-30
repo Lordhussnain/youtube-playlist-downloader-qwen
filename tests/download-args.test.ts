@@ -6,6 +6,7 @@
 // relies on, verified without spawning anything.
 
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   buildAria2cArgs,
   buildDownloadPlan,
@@ -69,6 +70,14 @@ describe("buildAria2cArgs", () => {
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: 0 }))).toBe("-x 1 -s 1 -j 1");
     expect(buildAria2cArgs(cfg({ connectionsPerDownload: -5 }))).toBe("-x 1 -s 1 -j 1");
   });
+
+  test("clamps -x to aria2c's hard cap of 16 while -s/-j keep the setting", () => {
+    // aria2c's own help: -x "Possible Values: 1-16". An unclamped value makes
+    // it exit 28 before transferring a byte — every download in the batch.
+    expect(buildAria2cArgs(cfg({ connectionsPerDownload: 64 }))).toBe("-x 16 -s 64 -j 64");
+    expect(buildAria2cArgs(cfg({ connectionsPerDownload: 17 }))).toBe("-x 16 -s 17 -j 17");
+    expect(buildAria2cArgs(cfg({ connectionsPerDownload: 16 }))).toBe("-x 16 -s 16 -j 16");
+  });
 });
 
 describe("computePerWorkerLimitKBps", () => {
@@ -101,11 +110,16 @@ describe("buildDownloadPlan", () => {
   const build = (over: Partial<Config> = {}, aria2cAvailable = true, activeSlots = 3) =>
     buildDownloadPlan({ job, config: cfg(over), activeSlots, aria2cAvailable });
 
-  test("uses aria2c with quoted downloader args when available", () => {
+  test("uses aria2c with unquoted downloader args when available", () => {
     const plan = build({ connectionsPerDownload: 12 });
     expect(plan.engine).toBe("aria2c");
     expect(flagValue(plan.args, "--downloader")).toBe("aria2c");
-    expect(flagValue(plan.args, "--downloader-args")).toBe('aria2c:"-x 12 -s 12 -j 12"');
+    // One argv element: yt-dlp shlex-splits the text after "aria2c:". Inner
+    // quotes are a Windows regression — they survive argv, the whole list
+    // becomes one token, and aria2c rejects `-x` with exit 28 before
+    // transferring a byte (the BAD_DOWNLOADER_ARGS engine pause).
+    expect(flagValue(plan.args, "--downloader-args")).toBe("aria2c:-x 12 -s 12 -j 12");
+    expect(flagValue(plan.args, "--downloader-args")).not.toContain('"');
     // argv[0] is the yt-dlp path, added by the worker — not part of the plan.
     expect(plan.args[0]).toBe(job.url);
   });
@@ -201,7 +215,8 @@ describe("buildDownloadPlan", () => {
   test("writes to the output template derived from the sanitized base name", () => {
     const plan = build();
     expect(plan.baseFilename).toBe("007 - Some Video");
-    expect(plan.outTemplate).toBe("/tmp/downloads/Playlist/007 - Some Video.%(ext)s");
+    // join() so the expectation holds on Windows separators too.
+    expect(plan.outTemplate).toBe(join(job.output_directory, "007 - Some Video.%(ext)s"));
   });
 
   test("keeps every argv entry free of newlines (spawn safety)", () => {
@@ -210,5 +225,63 @@ describe("buildDownloadPlan", () => {
       expect(a).not.toContain("\n");
       expect(a).not.toContain("\r");
     }
+  });
+});
+
+// --- multi-audio tracks -------------------------------------------------------
+// YouTube's multi-language audio: selected tracks arrive from the worker and
+// must splice into the format selector plus switch yt-dlp into multistream
+// MKV mode. A single track is a classic download; the audio-only preset is
+// exempt (an mp3 cannot carry several tracks).
+describe("buildDownloadPlan with audio tracks", () => {
+  const build = (over: Partial<Config> = {}) =>
+    buildDownloadPlan({ job, config: cfg(over), activeSlots: 3, aria2cAvailable: true });
+  const tracks = [
+    { formatId: "251-0", language: "en", label: "English", tbr: 160, acodec: "opus", isDefault: true },
+    { formatId: "251-1", language: "es", label: "Spanish", tbr: 150, acodec: "opus", isDefault: false },
+  ];
+  const buildWithTracks = (over: Partial<Config> = {}) =>
+    buildDownloadPlan({ job, config: cfg(over), activeSlots: 3, aria2cAvailable: true, audioTracks: tracks });
+
+  test("splices the track ids into the quality preset", () => {
+    expect(flagValue(buildWithTracks({ videoQuality: "1080p" }).args, "--format")).toBe(
+      "bv[height<=1080]+251-0+251-1/b[height<=1080]",
+    );
+  });
+
+  test("enables audio multistreams and the MKV container for 2+ tracks", () => {
+    const plan = buildWithTracks();
+    expect(plan.args).toContain("--audio-multistreams");
+    expect(flagValue(plan.args, "--merge-output-format")).toBe("mkv");
+  });
+
+  test("a single selected track pins exactly that track, without multistreams", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: true,
+      audioTracks: [tracks[0]],
+    });
+    expect(flagValue(plan.args, "--format")).toBe("bv[height<=1080]+251-0/b[height<=1080]");
+    expect(plan.args).not.toContain("--audio-multistreams");
+    expect(plan.args).not.toContain("--merge-output-format");
+  });
+
+  test("no tracks means the untouched preset", () => {
+    expect(flagValue(build().args, "--format")).toBe("bv[height<=1080]+ba/b[height<=1080]");
+    expect(build().args).not.toContain("--audio-multistreams");
+  });
+
+  test("the audio-only preset ignores tracks (mp3 has one stream)", () => {
+    const plan = buildWithTracks({ videoQuality: "audio" });
+    expect(flagValue(plan.args, "--format")).toBe("ba/bestaudio");
+    expect(plan.args).not.toContain("--audio-multistreams");
+  });
+
+  test("multistream flags survive alongside the aria2c downloader args", () => {
+    const plan = buildWithTracks({ useAria2c: true });
+    expect(flagValue(plan.args, "--downloader")).toBe("aria2c");
+    expect(plan.args).toContain("--audio-multistreams");
   });
 });

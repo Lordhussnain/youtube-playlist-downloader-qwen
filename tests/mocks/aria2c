@@ -40,6 +40,35 @@ function flagValue(name: string): string | null {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
 }
 
+// The real aria2c validates option values and dies with exit 28 ("bad/
+// unrecognized option was given or unexpected option argument was given"),
+// printing the offending option's help block first. -x is hard-capped at 16
+// and -k/--min-split-size must be a size like 512K/1M — reproduce both so the
+// engine's clamping and its BAD_DOWNLOADER_ARGS pause path are testable.
+function rejectOption(help: string): never {
+  console.error(help);
+  process.exit(28);
+}
+const xArg = flagValue("-x");
+if (xArg !== null) {
+  const x = parseInt(xArg, 10);
+  if (!Number.isFinite(x) || x < 1 || x > 16) {
+    rejectOption(
+      `-x, --max-connection-per-server=N\n` +
+        `    Set the maximum number of connections to one server for each download.\n` +
+        `    Possible Values: 1-16\n    Default: 1\n    Tags: #basic, #http, #ftp`,
+    );
+  }
+}
+const splitArg = flagValue("--min-split-size") ?? flagValue("-k");
+if (splitArg !== null && !/^\d+(\.\d+)?[KMG]$/i.test(splitArg)) {
+  rejectOption(
+    `-k, --min-split-size=SIZE\n` +
+      `    Split a download to this size or larger.\n` +
+      `    Possible Values: 1M-1G\n    Default: 20M\n    Tags: #basic, #http`,
+  );
+}
+
 const out = flagValue("--out") ?? flagValue("-o");
 
 if (!out) {

@@ -90,6 +90,34 @@ describe("removePartialFiles", () => {
     // No throw = pass.
     expect(true).toBe(true);
   });
+
+  test("reports fatal and keeps the data file when the control file cannot be removed", async () => {
+    const dir = await makeDir();
+    const part = join(dir, "v.part");
+    await writeFile(part, "partial-bytes");
+    // A directory where the control file belongs makes unlink fail with a
+    // real (non-ENOENT) error on every platform — a stand-in for the lock an
+    // orphaned aria2c or an antivirus scan holds on Windows.
+    const control = `${part}${ARIA2_CONTROL_SUFFIX}`;
+    await mkdir(control, { recursive: true });
+    const result = await removePartialFiles(part);
+    expect(result.fatal).toBe(true);
+    expect(result.controlRemoved).toBe(false);
+    expect(result.dataRemoved).toBe(false);
+    expect(existsSync(part)).toBe(true); // data untouched: no stranded control
+  });
+
+  test("removal continues when only the control file is absent (native path)", async () => {
+    const dir = await makeDir();
+    const part = join(dir, "v.part");
+    await writeFile(part, "partial-bytes");
+    const result = await removePartialFiles(part);
+    expect(result.fatal).toBe(false);
+    expect(result.controlRemoved).toBe(false);
+    expect(result.dataRemoved).toBe(true);
+    expect(existsSync(part)).toBe(false);
+  });
+
 });
 
 describe("findPartialFile", () => {
