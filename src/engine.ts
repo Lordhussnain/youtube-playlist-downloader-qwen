@@ -67,6 +67,27 @@ export async function main(): Promise<void> {
   // 2) Open/migrate the central database, then self-heal anything the last
   //    run left behind (crash, hard kill, files moved behind our back).
   initDatabase("archive.db");
+
+  // Single-instance gate: bind the web port BEFORE any state-mutating sweep.
+  // A second instance (autostart task + a manual start, two terminals) used to
+  // run reconcileCrashedJobs/reconcileMissingFiles first — re-queueing the
+  // live instance's in-flight work behind its back, which looked like workers
+  // fighting each other — and only then die on the busy port. The port is now
+  // the lock: whoever holds it owns the job database.
+  try {
+    webServer = startWebServer(config.webPort, config);
+  } catch (err: any) {
+    if (err?.code === "EADDRINUSE" || String(err?.message || "").includes("in use")) {
+      console.error(
+        `\n❌ Port ${config.webPort} is already in use — another engine instance is running.`,
+      );
+      console.error("   Stop that instance first (autostart task, another terminal, or a still-exiting process).");
+      console.error("   Two instances against one archive.db corrupt each other's job state.");
+      process.exit(1);
+    }
+    throw err;
+  }
+
   reconcileCrashedJobs();
   reconcileMissingFiles(config);
   // Run history: row created now, heartbeated so hard kills still leave data.
@@ -99,7 +120,6 @@ export async function main(): Promise<void> {
   }
 
   initDashboard(config);
-  webServer = startWebServer(config.webPort, config);
   const uiHost = !config.webBind || config.webBind === "0.0.0.0" ? "127.0.0.1" : config.webBind;
   console.log(
     `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,

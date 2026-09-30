@@ -103,6 +103,12 @@ export function reapStaleClaims(): void {
  * id from the yt-dlp archive and re-queue the job so the next run fetches it
  * again — otherwise the archive entry would make yt-dlp skip it forever.
  *
+ * Jobs whose conversion is in progress are skipped: with
+ * `deleteSourceAfterConvert` the converter legitimately has the media in
+ * mid-transition (the old source path is already gone while the new one is
+ * not recorded yet), and re-queueing the download onto a live converter is
+ * exactly the "file deleted before conversion finished" race.
+ *
  * Returns the number of jobs re-queued.
  */
 export function reconcileMissingFiles(config: Config): number {
@@ -115,6 +121,7 @@ export function reconcileMissingFiles(config: Config): number {
                 want_subtitles, want_thumbnail, want_description
          FROM jobs
          WHERE file_path IS NOT NULL
+           AND conversion_status != 'in_progress'
            AND (download_status = 'downloaded' OR conversion_status = 'done')`,
       )
       .all() as any[];
@@ -253,6 +260,23 @@ export function partialSidecars(partialPath: string): string[] {
   return [partialPath, `${partialPath}${ARIA2_CONTROL_SUFFIX}`];
 }
 
+/** What `removePartialFiles` actually managed to do. */
+export interface PartialRemovalResult {
+  /** The `.aria2` control file no longer exists. */
+  controlRemoved: boolean;
+  /** The `.part` data file no longer exists. */
+  dataRemoved: boolean;
+  /**
+   * True when removal had to abort because the control file is locked (still
+   * held open by another process). Neither file may have been touched:
+   * deleting the data file in this state would strand the control file and
+   * wedge aria2c permanently (see above).
+   */
+  fatal: boolean;
+  /** The path and reason of the failure, when fatal. */
+  error?: string;
+}
+
 /**
  * Delete a partial download and everything that belongs to it.
  *
@@ -262,13 +286,43 @@ export function partialSidecars(partialPath: string): string[] {
  * will not re-download the file."* So deleting the `.part` while stranding the
  * `.aria2` leaves aria2c holding a control file for data that is gone — it can
  * neither resume nor restart, and the job wedges and retries forever. (Exit
- * status 10, *"piece length was different from one in .aria2 control file"*, is
- * the other way this bites.) Always remove both together.
+ * status 10, *"piece length was different from one in .aria2 control file"*,
+ * is the other way this bites.)
+ *
+ * The control file is therefore removed FIRST, and a locked control file
+ * aborts the whole removal: on Windows an orphaned aria2c or an antivirus scan
+ * can hold the handle for a while, and blindly unlinking in either order can
+ * produce exactly the stranded-control-file state above. The order also bounds
+ * the damage of a half-finished cleanup: data-without-control merely restarts
+ * the transfer, control-without-data wedges it. Callers that must restart a
+ * transfer from scratch should check `.fatal` and retry later instead.
  */
-export async function removePartialFiles(partialPath: string): Promise<void> {
-  for (const path of partialSidecars(partialPath)) {
-    await unlink(path).catch(() => {});
+export async function removePartialFiles(partialPath: string): Promise<PartialRemovalResult> {
+  const controlPath = `${partialPath}${ARIA2_CONTROL_SUFFIX}`;
+  let controlRemoved = false;
+  try {
+    await unlink(controlPath);
+    controlRemoved = true;
+  } catch (e: any) {
+    if (e?.code !== "ENOENT") {
+      // Locked or otherwise undeletable — do NOT touch the data file.
+      return {
+        controlRemoved,
+        dataRemoved: false,
+        fatal: true,
+        error: `${controlPath}: ${e?.code || e?.message || e}`,
+      };
+    }
   }
+  let dataRemoved = false;
+  try {
+    await unlink(partialPath);
+    dataRemoved = true;
+  } catch {
+    // Data file locked but control gone: the next attempt restarts from
+    // scratch — annoying, not fatal.
+  }
+  return { controlRemoved, dataRemoved, fatal: false };
 }
 
 /**

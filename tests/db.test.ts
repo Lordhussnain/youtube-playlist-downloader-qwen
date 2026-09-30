@@ -253,6 +253,25 @@ describe("reconcileMissingFiles", () => {
     expect(archive).toContain("abc123");
   });
 
+  test("leaves jobs alone while their conversion is in progress", async () => {
+    // With deleteSourceAfterConvert the converter deletes the recorded source
+    // mid-job and records the new path at the end; a startup sweep running in
+    // that window must NOT re-queue the download onto the live converter.
+    const dir = await makeTmpDir();
+    const config = testConfig({ archiveFile: join(dir, "archive.txt"), verifyExistingFiles: true });
+    await writeFile(config.archiveFile, "youtube conv111\n");
+    insertJob("conv111", {
+      download_status: "downloaded",
+      file_path: join(dir, "missing.mp4"),
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-1",
+    });
+    expect(reconcileMissingFiles(config)).toBe(0);
+    const job = getJob("conv111");
+    expect(job.download_status).toBe("downloaded");
+    expect(job.conversion_status).toBe("in_progress");
+  });
+
   test("is a no-op when verifyExistingFiles is disabled", async () => {
     const dir = await makeTmpDir();
     const config = testConfig({ archiveFile: join(dir, "a.txt"), verifyExistingFiles: false });

@@ -267,9 +267,26 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
         : await findPartialFile(job.output_directory, base);
     if (resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial) {
       // Budget spent (or nothing to resume): throw the partial away and
-      // restart this video from scratch. The aria2c control file goes too —
+      // restart this video from scratch. The aria2c control file goes first —
       // stranding it makes aria2c refuse to restart (see removePartialFiles).
-      if (partial) await removePartialFiles(partial);
+      if (partial) {
+        const removal = await removePartialFiles(partial);
+        if (removal.fatal) {
+          // The control file is locked (orphaned aria2c, an antivirus scan).
+          // Deleting only the data file now would wedge this video forever,
+          // so keep both files, surface exactly what is blocking, and let a
+          // later attempt retry once the handle is released.
+          const msg = `partial file locked, cannot restart cleanly (${removal.error}). Close the program holding it — usually an orphaned aria2c/ffmpeg or antivirus scanning the download folder.`;
+          db.run(
+            `UPDATE jobs SET download_status = 'pending', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [msg.slice(0, 500), job.id],
+          );
+          logError("download", `${job.id} ${job.title}: ${msg}`);
+          updateWorkerLine(id, `🔒 Partial locked — will retry | ${job.title}`, config);
+          await Bun.sleep(computeBackoffMs(2, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+          return;
+        }
+      }
       resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
       updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
       return;

@@ -15,6 +15,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - **Automatic retries** with exponential backoff + jitter on transient failures (network drops, throttling, timeouts)
 - **Permanent-failure detection** — private / removed / age-gated / geo-blocked videos fail fast and are never auto-requeued
 - **Self-healing sweeps** — crashed jobs resume, stale claims are reclaimed, deleted downloads are re-fetched, and failed jobs are retried after a cooldown. With aria2c these sweeps resume from the download's `.aria2` control file, and a discarded partial always takes its control file with it
+- **Single-instance safety** — the web port acts as a lock: starting a second engine against the same `archive.db` refuses to start (with an actionable message) instead of re-queueing the running instance's in-flight work. If a restart-from-scratch hits a partial file locked by another program (orphaned aria2c/ffmpeg, antivirus), the video is retried later with that exact reason in `last_error` instead of being wedged
 - **Duration-aware watchdog** — long videos are not killed by a flat 15-minute timeout
 - **Disk space precheck** before starting a batch
 - **Graceful shutdown** — safely stops in-flight downloads on exit

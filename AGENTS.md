@@ -133,12 +133,17 @@ dependency-free — it is the module that breaks every import cycle.
 1. `loadConfig()` → `setConfig()` (must be first: dependency search uses paths from it)
 2. `checkDependencies()` — fails fast with install hints
 3. `initDatabase("archive.db")` — schema + migrations + claim transactions
-4. `reconcileCrashedJobs()` → `reconcileMissingFiles()`
-5. `startRunHistory()` + heartbeat interval
+4. `startWebServer()` — **before any sweep: the web port is the single-instance
+   lock**. A second instance (autostart task + a manual start) dies here with an
+   actionable error instead of re-queueing a live instance's in-flight work.
+5. `reconcileCrashedJobs()` → `reconcileMissingFiles()` (the latter skips jobs
+   with a conversion in progress — the converter legitimately has those files
+   in mid-transition under `deleteSourceAfterConvert`)
+9. `startRunHistory()` + heartbeat interval
 6. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
 7. cookie validation (if enabled)
 8. scan every configured playlist/channel into the jobs table
-9. `initDashboard()`, `startWebServer()`
+13. `initDashboard()`
 10. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
     `requeueFailedJobs` (60s), `startRssPolling()`
 11. supervised worker pools (download × N, metadata × N, convert × N)
@@ -600,6 +605,20 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 17. **New yt-dlp flags belong in `buildDownloadPlan`.** The download worker
     passes the URL first and the plan's args after it, so the mock's URL
     detection (`argv[0]`) depends on that ordering.
+18. **One instance per `archive.db`.** The web port is the lock and `main()`
+    binds it before the sweeps; anything that mutates job state must stay
+    after `startWebServer()` in the startup order.
+19. **`removePartialFiles` removes the `.aria2` control file FIRST and
+    reports a `fatal` result when it is locked** (orphaned aria2c, antivirus).
+    Never delete the `.part` after a fatal — that strands the control file and
+    wedges aria2c. "Restart from scratch" paths must check `.fatal` and retry
+    later instead.
+20. **The converter guards every destructive step with
+    `stillOwnsConversion`** (source delete, secondary-storage move, the final
+    done-update) and updates `file_path` to the converted output BEFORE
+    unlinking the source. Deleting first is what made a crash in the
+    finalize window look like "file deleted before conversion finished" and
+    triggered a full re-download on the next startup sweep.
 
 ---
 
