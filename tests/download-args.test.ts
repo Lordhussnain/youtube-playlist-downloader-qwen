@@ -124,6 +124,32 @@ describe("buildDownloadPlan", () => {
     expect(plan.args[0]).toBe(job.url);
   });
 
+  test("hands yt-dlp the resolved aria2c binary instead of a bare name", () => {
+    // Discovery may find aria2c next to the app or in a winget/scoop shim that
+    // is not on the child's PATH; yt-dlp must not have to find it again.
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: true,
+      aria2cBinary: join("C:\\tools", "aria2c.exe"),
+    });
+    expect(flagValue(plan.args, "--downloader")).toBe(join("C:\\tools", "aria2c.exe"));
+    // The downloader args are unchanged — only the binary reference differs.
+    expect(flagValue(plan.args, "--downloader-args")).toBe("aria2c:-x 16 -s 16 -j 16");
+  });
+
+  test("falls back to the bare name when no binary was resolved", () => {
+    const plan = buildDownloadPlan({
+      job,
+      config: cfg(),
+      activeSlots: 3,
+      aria2cAvailable: true,
+      aria2cBinary: null,
+    });
+    expect(flagValue(plan.args, "--downloader")).toBe("aria2c");
+  });
+
   test("omits downloader flags on the native path", () => {
     const plan = build({}, false);
     expect(plan.engine).toBe("native");

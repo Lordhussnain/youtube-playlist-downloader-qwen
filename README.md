@@ -23,6 +23,7 @@ a terminal UI and a web dashboard to watch it all happen.
 - Correct format selection across VP9/AV1 containers (fixes yt-dlp/ffmpeg mismatches)
 - **Multi-audio tracks** — YouTube's multi-language audio (the player's *Audio track* menu: original + auto-dubbed tracks). Keep every track, or just the languages you want, muxed into one MKV whose audio is switchable in any player — plus a per-video track picker in the dashboard
 - Compatible with authenticated downloads (`--cookies`) alongside the Android player-client extractor args
+- **cookies.txt is watched while the engine runs** — export it from your browser after startup (or replace it when it expires) and the next download attempt uses it; the engine logs the switch and tells you how many credential-blocked jobs it may rescue
 - **Web dashboard** with live job status, bulk actions, failed-job recovery, a reliability panel, per-job detail, and an in-browser settings editor for the downloader
 
 ## Tech Stack

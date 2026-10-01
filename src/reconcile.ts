@@ -16,6 +16,7 @@ import { join, resolve } from "node:path";
 import { db, perVideoCap, type Job } from "./db";
 import { removeFromArchive } from "./archive";
 import { logError } from "./logger";
+import { detectCookiesChange, type CookiesChange } from "./tools";
 import { isPermanentDownloadError } from "./retry";
 import { jobBaseFilename } from "./download-args";
 import type { Config } from "./config";
@@ -153,6 +154,55 @@ export function reconcileMissingFiles(config: Config): number {
     logError("reconcile", String(e?.message || e));
   }
   return fixed;
+}
+
+/**
+ * Sweep: keep watching `cookiesFile` for the whole run.
+ *
+ * Cookies are not a startup-only concern. Operators export cookies.txt from the
+ * browser *after* the engine is already running (or replace it when it expires),
+ * and the download attempts must start using it without a restart. Returns the
+ * transition so tests can assert on it; null means nothing changed.
+ */
+export function cookiesWatch(config: Config): CookiesChange {
+  const { change, state } = detectCookiesChange(config);
+  if (!change) return null;
+  if (change === "appeared" || change === "updated") {
+    // Jobs parked by a credential-shaped permanent error are the ones this
+    // unblocks. They are NOT auto-requeued — permanent failures never are —
+    // but the operator is told exactly how many the new cookies may rescue.
+    const blocked =
+      (
+        db
+          .query(
+            `SELECT COUNT(*) AS n FROM jobs
+              WHERE download_status = 'failed'
+                AND (lower(COALESCE(last_error, '')) LIKE '%login%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%sign in%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%age%'
+                  OR lower(COALESCE(last_error, '')) LIKE '%cookie%')`,
+          )
+          .get() as any
+      )?.n || 0;
+    console.log(
+      `🍪 cookies.txt ${change === "appeared" ? "found" : "changed"} (${state.size} bytes) — the next download attempt will use it.`,
+    );
+    if (blocked > 0) {
+      console.log(
+        `   ${blocked} failed job(s) look credential-related — use "Requeue all failed" (or Retry) to spend the new cookies on them.`,
+      );
+    }
+    logError(
+      "cookies",
+      `cookies.txt ${change} (${state.size} bytes) at ${state.file}; ${blocked} job(s) parked with a credential-style error`,
+    );
+  } else {
+    console.warn(
+      "⚠️ cookies.txt disappeared — continuing without cookies; age-gated/private/member-only videos will now fail.",
+    );
+    logError("cookies", `cookies.txt disappeared (${state.file}) — continuing without cookies`);
+  }
+  return change;
 }
 
 export interface RequeueResult {

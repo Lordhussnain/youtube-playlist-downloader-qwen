@@ -99,6 +99,16 @@ export interface BuildDownloadPlanOptions {
   /** Whether aria2c was found on this machine. */
   aria2cAvailable: boolean;
   /**
+   * The resolved aria2c executable, when discovery found one. Passed to yt-dlp
+   * as `--downloader <path>` rather than the bare name `aria2c`: discovery
+   * searches the app folder, the compiled exe's folder and the
+   * winget/scoop/chocolatey shim dirs, none of which are guaranteed to be on
+   * the child process's PATH — and on Windows a bare name yt-dlp cannot resolve
+   * fails the download with "aria2c not found" even though the engine just
+   * probed the binary successfully.
+   */
+  aria2cBinary?: string | null;
+  /**
    * Audio tracks selected for this job (multi-audio support). Empty/absent =
    * classic single-track download. Two or more tracks are muxed into one MKV
    * with `--audio-multistreams` so the audio is switchable in any player.
@@ -196,7 +206,9 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   // Multi-connection downloader. HLS/live streams fall back to the native
   // downloader inside yt-dlp automatically.
   if (engine === "aria2c") {
-    args.push("--downloader", "aria2c");
+    // Absolute path when we have one (see aria2cBinary) — never rely on the
+    // child's PATH to re-discover a binary we already found.
+    args.push("--downloader", opts.aria2cBinary || "aria2c");
     // One argv element, NO inner quotes. The value reaches yt-dlp without a
     // shell, so inner `"` would arrive literally; on Windows the re-quoted
     // command line then makes yt-dlp's shlex treat the whole list as ONE

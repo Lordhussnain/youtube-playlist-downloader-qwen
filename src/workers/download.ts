@@ -97,6 +97,7 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     config,
     activeSlots: activeDlSlots.size,
     aria2cAvailable: !!aria2cPath(),
+    aria2cBinary: aria2cPath(),
     audioTracks,
   });
   const { baseFilename, outTemplate, timeoutMs } = plan;

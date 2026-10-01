@@ -148,7 +148,7 @@ dependency-free — it is the module that breaks every import cycle.
 9. scan every configured playlist/channel into the jobs table
 10. `initDashboard()`
 11. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
-    `requeueFailedJobs` (60s), `startRssPolling()`
+    `requeueFailedJobs` (60s), `cookiesWatch` (60s), `startRssPolling()`
 12. supervised worker pools (download × N, metadata × N, convert × N)
 13. `startAutonomousPolling()` if daemon mode
 
@@ -241,6 +241,16 @@ while (!abortController.signal.aborted) {
 Workers are supervised (`lifecycle.ts supervise()`): a crashed loop is logged
 and restarted after 5s. Never let a worker loop exit on error.
 
+**The three claims are mutually exclusive on the stage that owns the media
+file** (`db.ts`, gotcha 24). A download is never claimed while
+`conversion_status` or `metadata_status` is `in_progress`, and metadata is
+never claimed while `conversion_status` is `in_progress`. All three pools share
+one job row and one file on disk, so without those exclusions a re-queued
+download starts yt-dlp writing to the very path the converter is reading — the
+"file deleted before conversion finished" race. `conversion_status = 'done'`
+stays claimable by the metadata worker on purpose: `requeueFailedJobs()`
+re-queues a failed sidecar pass on an already-converted job.
+
 ---
 
 ## 6. Reliability policies — where each lives
@@ -259,6 +269,7 @@ and restarted after 5s. Never let a worker loop exit on error.
 | Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
 | Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs |
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
+| Cookies watcher | `reconcile.ts cookiesWatch()` + `tools.ts detectCookiesChange()` | 60s sweep: reports cookies.txt appearing / changing / vanishing mid-run and counts the credential-blocked jobs it may rescue (never auto-requeues them) |
 | Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
 | Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
@@ -459,7 +470,7 @@ bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tes
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-257 tests across 19 files. Tests share one process, so any file that touches the
+279 tests across 20 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -470,7 +481,8 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/retry.test.ts` | backoff math, watchdog scaling, error classification |
 | `tests/util.test.ts` | formatters, Windows filename hardening, `fitBaseFilename`, hashing |
 | `tests/config.test.ts` | defaults, validation, cross-field refinements, load/save |
-| `tests/db.test.ts` | schema + legacy migration, atomic claims, all reconcile/requeue sweeps, ingestion dedupe |
+| `tests/db.test.ts` | schema + legacy migration, atomic claims, the pipeline claim exclusions, all reconcile/requeue sweeps, ingestion dedupe |
+| `tests/cookies.test.ts` | `cookiesArgs`/`cookiesState` on a missing/empty/present file, the appeared/updated/disappeared transitions, and `cookiesWatch`'s credential-blocked count |
 | `tests/rss.test.ts` | `parseRssFeed` against a realistic feed (CDATA, missing duration) |
 | `tests/webauth.test.ts` | token extraction, timing-safe compare, authorization |
 | `tests/report.test.ts` | run report contents |
@@ -668,6 +680,21 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     never changes there). See 9.3 — crash-recovery scenarios that depend on an
     orphan abandoning its transfer are POSIX-only until the harness kills the
     process tree itself.
+24. **Keep the three claim queries mutually exclusive.** `claimDownloadJob`
+    excludes jobs whose `conversion_status` or `metadata_status` is
+    `in_progress`; `claimMetadataJob` excludes `conversion_status =
+    'in_progress'`. One job row, one file on disk, three pools — a download
+    claimed mid-conversion writes over the file being converted. Note the
+    parenthesised `OR` in the download claim: an exclusion added *outside* the
+    parens binds only to the paused branch. `tests/db.test.ts` "pipeline claim
+    exclusion" is the guard.
+25. **yt-dlp gets the resolved aria2c *path*, not the bare name.** Discovery
+    searches the app folder, the compiled exe's folder and the
+    winget/scoop/chocolatey shims — none of which are guaranteed to be on the
+    child process's PATH, so `--downloader aria2c` can fail with "aria2c not
+    found" on a machine where the engine just probed the binary successfully.
+    `buildDownloadPlan` emits `--downloader <aria2cBinary>`; the mock yt-dlp
+    matches the basename, so keep that regex if you change the flag.
 
 ---
 
@@ -687,7 +714,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 257 tests across 19 files).
+- `bun run check` passes (strict typecheck + the full suite — 279 tests across 20 files).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

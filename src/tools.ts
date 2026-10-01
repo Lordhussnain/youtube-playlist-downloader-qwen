@@ -28,12 +28,68 @@ export function activeDownloader(): "aria2c" | "native" {
   return resolvedTools.aria2cPath ? "aria2c" : "native";
 }
 
+export interface CookiesState {
+  /** The configured path, used verbatim in argv (relative paths still work). */
+  file: string;
+  /** Exists AND non-empty — a 0-byte cookies.txt is not usable cookies. */
+  present: boolean;
+  size: number;
+  mtimeMs: number;
+}
+
+/** Snapshot of the cookies file right now. Never throws. */
+export function cookiesState(config: { cookiesFile: string }): CookiesState {
+  const file = config.cookiesFile || "";
+  try {
+    const s = statSync(file);
+    return { file, present: s.size > 0, size: s.size, mtimeMs: s.mtimeMs };
+  } catch {
+    return { file, present: false, size: 0, mtimeMs: 0 };
+  }
+}
+
 /** `--cookies <file>` when the file exists and is non-empty, else nothing. */
 export function cookiesArgs(config: { cookiesFile: string }): string[] {
-  try {
-    if (statSync(config.cookiesFile).size > 0) return ["--cookies", config.cookiesFile];
-  } catch {}
-  return [];
+  const s = cookiesState(config);
+  return s.present ? ["--cookies", s.file] : [];
+}
+
+export type CookiesChange = "appeared" | "disappeared" | "updated" | null;
+
+let cookiesBaseline: CookiesState | null = null;
+
+/**
+ * Compare the cookies file with the last observation and remember this one.
+ *
+ * `cookiesArgs()` re-stats the file on every yt-dlp invocation, so a
+ * cookies.txt dropped in *after* startup is already used by the next attempt —
+ * silently. This is the part that makes it observable: the engine polls it
+ * (see `reconcile.ts cookiesWatch`) so the operator sees the file being picked
+ * up, replaced, or vanishing instead of wondering why age-gated videos
+ * suddenly work or suddenly fail.
+ */
+export function detectCookiesChange(config: {
+  cookiesFile: string;
+}): { change: CookiesChange; state: CookiesState } {
+  const state = cookiesState(config);
+  const prev = cookiesBaseline;
+  cookiesBaseline = state;
+  if (!prev) return { change: null, state }; // first observation = baseline
+  if (!prev.present && state.present) return { change: "appeared", state };
+  if (prev.present && !state.present) return { change: "disappeared", state };
+  if (
+    prev.present &&
+    state.present &&
+    (prev.size !== state.size || prev.mtimeMs !== state.mtimeMs)
+  ) {
+    return { change: "updated", state };
+  }
+  return { change: null, state };
+}
+
+/** Forget the observed cookies state (tests, and a config path change). */
+export function resetCookiesBaseline(): void {
+  cookiesBaseline = null;
 }
 
 /** Cheap validity probe for a cookies file (one yt-dlp metadata call). */

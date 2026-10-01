@@ -11,6 +11,7 @@ import { aria2cPath, checkDependencies, validateCookies } from "./tools";
 import { initDatabase } from "./db";
 import {
   cleanOrphanedFiles,
+  cookiesWatch,
   reconcileCrashedJobs,
   reconcileMissingFiles,
   reapStaleClaims,
@@ -101,10 +102,18 @@ export async function main(): Promise<void> {
   await cleanOrphanedFiles(config.outputRoot, config);
   autoscaler.init(config);
 
+  // Establish the cookies baseline, then keep watching for the whole run: a
+  // cookies.txt exported from the browser *after* startup must be picked up
+  // without a restart (cookiesWatch runs on an interval below).
+  cookiesWatch(config);
   if (config.validateCookiesOnStart && existsSync(config.cookiesFile)) {
     const valid = await validateCookies(config.cookiesFile);
     if (!valid) console.warn("⚠️ Cookies may be invalid or expired.");
     else console.log("✅ Cookies validated.");
+  } else if (!existsSync(config.cookiesFile)) {
+    console.log(
+      `ℹ️ No ${config.cookiesFile} yet — downloads run anonymously. Drop the file in while the engine runs and it is picked up within a minute.`,
+    );
   }
 
   // 3) Load every link from config.json, fetch video details, store in DB.
@@ -131,6 +140,8 @@ export async function main(): Promise<void> {
   setInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.
   setInterval(() => requeueFailedJobs(getConfig()), 60_000);
+  // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run.
+  setInterval(() => cookiesWatch(getConfig()), 60_000);
   // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
   startRssPolling(config);
 

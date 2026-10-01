@@ -547,3 +547,86 @@ describe("perVideoCap", () => {
     expect(perVideoCap(testConfig({ maxRetryAttempts: 5, maxFailuresPerVideo: 2 }))).toBe(2);
   });
 });
+
+// The three worker pools share one job row, so their claims must be mutually
+// exclusive on the stage that owns the media file. Without this a download can
+// start while the converter is mid-job — yt-dlp then writes (and finally
+// replaces) the very file being converted, which is what operators see as
+// "the file was deleted before conversion finished".
+describe("pipeline claim exclusion", () => {
+  test("a pending download is still claimed in the normal case", () => {
+    insertJob("cx0", { download_status: "pending", conversion_status: "pending", metadata_status: "not_needed" });
+    const job = claimDownloadJob("dl-1");
+    expect(job?.id).toBe("cx0");
+    expect(getJob("cx0").download_status).toBe("downloading");
+  });
+
+  test("no download claim while the converter owns the job", () => {
+    insertJob("cx1", {
+      download_status: "pending",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-1",
+    });
+    expect(claimDownloadJob("dl-1")).toBeNull();
+    expect(getJob("cx1").download_status).toBe("pending");
+  });
+
+  test("no download claim while the metadata worker owns the job", () => {
+    insertJob("cx2", { download_status: "pending", metadata_status: "in_progress" });
+    expect(claimDownloadJob("dl-2")).toBeNull();
+    expect(getJob("cx2").download_status).toBe("pending");
+  });
+
+  test("an interrupted job waiting on its converter is not re-downloaded", () => {
+    // Guards the parenthesised OR: the exclusion must apply to BOTH the
+    // pending branch and the paused/interrupted branch, not just the last one.
+    insertJob("cx3", {
+      download_status: "paused",
+      pause_reason: "interrupted",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-3",
+    });
+    expect(claimDownloadJob("dl-3")).toBeNull();
+    expect(getJob("cx3").download_status).toBe("paused");
+
+    // Same shape without a live conversion: still claimable.
+    insertJob("cx3b", { download_status: "paused", pause_reason: "interrupted" });
+    expect(claimDownloadJob("dl-3")?.id).toBe("cx3b");
+  });
+
+  test("a user-paused job is never auto-claimed", () => {
+    insertJob("cx3c", { download_status: "paused", pause_reason: "user" });
+    expect(claimDownloadJob("dl-4")).toBeNull();
+  });
+
+  test("no metadata claim while the converter owns the job", () => {
+    insertJob("cx4", {
+      download_status: "downloaded",
+      metadata_status: "pending",
+      conversion_status: "in_progress",
+      conversion_claimed_by: "cv-4",
+    });
+    expect(claimMetadataJob("md-1")).toBeNull();
+    expect(getJob("cx4").metadata_status).toBe("pending");
+  });
+
+  test("metadata after a finished conversion is still claimable", () => {
+    // requeueFailedJobs re-queues a failed metadata stage on jobs that already
+    // converted — that path must keep working.
+    insertJob("cx5", {
+      download_status: "downloaded",
+      metadata_status: "pending",
+      conversion_status: "done",
+    });
+    expect(claimMetadataJob("md-2")?.id).toBe("cx5");
+  });
+
+  test("the converter still claims a finished download", () => {
+    insertJob("cx6", {
+      download_status: "downloaded",
+      conversion_status: "pending",
+      metadata_status: "done",
+    });
+    expect(claimConvertJob("cv-6")?.id).toBe("cx6");
+  });
+});

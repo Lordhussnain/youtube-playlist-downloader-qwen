@@ -146,7 +146,11 @@ if (failTimes > 0 && attempts <= failTimes) {
 // yt-dlp hands the transfer to aria2c with its own argument set. Faithfully
 // forward: the parsed --downloader-args, --limit-rate mapped to aria2c's
 // --max-overall-download-limit, the .part temp file as --out, and the URL.
-if (flagValue("--downloader") === "aria2c") {
+// The engine hands yt-dlp the *resolved* aria2c binary (`--downloader <path>`),
+// because a bare name would have to be re-discovered on the child's PATH and on
+// Windows it often is not there. Match the basename so both forms work.
+const downloaderArg = flagValue("--downloader") || "";
+if (/(^|[\\/])aria2c(\.exe)?$/i.test(downloaderArg)) {
   const raw = flagValue("--downloader-args") || "";
   // Strip the aria2c: prefix (plus any legacy wrapping quotes — the engine no
   // longer emits them) — a simplified shlex — and split into argv.

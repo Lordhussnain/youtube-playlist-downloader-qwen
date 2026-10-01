@@ -162,8 +162,15 @@ export function initDatabase(path: string = "archive.db"): void {
         `UPDATE jobs SET download_status = 'downloading', pause_reason = NULL, download_claimed_by = ?, download_claimed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
          WHERE id = (
            SELECT id FROM jobs
-           WHERE download_status = 'pending'
-              OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live'))
+           WHERE (download_status = 'pending'
+              OR (download_status = 'paused' AND COALESCE(pause_reason, '') NOT IN ('user', 'waiting_live')))
+             -- Pipeline exclusion: never start a download while another worker
+             -- owns this job's media file. The converter deletes/renames the
+             -- source mid-job and the metadata worker writes sidecars next to
+             -- it, so a yt-dlp writing to the same path is what produced
+             -- "file deleted before conversion finished".
+             AND COALESCE(conversion_status, '') != 'in_progress'
+             AND COALESCE(metadata_status, '') != 'in_progress'
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,
@@ -198,6 +205,12 @@ export function initDatabase(path: string = "archive.db"): void {
          WHERE id = (
            SELECT id FROM jobs
            WHERE download_status = 'downloaded' AND metadata_status = 'pending'
+             -- Sidecars are fetched against the media file's path; doing that
+             -- while the converter is renaming/moving it lands them in the
+             -- wrong place. A job whose conversion already finished ('done')
+             -- is still eligible — a failed-then-requeued metadata stage runs
+             -- after conversion on purpose.
+             AND COALESCE(conversion_status, '') != 'in_progress'
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,
