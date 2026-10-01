@@ -59,7 +59,10 @@ shebangs nor spawns extensionless files, so the integration harness compiles
 them into real executables with `bun build --compile` (cached per run, a few
 seconds once) and pins every tool path in the engine's config to the mocks —
 bare-name PATH discovery could otherwise pick up real yt-dlp/ffmpeg/aria2c
-installed on the machine.
+installed on the machine. Two more Windows facts the code already accounts for:
+some Bun builds for Windows do not implement `statfs` at all (see gotcha 22 —
+go through `diskUsage()`), and Windows does not reparent orphans, so the mocks'
+`process.ppid` watchdogs are inert there (see 9.3).
 
 ---
 
@@ -81,7 +84,7 @@ src/
   audio-tracks.ts PURE multi-audio track parsing/selection + the yt-dlp -J probe
   settings.ts    dashboard-editable config allow-list + validate/persist/apply
   retry.ts       PURE retry policy: backoff, watchdog, error classification
-  resilience.ts  pause/resume, circuit breaker, network + disk guards
+  resilience.ts  pause/resume, circuit breaker, network + disk guards (diskUsage = the only statfs caller)
   reconcile.ts   self-healing sweeps (crashes, stale claims, missing files, failed jobs) + partial-file housekeeping
   scanner.ts     playlist/channel listing + deduplicated ingestion
   autoscale.ts   dynamic download-slot management
@@ -139,15 +142,15 @@ dependency-free — it is the module that breaks every import cycle.
 5. `reconcileCrashedJobs()` → `reconcileMissingFiles()` (the latter skips jobs
    with a conversion in progress — the converter legitimately has those files
    in mid-transition under `deleteSourceAfterConvert`)
-9. `startRunHistory()` + heartbeat interval
-6. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
-7. cookie validation (if enabled)
-8. scan every configured playlist/channel into the jobs table
-13. `initDashboard()`
-10. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
+6. `startRunHistory()` + heartbeat interval
+7. `mkdir(outputRoot)` → `cleanOrphanedFiles()` → `autoscaler.init()`
+8. cookie validation (if enabled)
+9. scan every configured playlist/channel into the jobs table
+10. `initDashboard()`
+11. `networkMonitor()`, `reapStaleClaims` (60s), `autoscaleTick` (15s),
     `requeueFailedJobs` (60s), `startRssPolling()`
-11. supervised worker pools (download × N, metadata × N, convert × N)
-12. `startAutonomousPolling()` if daemon mode
+12. supervised worker pools (download × N, metadata × N, convert × N)
+13. `startAutonomousPolling()` if daemon mode
 
 ---
 
@@ -256,7 +259,7 @@ and restarted after 5s. Never let a worker loop exit on error.
 | Circuit breaker | `resilience.ts notePipelineFailure()` | N consecutive failures per stage pauses the engine (`TOO_MANY_FAILURES`) |
 | Pause / resume | `resilience.ts triggerPause / triggerResume` | SIGINTs child yt-dlp; resume re-queues paused jobs |
 | Network monitor | `resilience.ts networkMonitor()` | probes 3 hosts, pauses after 2 consecutive failures |
-| Disk guard | `resilience.ts checkDiskSpace()` | statfs → PowerShell fallback → degraded mode (never bricks the engine) |
+| Disk guard | `resilience.ts diskUsage()` → `checkDiskSpace()` | `diskUsage` is the **only** `statfs` caller: statfs → PowerShell `Get-PSDrive` fallback → `-1/-1` degraded mode (never bricks the engine, never 500s `/api/status`) |
 | Crash recovery | `reconcile.ts reconcileCrashedJobs()` | `downloading` → `paused + interrupted` (auto-claimable) |
 | Stale-claim reaper | `reconcile.ts reapStaleClaims()` | downloads >20 min, conversions >3 h, metadata >15 min; thresholds live in `STALE_CLAIM_THRESHOLDS` so the dashboard cannot drift from them |
 | Missing-file reconciliation | `reconcile.ts reconcileMissingFiles()` | scrubs the yt-dlp archive + re-queues |
@@ -405,20 +408,33 @@ Auth: every request (UI + API) is gated when `webToken` is set — via cookie
 (`yta_token`, HttpOnly after sign-in), `Authorization: Bearer`, `X-Web-Token`,
 or `?token=`. Comparison is timing-safe. Default bind is `127.0.0.1`.
 
+Routing is a `ROUTES` table of `{methods, pattern, handler}` with `:param`
+segments — not an if-chain. The contract every route shares: a
+`{ ok: true|false, … }` envelope, a **JSON** 404 for an unknown API path, and a
+**JSON** 405 (+ `Allow`) for a known path with the wrong method. Trailing
+slashes collapse (`/api/jobs/` is `/api/jobs`). Static action paths are listed
+*before* `:param` routes so a wrong method answers 405 instead of binding the
+segment as an id (gotcha 21).
+
 | Method | Route | Purpose |
 | --- | --- | --- |
 | GET | `/` | dashboard (login page when a token is required) |
-| HEAD | `/api/ping` | liveness probe used by the UI |
-| GET | `/api/status` | stats, speed, ETA, disk, workers, pause state |
+| GET · HEAD | `/api/ping` | liveness probe used by the UI |
+| GET | `/api/version` | engine/runtime info (`Bun.version`, platform/arch, uptime seconds) |
+| GET | `/api/status` | stats, speed, ETA, disk, live worker lines, pause state, `runtime`; `diskSpace.free` reads `"unknown"` when no disk probe could answer |
 | GET | `/api/jobs` | up to 500 jobs with status/retry/progress fields, plus parsed `audio_tracks` / `audio_selection` |
+| GET | `/api/jobs/:id` | one job, read fresh from the DB — the detail drawer fetches this instead of trusting a poll-cycle-old list row |
 | POST | `/api/scan` | `{url, folder?}` → scan & ingest |
+| POST | `/api/queue/purge` | delete every pending / paused / waiting_live / failed job; returns `{ok, deleted}` |
 | POST | `/api/pause` · `/api/resume` | global pause / resume-all |
-| POST | `/api/retry/<id>` | re-queue one job (all stages, budgets reset) |
-| POST | `/api/failcount/reset/<id>` | zero the retry counters |
-| POST | `/api/jobs/pause` · `/api/jobs/delete` | bulk by `{ids: []}` |
-| POST | `/api/jobs/<id>/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
-| POST | `/api/jobs/<id>/audio-probe` | runs the yt-dlp `-J` probe for one job, stores + returns its audio tracks |
-| DELETE | `/api/jobs/<id>` | delete one job |
+| POST | `/api/jobs/:id/retry` | re-queue one job (all stages, budgets reset); 404 for an unknown id |
+| POST | `/api/jobs/:id/reset-failures` | zero the per-stage retry counters; 404 for an unknown id |
+| POST | `/api/jobs/pause` | bulk user-pause by `{ids: []}` |
+| DELETE | `/api/jobs` | bulk delete by `{ids: []}` |
+| POST | `/api/jobs/:id/audio-tracks` | per-job audio-track selection: `{tracks:["es",…]}` saves it, `{tracks:null}` returns the job to the global mode |
+| POST | `/api/jobs/:id/audio-probe` | runs the yt-dlp `-J` probe for one job, stores + returns its audio tracks |
+| DELETE | `/api/jobs/:id` | delete one job |
+| POST | `/api/retry/:id` · `/api/failcount/reset/:id` · `/api/jobs/delete` | **legacy aliases** of the canonical routes above — kept on purpose for older dashboards and scripts |
 | GET | `/api/failed` | failed jobs |
 | POST | `/api/failed/requeue` | force-requeue eligible failed jobs (cooldown ignored, permanent errors still skipped) |
 | GET | `/api/reliability` | pause state, kept partials, retryable count, active policy, active downloader engine (`downloader.engine` / `.path` / `.connectionsPerDownload` / `.concurrentFragments` / `.maxBandwidthKBps` / `.autoscaleRampStep`), plus a `resume` block (`resumablePartials` / `interrupted` / `staleClaims`) and a `sweeps` array (`id` / `label` / `cadence` / `detail` / `pending`; `missingFiles.pending` is `null` because that sweep stats every file) |
@@ -437,12 +453,13 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 ### 9.1 Running
 
 ```bash
-bun test                       # everything (~45s)
+bun test                       # everything (~130s — the integration scenarios dominate)
 bun test tests/retry.test.ts   # one file
-bunx tsc --noEmit              # typecheck (tsconfig covers *.ts, src/**, tests/**)
+bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
+bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-224 tests across 15 files. Tests share one process, so any file that touches the
+257 tests across 19 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -460,7 +477,11 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/download-args.test.ts` | downloader-engine selection, aria2c args, bandwidth split, fragment/chunk/buffer flags, watchdog scaling, multi-audio selector/multistream flags |
 | `tests/audio-tracks.test.ts` | track parsing (variant collapse, drc drop, ordering), selection policy incl. per-job override, selector splicing, JSON column round-trips |
 | `tests/autoscale.test.ts` | slot ramp step, backlog/ceiling clamps, idle collapse, disabled mode |
-| `tests/reconcile.test.ts` | `removePartialFiles`, `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
+| `tests/reconcile.test.ts` | `removePartialFiles` (control-file-first order and its `fatal` result), `partialSidecars`, `findPartialFile`, and `cleanOrphanedFiles` control-file handling |
+| `tests/convert.test.ts` | `findConvertedOutput` crash-window adoption: adopts a finished mp3/mp4, never the source itself, empty for unrelated sidecars |
+| `tests/logger.test.ts` | `errorLogPath()` routes test-run logs to the temp dir, never the operator's `error.log` |
+| `tests/disk.test.ts` | `diskUsage()` happy path, the `-1/-1` degraded path, and `checkDiskSpace`'s allow-through when free space is unknown |
+| `tests/web-routes.test.ts` | the `ROUTES` table: canonical per-job routes, the legacy aliases, the `{ok}` envelope, JSON 404 and 405 + `Allow`, trailing-slash collapse |
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
@@ -506,6 +527,14 @@ The yt-dlp mock kills its aria2c child when its own parent dies, so a hard-kille
 engine leaves a realistic interrupted state instead of an orphan finishing the
 download.
 
+**That watchdog is POSIX-only.** Both mocks detect the death by polling
+`process.ppid`, which changes only because POSIX reparents orphans to PID 1.
+Windows keeps the original parent-PID value, so on win32 neither watcher ever
+fires and an orphaned mock runs to completion — the crash-recovery scenario
+("a hard kill mid-download resumes on restart") is only meaningful on POSIX. To
+make it work on Windows, kill the whole process tree from the harness
+(`taskkill /PID <pid> /T /F`) instead of relying on `process.ppid`.
+
 The mock yt-dlp also speaks multi-audio: `--dump-single-json` answers with a
 three-track format list (en original + es/hi dubs, quality variants and `-drc`
 duplicates included, exactly the soup `extractAudioTracks` must clean), and a
@@ -525,6 +554,9 @@ Mock controls (environment variables):
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
 | `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
+| `FAKE_ARIA2C_FAIL_TIMES=N` | fail the first N attempts *inside* aria2c, leaving the `.part` + `.part.aria2` pair |
+| `FAKE_ARIA2C_FAIL_MODE` | `transient` \| `corrupt` (which aria2c-side error message to emit) |
+| `FAKE_ARIA2C_INFLIGHT_MS=N` | hold a transfer open N ms so a hard kill lands mid-flight, with partial + control file on disk |
 
 **When adding an engine behavior, add an integration scenario rather than
 mocking internals** — the mocks are the contract boundary.
@@ -624,6 +656,18 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     method answers 405 instead of binding the segment as an id. Legacy aliases
     (`/api/retry/:id`, `/api/failcount/reset/:id`, `POST /api/jobs/delete`)
     are kept on purpose — older dashboards and scripts bookmark them.
+22. **Never call `statfs` directly — go through `resilience.ts diskUsage()`.**
+    Some Bun builds for Windows do not implement it, so the import is
+    `undefined` and *calling* it throws a `TypeError` **synchronously** — a
+    `.catch()` chained on the call cannot see it, and the whole request 500s
+    (that is how `/api/status` used to blank the dashboard). `diskUsage()`
+    catches the synchronous throw, falls back to PowerShell `Get-PSDrive` on
+    win32, and returns `-1/-1` + an `error` string so callers degrade instead
+    of failing. `tests/disk.test.ts` is the guard.
+23. **The mocks' orphan watchdogs do not work on Windows** (`process.ppid`
+    never changes there). See 9.3 — crash-recovery scenarios that depend on an
+    orphan abandoning its transfer are POSIX-only until the harness kills the
+    process tree itself.
 
 ---
 
@@ -639,10 +683,11 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
 | Support a new site/URL shape | `src/scanner.ts normalizeVideoUrl()` (canonicalization + dedupe) |
+| Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + 100 tests).
+- `bun run check` passes (strict typecheck + the full suite — 257 tests across 19 files).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).
