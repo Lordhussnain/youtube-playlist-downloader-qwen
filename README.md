@@ -193,6 +193,40 @@ not a static list of settings:
 Every count comes from `GET /api/reliability`, which reads the live config (not
 a startup snapshot) and the job table.
 
+### Web dashboard & API
+
+The dashboard (`web_ui.html`, served at `/`) shows live stats, a workers strip
+(what each DL/MD/CV worker is doing right now), the reliability panel, a
+sortable/filterable job table, a per-job detail drawer, failed-job and run-history
+tabs, and the log viewer. It polls only while the tab is visible.
+
+All endpoints answer `{ ok: true|false, … }`, unknown API paths are a JSON 404,
+and a known path with the wrong method is a JSON 405 (+ `Allow`). When
+`webToken` is set, every route requires the token (cookie, `Authorization:
+Bearer`, `X-Web-Token`, or `?token=`).
+
+| Method & path | What it does |
+| --- | --- |
+| `GET /api/ping` | Liveness probe (also answers `HEAD`). |
+| `GET /api/version` | Engine/runtime info (Bun version, platform, uptime). |
+| `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
+| `GET /api/jobs` | The 500 newest jobs. |
+| `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows). |
+| `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). |
+| `POST /api/jobs/:id/reset-failures` | Clear the per-stage failure counters (alias: `POST /api/failcount/reset/:id`). |
+| `POST /api/jobs/:id/audio-tracks` | Save the per-video audio-track selection (`tracks: null` resets). |
+| `POST /api/jobs/:id/audio-probe` | Discover the audio tracks YouTube offers for this video. |
+| `DELETE /api/jobs/:id` | Delete one job row. |
+| `POST /api/jobs/pause` | Bulk user-pause `{ "ids": [...] }`. |
+| `DELETE /api/jobs` | Bulk delete `{ "ids": [...] }` (alias: `POST /api/jobs/delete`). |
+| `POST /api/scan` | Scan/add a playlist or channel `{ "url", "folder?" }`. |
+| `POST /api/queue/purge` | Delete all pending/paused/waiting/failed jobs. |
+| `POST /api/pause` · `POST /api/resume` | Pause/resume the whole engine. |
+| `GET /api/failed` · `POST /api/failed/requeue` | Failed jobs; requeue all eligible (ignores cooldown). |
+| `GET`/`POST /api/settings` | Dashboard-editable settings snapshot / validated patch. |
+| `GET /api/reliability` | Resume + self-healing snapshot (see above). |
+| `GET /api/history?limit=` · `GET /api/logs?type=error\|report&limit=` | Run history; logs. |
+
 The terminal UI carries the same signal: the header line gains a `Res:n` field
 whenever jobs are holding a partial they will resume from, so a paused engine
 reports its resume state without needing the browser open.

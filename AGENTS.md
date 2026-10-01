@@ -93,7 +93,7 @@ src/
   polling.ts     daemon-mode full rescans
   dashboard.ts   TUI rendering
   report.ts      human-readable run report
-  web.ts         Bun.serve dashboard + JSON API + token auth
+  web.ts         Bun.serve dashboard + JSON API (route table) + token auth
   history.ts     heartbeated run_history rows
   lifecycle.ts   worker supervision + graceful shutdown
   engine.ts      orchestration (main): wires everything together
@@ -619,6 +619,11 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     unlinking the source. Deleting first is what made a crash in the
     finalize window look like "file deleted before conversion finished" and
     triggered a full re-download on the next startup sweep.
+21. **API routes live in the `ROUTES` table in `web.ts`.** Static action paths
+    (`/api/jobs/pause`) must be listed before `:param` routes so a wrong
+    method answers 405 instead of binding the segment as an id. Legacy aliases
+    (`/api/retry/:id`, `/api/failcount/reset/:id`, `POST /api/jobs/delete`)
+    are kept on purpose — older dashboards and scripts bookmark them.
 
 ---
 
@@ -628,7 +633,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 | --- | --- |
 | Add a config key | `src/config.ts` (schema + defaults) → `update_config.ts` prompt → test (coverage guard: `tests/config-manager.test.ts`) |
 | Add a failure class | `src/retry.ts` classifier → `src/workers/download.ts` handler branch → unit test |
-| Add an API endpoint | `src/web.ts handleRequest()` (after the auth gate) → `web_ui.html` caller |
+| Add an API endpoint | `src/web.ts` `ROUTES` table (after the auth gate; pattern `:params`, `{ok}` envelope) → `web_ui.html` caller |
 | Add a dashboard field | `src/web.ts` response → `web_ui.html` render function |
 | Change claim semantics | `src/db.ts` claim transactions + `tests/db.test.ts` atomicity tests |
 | Add a sweep | `src/reconcile.ts` (pure-ish, take `Config`) → register interval in `src/engine.ts` |
