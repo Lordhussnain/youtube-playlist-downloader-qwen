@@ -7,14 +7,13 @@
 // the same gate.
 
 import { existsSync, readFileSync } from "node:fs";
-import { statfs } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
 import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
-import { triggerPause, triggerResume } from "./resilience";
+import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
@@ -294,10 +293,15 @@ const ROUTES: Route[] = [
         workers.push({ id: `MD${i}`, type: "metadata", status: workerStatuses.get(`MD${i}`) || "Idle" });
       }
 
-      const diskStats = await statfs(config.outputRoot).catch(() => ({ bavail: 0, blocks: 1, bsize: 1 }));
-      const freeGB = ((diskStats.bavail * diskStats.bsize) / 1024 ** 3).toFixed(1);
-      const totalGB = ((diskStats.blocks * diskStats.bsize) / 1024 ** 3).toFixed(1);
-      const diskPercent = ((diskStats.bavail / diskStats.blocks) * 100).toFixed(0);
+      // Goes through the shared probe: on Windows Bun builds without statfs a
+      // direct call throws synchronously and would 500 this whole endpoint.
+      const disk = await diskUsage(config.outputRoot);
+      const known = disk.freeBytes >= 0;
+      const freeGB = known ? (disk.freeBytes / 1024 ** 3).toFixed(1) : "--";
+      const totalGB = disk.totalBytes > 0 ? (disk.totalBytes / 1024 ** 3).toFixed(1) : "--";
+      const diskPercent =
+        known && disk.totalBytes > 0 ? ((disk.freeBytes / disk.totalBytes) * 100).toFixed(0) : "0";
+      const diskLabel = known ? `${freeGB} GB / ${totalGB} GB` : "unknown";
 
       const memUsage = process.memoryUsage();
       const ramUsedGB = (memUsage.rss / 1024 ** 3).toFixed(2);
@@ -334,7 +338,7 @@ const ROUTES: Route[] = [
         workers,
         isPaused: isPaused(),
         pauseReason: getPauseReason(),
-        diskSpace: { free: `${freeGB} GB / ${totalGB} GB`, percent: parseFloat(diskPercent) },
+        diskSpace: { free: diskLabel, percent: parseFloat(diskPercent) },
         system: {
           cpu: "--",
           cpuPercent: 0,

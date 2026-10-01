@@ -114,40 +114,89 @@ export async function networkMonitor(): Promise<void> {
 // --- Disk space guard --------------------------------------------------------
 let diskCheckWarned = false;
 
+/** Volume sizes in bytes, or -1 when no probe could determine them. */
+export interface DiskUsage {
+  freeBytes: number;
+  totalBytes: number;
+  /** Why every probe failed, when they all did (for the error log). */
+  error?: string;
+}
+
+/**
+ * Free + total bytes for the volume holding `path`.
+ *
+ * statfs first (one syscall, no child process). Some Bun builds on Windows do
+ * not implement it at all — then `statfs` is `undefined` and *calling* it
+ * throws a TypeError synchronously, which a `.catch()` chained on the call can
+ * never see. That is why every caller goes through here rather than calling
+ * statfs directly: this function's `try` catches the synchronous throw too,
+ * and falls back to PowerShell's Get-PSDrive on win32.
+ *
+ * Returns -1/-1 rather than throwing when no probe works, so a machine without
+ * a usable disk probe degrades (no low-disk guard, dashboard shows "unknown")
+ * instead of failing whatever asked.
+ */
+export async function diskUsage(path: string): Promise<DiskUsage> {
+  try {
+    const stats = await statfs(path);
+    return { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+  } catch (e: any) {
+    const fallback = await windowsDiskUsage(path);
+    if (fallback) return fallback;
+    return { freeBytes: -1, totalBytes: -1, error: String(e?.code || e?.message || e) };
+  }
+}
+
+/** Get-PSDrive probe for win32; null when it cannot answer. */
+async function windowsDiskUsage(path: string): Promise<DiskUsage | null> {
+  try {
+    if (process.platform !== "win32") return null;
+    const root = resolve(path); // e.g. D:\Downloads\YT
+    const drive = root.slice(0, 1); // "D"
+    if (!/^[A-Za-z]$/.test(drive)) return null;
+    const proc = Bun.spawn(
+      [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$d = Get-PSDrive -Name '${drive}'; "$($d.Free) $($d.Used)"`,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (code !== 0) return null;
+    const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
+    if (!Number.isFinite(free)) return null;
+    return {
+      freeBytes: free,
+      totalBytes: Number.isFinite(used) ? free + used : -1,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function checkDiskSpace(
   path: string,
   minGB: number,
 ): Promise<{ free: number; ok: boolean }> {
-  try {
-    const stats = await statfs(path);
-    const freeGB = (stats.bavail * stats.bsize) / 1024 ** 3;
-    return { free: freeGB, ok: freeGB > minGB };
-  } catch {
-    // Windows fallback: some Bun builds lack statfs — ask PowerShell instead.
-    try {
-      if (process.platform === "win32") {
-        const root = resolve(path); // e.g. D:\Downloads\YT
-        const drive = root.slice(0, 1); // "D"
-        if (/^[A-Za-z]$/.test(drive)) {
-          const proc = Bun.spawn(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", `(Get-PSDrive -Name '${drive}').Free`],
-            { stdout: "pipe", stderr: "pipe" },
-          );
-          const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-          const freeGB = parseFloat(out.trim()) / 1024 ** 3;
-          if (code === 0 && Number.isFinite(freeGB)) return { free: freeGB, ok: freeGB > minGB };
-        }
-      }
-    } catch {}
+  const usage = await diskUsage(path);
+  if (usage.freeBytes < 0) {
     // Degraded mode: never permanently brick the engine over a failed probe —
     // log once and allow (yt-dlp will still surface a real disk-full error).
     if (!diskCheckWarned) {
       diskCheckWarned = true;
       console.warn("⚠️ Could not determine free disk space — continuing without the low-disk guard.");
-      logError("disk", `statfs/PowerShell probe failed for ${path}; low-disk guard disabled for this run`);
+      logError(
+        "disk",
+        `statfs/PowerShell probe failed for ${path} (${usage.error || "unknown"}); low-disk guard disabled for this run`,
+      );
     }
     return { free: -1, ok: true };
   }
+  const freeGB = usage.freeBytes / 1024 ** 3;
+  return { free: freeGB, ok: freeGB > minGB };
 }
 
 // --- Child-process bookkeeping ----------------------------------------------
