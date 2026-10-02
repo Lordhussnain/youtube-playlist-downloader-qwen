@@ -256,6 +256,12 @@ The dashboard (`web_ui.html`, served at `/`) shows live stats, a workers strip
 sortable/filterable job table, a per-job detail drawer, failed-job and run-history
 tabs, and the log viewer. It polls only while the tab is visible.
 
+The job table filters locally (title, folder, or an exact video id) and renders
+in windows of 100 rows — the rest load as you scroll, and "select all" still
+means every matching row. Keyboard: `/` search, `j`/`k` (or arrows) move,
+`Enter` opens the drawer, `x` toggles selection, `p` pause/resume, `s`
+settings, `r` refresh, `Esc` closes.
+
 All endpoints answer `{ ok: true|false, … }`, unknown API paths are a JSON 404,
 and a known path with the wrong method is a JSON 405 (+ `Allow`). When
 `webToken` is set, every route requires the token (cookie, `Authorization:

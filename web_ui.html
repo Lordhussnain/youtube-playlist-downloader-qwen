@@ -599,6 +599,9 @@
     .jobs-table tbody tr { cursor: pointer; }
     .jobs-table tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
     .jobs-table tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
+    .jobs-table tbody tr.focused td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+    .jobs-table tbody tr.focused { background: rgba(59, 130, 246, 0.08); }
+    .more-rows td { text-align: center; color: var(--text-secondary); font-size: 0.78rem; padding: 12px; }
     .kbd {
       display: inline-block;
       min-width: 18px;
@@ -815,16 +818,18 @@
     <button class="btn btn-success" onclick="refreshData()">🔄 Refresh</button>
     <button class="btn btn-secondary" onclick="openSettings()">⚙️ Settings</button>
     <button class="btn btn-danger" onclick="purgeQueue()">🗑️ Purge Queue</button>
-    <select id="statusFilter" class="search-box" onchange="renderJobs(lastJobs)">
+    <select id="statusFilter" class="search-box" onchange="filterJobs()">
       <option value="all">All statuses</option>
       <option value="downloading">⬇️ Downloading</option>
       <option value="pending">Not started</option>
       <option value="paused">⏸️ Paused</option>
       <option value="waiting_live">Waiting for VOD</option>
+      <option value="converting">🔄 Converting</option>
       <option value="done">✅ Done</option>
       <option value="failed">❌ Failed</option>
+      <option value="pruned">🗑️ Pruned</option>
     </select>
-    <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search jobs... (Press / to focus)" onkeyup="filterJobs()" />
+    <input type="text" class="search-box" id="searchInput" placeholder="🔍 Search title, folder or id... (Press / to focus)" oninput="filterJobs()" />
   </div>
   
   <div class="bulk-actions" id="bulkActions">
@@ -839,6 +844,9 @@
     <span><span class="kbd">s</span> settings</span>
     <span><span class="kbd">p</span> pause / resume</span>
     <span><span class="kbd">r</span> refresh</span>
+    <span><span class="kbd">j</span>/<span class="kbd">k</span> move</span>
+    <span><span class="kbd">Enter</span> details</span>
+    <span><span class="kbd">x</span> select</span>
     <span><span class="kbd">Esc</span> close</span>
   </div>
 
@@ -1045,14 +1053,16 @@
     }
     
     // Selection management
+    // "Select all" means every row matching the current search/filter, not
+    // just the ones the windowed renderer has materialised so far.
+    let lastFiltered = [];
     function toggleSelectAll() {
-      const checkboxes = document.querySelectorAll('.job-checkbox');
       const selectAll = document.getElementById('selectAll').checked;
-      checkboxes.forEach(cb => {
-        cb.checked = selectAll;
-        if (selectAll) selectedJobs.add(cb.dataset.id);
-        else selectedJobs.delete(cb.dataset.id);
-      });
+      for (const job of lastFiltered) {
+        if (selectAll) selectedJobs.add(job.id);
+        else selectedJobs.delete(job.id);
+      }
+      document.querySelectorAll('.job-checkbox').forEach(cb => { cb.checked = selectedJobs.has(cb.dataset.id); });
       updateBulkActions();
     }
     
@@ -1322,14 +1332,28 @@
       showNotification('🔄 Dashboard refreshed', 'success', 2000);
     }
     
+    // Windowed rendering: the API hands over up to 500 rows every 5 s, and
+    // building 500 <tr>s each poll is what made the tab sluggish. Only the
+    // first RENDER_PAGE matching rows are materialised; a sentinel row at the
+    // bottom grows the window when scrolled into view (or clicked).
+    const RENDER_PAGE = 100;
+    let renderLimit = RENDER_PAGE;
+    let moreObserver = null;
+    function showMoreRows() {
+      renderLimit += RENDER_PAGE;
+      renderJobs(lastJobs);
+    }
+
     function renderJobs(jobs) {
       const tbody = document.getElementById('jobsTableBody');
-      const search = document.getElementById('searchInput').value.toLowerCase();
+      const search = document.getElementById('searchInput').value.toLowerCase().trim();
       const statusFilter = (document.getElementById('statusFilter') || {}).value || 'all';
 
       const filtered = jobs.filter(job => {
-        const matchesSearch = job.title?.toLowerCase().includes(search) ||
-          job.folder?.toLowerCase().includes(search);
+        const matchesSearch = !search ||
+          job.title?.toLowerCase().includes(search) ||
+          job.folder?.toLowerCase().includes(search) ||
+          job.id?.toLowerCase() === search;
         const matchesStatus = statusFilter === 'all' || jobStatus(job) === statusFilter;
         return matchesSearch && matchesStatus;
       });
@@ -1351,7 +1375,13 @@
         return;
       }
 
-      tbody.innerHTML = filtered.map(job => {
+      lastFiltered = filtered;
+      const visible = filtered.slice(0, renderLimit);
+      const moreRow = filtered.length > visible.length
+        ? `<tr class="more-rows" id="moreRows"><td colspan="8">Showing ${visible.length} of ${filtered.length} — <a href="#" onclick="showMoreRows(); return false;">show more</a></td></tr>`
+        : '';
+
+      tbody.innerHTML = visible.map(job => {
         const progress = Number(job.progress) || 0;
         const status = jobStatus(job);
         const statusClass = `status-${status}`;
@@ -1412,7 +1442,40 @@
             </td>
           </tr>
         `;
-      }).join('');
+      }).join('') + moreRow;
+
+      // Grow the window automatically as the sentinel scrolls into view.
+      if (moreObserver) { moreObserver.disconnect(); moreObserver = null; }
+      const sentinel = document.getElementById('moreRows');
+      if (sentinel && 'IntersectionObserver' in window) {
+        moreObserver = new IntersectionObserver((entries) => {
+          if (entries.some(e => e.isIntersecting)) showMoreRows();
+        }, { rootMargin: '200px' });
+        moreObserver.observe(sentinel);
+      }
+      applyRowFocus();
+    }
+
+    // Keyboard navigation over the rendered rows: j/k (or arrows) move a
+    // focus marker, Enter opens the drawer, x toggles the row's checkbox.
+    // Focus follows the job id, so it survives re-renders and re-sorts.
+    let focusedJobId = null;
+    function renderedRows() {
+      return Array.from(document.querySelectorAll('#jobsTableBody tr[data-job-id]'));
+    }
+    function applyRowFocus() {
+      for (const tr of renderedRows()) tr.classList.toggle('focused', tr.dataset.jobId === focusedJobId);
+    }
+    function moveRowFocus(delta) {
+      const rows = renderedRows();
+      if (!rows.length) return;
+      let idx = rows.findIndex(tr => tr.dataset.jobId === focusedJobId);
+      idx = idx < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, idx + delta));
+      focusedJobId = rows[idx].dataset.jobId;
+      applyRowFocus();
+      rows[idx].scrollIntoView({ block: 'nearest' });
+      // Reaching the bottom of the window pulls in the next page.
+      if (idx === rows.length - 1 && document.getElementById('moreRows')) showMoreRows();
     }
     
     async function retryJob(id) {
@@ -1608,8 +1671,11 @@
         .replace(/'/g, '&#039;');
     }
     
+    // Search / status filter are applied to the last snapshot locally — no
+    // round-trip per keystroke. Changing them resets the render window.
     function filterJobs() {
-      fetchStatus();
+      renderLimit = RENDER_PAGE;
+      renderJobs(lastJobs);
     }
     
 
@@ -2008,6 +2074,23 @@
         case '/':
           e.preventDefault();
           document.getElementById('searchInput').focus();
+          break;
+        case 'j': case 'ArrowDown':
+          e.preventDefault(); moveRowFocus(1);
+          break;
+        case 'k': case 'ArrowUp':
+          e.preventDefault(); moveRowFocus(-1);
+          break;
+        case 'Enter':
+          if (focusedJobId) { e.preventDefault(); openJobDetailById(focusedJobId); }
+          break;
+        case 'x':
+          if (focusedJobId) {
+            e.preventDefault();
+            toggleJobSelection(focusedJobId);
+            const cb = document.querySelector(`.job-checkbox[data-id="${focusedJobId}"]`);
+            if (cb) cb.checked = selectedJobs.has(focusedJobId);
+          }
           break;
       }
     });
