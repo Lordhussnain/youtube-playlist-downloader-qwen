@@ -19,6 +19,8 @@ import {
   partialSidecars,
   removePartialFiles,
   recordPartialPaths,
+  reapStaleClaims,
+  STALE_CLAIM_THRESHOLDS,
 } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
@@ -265,5 +267,43 @@ describe("cleanOrphanedFiles with aria2c control files", () => {
     await cleanOrphanedFiles(dir, testConfig({ maxRetryAttempts: 5 }));
     expect(existsSync(part)).toBe(false);
     expect(existsSync(`${part}${ARIA2_CONTROL_SUFFIX}`)).toBe(false);
+  });
+});
+
+describe("reapStaleClaims measures progress, not claim age (1.1)", () => {
+  function insertDownloading(id: string, claimedAt: string): void {
+    db.run(
+      `INSERT INTO jobs (id, url, title, output_directory, target_format, download_status, download_claimed_by, download_claimed_at)
+       VALUES (?, ?, ?, ?, 'mp4', 'downloading', 'dl-1', ?)`,
+      [id, `https://www.youtube.com/watch?v=${id}`, `Video ${id}`, "/tmp/out", claimedAt],
+    );
+  }
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString().slice(0, 19).replace("T", " ");
+
+  test("the download window follows maxDownloadMinutes and never drops below 20", () => {
+    expect(STALE_CLAIM_THRESHOLDS(testConfig({ maxDownloadMinutes: 180 })).downloadMinutes).toBe(180);
+    expect(STALE_CLAIM_THRESHOLDS(testConfig({ maxDownloadMinutes: 1 })).downloadMinutes).toBe(20);
+    expect(STALE_CLAIM_THRESHOLDS(testConfig({ maxDownloadMinutes: 1 })).download).toBe("-20 minutes");
+  });
+
+  test("a 25-minute-old claim that is still heart-beating survives; a silent one is reaped", () => {
+    const config = testConfig({ maxDownloadMinutes: 30 });
+    insertDownloading("heartbeat", minutesAgo(25)); // claimed 25 min ago …
+    // … but progress just refreshed download_claimed_at (what updateJobProgress does)
+    db.run(`UPDATE jobs SET download_claimed_at = CURRENT_TIMESTAMP WHERE id = 'heartbeat'`);
+    insertDownloading("silent", minutesAgo(45)); // no heartbeat for 45 min > 30
+    reapStaleClaims(config);
+    const hb = db.query("SELECT download_status FROM jobs WHERE id = 'heartbeat'").get() as any;
+    const si = db.query("SELECT download_status, pause_reason FROM jobs WHERE id = 'silent'").get() as any;
+    expect(hb.download_status).toBe("downloading");
+    expect(si.download_status).toBe("paused");
+    expect(si.pause_reason).toBe("interrupted");
+  });
+
+  test("a claim younger than maxDownloadMinutes is never stolen, even past the old 20-minute floor", () => {
+    insertDownloading("long-transfer", minutesAgo(100)); // 100 min, no heartbeat
+    reapStaleClaims(testConfig({ maxDownloadMinutes: 180 }));
+    const row = db.query("SELECT download_status FROM jobs WHERE id = 'long-transfer'").get() as any;
+    expect(row.download_status).toBe("downloading");
   });
 });

@@ -42,18 +42,22 @@ describe("update_config.ts reports the engine's real thresholds", () => {
   test("reads the stale-claim thresholds from reconcile, not a literal", () => {
     // The manager must not restate the sweep timeouts by hand, or the two
     // drift apart and the terminal lies about when recovery happens.
-    expect(source).toContain("STALE_CLAIM_THRESHOLDS");
-    expect(source).toContain("${STALE_CLAIM_THRESHOLDS.download");
-    expect(source).toContain("${STALE_CLAIM_THRESHOLDS.conversion");
-    expect(source).toContain("${STALE_CLAIM_THRESHOLDS.metadata");
+    expect(source).toContain("STALE_CLAIM_THRESHOLDS(config)");
+    expect(source).toContain("${thresholds.download");
+    expect(source).toContain("${thresholds.conversion");
+    expect(source).toContain("${thresholds.metadata");
   });
 
   test("the imported thresholds are the ones the reaper uses", () => {
-    expect(STALE_CLAIM_THRESHOLDS).toEqual({
-      download: "-20 minutes",
+    // The download window follows maxDownloadMinutes (floored at 20) so the
+    // reaper can never undercut the watchdog.
+    expect(STALE_CLAIM_THRESHOLDS(DEFAULT_CONFIG)).toEqual({
+      download: "-180 minutes",
       conversion: "-3 hours",
       metadata: "-15 minutes",
+      downloadMinutes: 180,
     });
+    expect(STALE_CLAIM_THRESHOLDS({ maxDownloadMinutes: 5 }).download).toBe("-20 minutes");
   });
 
   test("counts resumable partials with the same predicate the engine uses", () => {

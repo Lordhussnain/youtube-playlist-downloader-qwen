@@ -135,7 +135,7 @@ export async function main(): Promise<void> {
   );
 
   networkMonitor();
-  setInterval(reapStaleClaims, 60_000);
+  setInterval(() => reapStaleClaims(getConfig()), 60_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
   setInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.

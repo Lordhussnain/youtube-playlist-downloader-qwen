@@ -46,27 +46,57 @@ export function reconcileCrashedJobs(): void {
   }
 }
 
+/** The floor for the download stale-claim window, in minutes. */
+export const STALE_DOWNLOAD_FLOOR_MINUTES = 20;
+
+export interface StaleClaimThresholds {
+  /** SQLite datetime modifier, e.g. `-180 minutes`. */
+  download: string;
+  conversion: string;
+  metadata: string;
+  /** The download window in minutes (what `download` encodes). */
+  downloadMinutes: number;
+}
+
 /**
  * How long a claim may sit untouched before `reapStaleClaims` treats its owner
- * as dead and re-queues the job. Exported so the dashboard's sweep status
- * reports exactly the same thresholds the sweep itself enforces — if these
- * drift, the UI would promise recovery the engine never performs.
+ * as dead and re-queues the job. Exported so the dashboard's sweep status and
+ * the config manager report exactly the thresholds the sweep enforces — if
+ * these drift, the UI would promise recovery the engine never performs.
+ *
+ * The download window is config-aware: `download_claimed_at` is refreshed on
+ * every progress tick (see `workers/download.ts updateJobProgress`), so the
+ * reaper measures *no progress*, not *claim age* — and the window can never
+ * undercut the watchdog's own ceiling (`maxDownloadMinutes`), which is how a
+ * legitimate 2-hour transfer used to be stolen at the 20-minute mark and
+ * handed to a second yt-dlp writing the same file.
  */
-export const STALE_CLAIM_THRESHOLDS = {
-  download: "-20 minutes",
-  conversion: "-3 hours",
-  metadata: "-15 minutes",
-} as const;
+export function STALE_CLAIM_THRESHOLDS(
+  config: Pick<Config, "maxDownloadMinutes">,
+): StaleClaimThresholds {
+  const minutes = Math.max(
+    STALE_DOWNLOAD_FLOOR_MINUTES,
+    Math.floor(Number.isFinite(config.maxDownloadMinutes) ? config.maxDownloadMinutes : 0),
+  );
+  return {
+    download: `-${minutes} minutes`,
+    conversion: "-3 hours",
+    metadata: "-15 minutes",
+    downloadMinutes: minutes,
+  };
+}
 
 /**
  * Periodic safety net: if a worker process/thread dies mid-job the claim can
- * be left behind. Downloads have a duration-aware watchdog, so any claim older
- * than `STALE_CLAIM_THRESHOLDS.download` is definitely dead → mark
- * paused+interrupted for auto-resume. Conversion and metadata claims past their
- * thresholds are re-queued.
+ * be left behind. Downloads heartbeat their claim on every progress update
+ * and have a duration-aware watchdog, so a claim with no heartbeat for longer
+ * than `STALE_CLAIM_THRESHOLDS(config).download` is definitely dead → mark
+ * paused+interrupted for auto-resume. Conversion and metadata claims past
+ * their thresholds are re-queued.
  */
-export function reapStaleClaims(): void {
+export function reapStaleClaims(config: Pick<Config, "maxDownloadMinutes">): void {
   try {
+    const t = STALE_CLAIM_THRESHOLDS(config);
     // Freeze each in-flight download's `.part` path while the job is still
     // 'downloading' (that is this function's own filter) — otherwise the
     // reclaimed job resumes without a partial and restarts from scratch.
@@ -75,16 +105,16 @@ export function reapStaleClaims(): void {
       `UPDATE jobs SET download_status = 'paused', pause_reason = 'interrupted',
          download_claimed_by = NULL, download_claimed_at = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'downloading'
-         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.download}'))`,
+         AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}'))`,
     );
     const cv = db.run(
       `UPDATE jobs SET conversion_status = 'pending', conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE conversion_status = 'in_progress'
-         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.conversion}'))`,
+         AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}'))`,
     );
     const md = db.run(
       `UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP
-       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '${STALE_CLAIM_THRESHOLDS.metadata}')`,
+       WHERE metadata_status = 'in_progress' AND updated_at < datetime('now', '${t.metadata}')`,
     );
     const total = dl.changes + cv.changes + md.changes;
     if (total > 0) {

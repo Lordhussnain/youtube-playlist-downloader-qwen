@@ -398,7 +398,14 @@ function baseNameOf(job: Job): string {
   return jobBaseFilename(job);
 }
 
-/** Record progress, keeping best_progress as the high-water mark. */
+/**
+ * Record progress, keeping best_progress as the high-water mark.
+ *
+ * Also heartbeats the claim: `download_claimed_at` rides along in the same
+ * (500 ms-throttled) UPDATE, so the stale-claim reaper measures "no progress
+ * for N minutes" rather than "claimed N minutes ago" — a legitimate long
+ * transfer is never stolen from under a live yt-dlp.
+ */
 function updateJobProgress(
   id: string,
   pct: number,
@@ -409,7 +416,8 @@ function updateJobProgress(
   db.run(
     `UPDATE jobs SET progress = ?, speed = ?, eta = ?,
        best_progress = MAX(COALESCE(best_progress, 0), ?),
-       file_size = COALESCE(?, file_size)
+       file_size = COALESCE(?, file_size),
+       download_claimed_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
     [pct, bps, eta, pct, totalBytes, id],
   );

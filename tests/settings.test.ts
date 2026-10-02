@@ -309,9 +309,10 @@ describe("GET /api/reliability — resume + self-healing state", () => {
 
   test("the sweep thresholds match the ones the reaper enforces", async () => {
     // Guards against the dashboard promising recovery the engine never performs.
-    expect(STALE_CLAIM_THRESHOLDS.download).toBe("-20 minutes");
-    expect(STALE_CLAIM_THRESHOLDS.conversion).toBe("-3 hours");
-    expect(STALE_CLAIM_THRESHOLDS.metadata).toBe("-15 minutes");
+    const t = STALE_CLAIM_THRESHOLDS(baseConfig({ maxDownloadMinutes: 90 }));
+    expect(t.download).toBe("-90 minutes");
+    expect(t.conversion).toBe("-3 hours");
+    expect(t.metadata).toBe("-15 minutes");
   });
 });
 

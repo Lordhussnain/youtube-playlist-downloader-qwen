@@ -232,7 +232,7 @@ describe("reapStaleClaims", () => {
       conversion_claimed_by: "cv-1",
       conversion_claimed_at: "2020-01-01 00:00:00",
     });
-    reapStaleClaims();
+    reapStaleClaims(testConfig());
     expect(getJob("stale-dl").download_status).toBe("paused");
     expect(getJob("stale-dl").pause_reason).toBe("interrupted");
     expect(getJob("fresh-dl").download_status).toBe("downloading"); // untouched

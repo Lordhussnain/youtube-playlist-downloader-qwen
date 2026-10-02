@@ -727,7 +727,7 @@ function reliabilityHandler(config: Config): Response {
     .get() as any;
   // What the stale-claim reaper would reclaim right now — same thresholds the
   // sweep enforces (imported, so they cannot drift apart).
-  const t = STALE_CLAIM_THRESHOLDS;
+  const t = STALE_CLAIM_THRESHOLDS(config);
   const staleClaims = db
     .query(
       `SELECT

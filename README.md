@@ -194,9 +194,12 @@ not a static list of settings:
 - **Interrupted** — jobs parked as `paused` + `interrupted`, i.e. the ones the
   crashed-jobs sweep will re-claim and continue rather than restart.
 - **Stale claims** — what the reaper would reclaim right now: claims older than
-  the thresholds in `STALE_CLAIM_THRESHOLDS` (20 min download / 3 h conversion /
-  15 min metadata). The panel imports those constants, so it cannot advertise a
-  timeout the sweep does not enforce.
+  the thresholds from `STALE_CLAIM_THRESHOLDS(config)` — downloads with no
+  progress heartbeat for `max(20, maxDownloadMinutes)` minutes, conversions
+  3 h, metadata 15 min. The panel calls the same function the sweep uses, so
+  it cannot advertise a timeout the sweep does not enforce. (Downloads refresh
+  their claim timestamp on every progress tick, so a long but healthy transfer
+  is never reclaimed from under a live yt-dlp.)
 - **Self-healing sweeps** — the four sweeps with their cadence and a pending
   count. Deleted-files is `startup`-only and stats every recorded file, so its
   count is reported as unknown rather than guessed.
