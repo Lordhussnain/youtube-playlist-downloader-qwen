@@ -9,6 +9,8 @@
 import { cookiesArgs, ytDlp } from "./tools";
 import { ingestItems, type ListingItem } from "./scanner";
 import { logError } from "./logger";
+import { spawnBounded } from "./spawn";
+import { abortController, everyInterval } from "./state";
 import type { Config } from "./config";
 
 const channelIdCache = new Map<string, string>();
@@ -21,15 +23,11 @@ export async function resolveChannelId(channelUrl: string, config: Config): Prom
   if (cached) return cached;
   try {
     // @handle / custom URLs: resolve once via yt-dlp, then cache for the run.
-    const proc = Bun.spawn(
+    const { stdout: out, code, timedOut } = await spawnBounded(
       [ytDlp(), ...cookiesArgs(config), "--flat-playlist", "--playlist-end", "1", "--print", "%(channel_id)s", channelUrl],
-      { stdout: "pipe", stderr: "pipe" },
+      { timeoutMs: 90_000, signal: abortController.signal },
     );
-    const [out, , code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    if (timedOut) logError("rss", `${channelUrl}: channel-id lookup timed out`);
     if (code !== 0) return null;
     const id = out
       .split("\n")
@@ -106,5 +104,5 @@ export function startRssPolling(config: Config): void {
     }
   };
   setTimeout(tick, Math.min(intervalMs, 2 * 60_000));
-  setInterval(tick, intervalMs);
+  everyInterval(tick, intervalMs);
 }

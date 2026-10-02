@@ -33,6 +33,21 @@ export const activeMetadataProcs = new Map<number, Bun.Subprocess>();
 export const abortController = new AbortController();
 export const startTime = Date.now();
 
+/**
+ * setInterval that is cleared when the engine aborts. Every periodic sweep
+ * goes through here so shutdown does not depend on process.exit() to stop
+ * the timers (and tests can abort without leaking intervals).
+ */
+export function everyInterval(fn: () => void, ms: number): ReturnType<typeof setInterval> {
+  const timer = setInterval(fn, ms);
+  if (abortController.signal.aborted) {
+    clearInterval(timer);
+  } else {
+    abortController.signal.addEventListener("abort", () => clearInterval(timer), { once: true });
+  }
+  return timer;
+}
+
 let globalIsPaused = false;
 let pauseReason: string | null = null;
 let isTTY = process.stdout.isTTY;

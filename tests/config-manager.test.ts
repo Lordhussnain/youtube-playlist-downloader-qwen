@@ -67,3 +67,19 @@ describe("update_config.ts reports the engine's real thresholds", () => {
     expect(source).toContain("partial_file_path IS NOT NULL");
   });
 });
+
+describe("3.10 — secrets and the right database", () => {
+  test("View config masks the web token", () => {
+    const view = source.slice(source.indexOf("async function viewConfig"));
+    expect(view).toContain("maskSecrets(config)");
+    expect(view).not.toMatch(/JSON\.stringify\(config,/);
+    expect(source).toContain('webToken: config.webToken ? "(set — hidden)" : ""');
+  });
+
+  test("the resume panel reads archive.db, not yt-dlp's text archive", () => {
+    const fn = source.slice(source.indexOf("function readResumeState"), source.indexOf("ro.close()"));
+    expect(fn).toContain("new Database(JOB_DB_PATH");
+    expect(fn).not.toContain("new Database(config.archiveFile");
+    expect(source).toContain('const JOB_DB_PATH = "archive.db"');
+  });
+});

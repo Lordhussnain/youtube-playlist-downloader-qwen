@@ -8,6 +8,7 @@
 import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os from "node:os";
+import { spawnBounded } from "./spawn";
 
 // aria2c is optional: when present it becomes the multi-connection downloader
 // (yt-dlp --downloader aria2c), and when absent the engine transparently uses
@@ -95,26 +96,18 @@ export function resetCookiesBaseline(): void {
 /** Cheap validity probe for a cookies file (one yt-dlp metadata call). */
 export async function validateCookies(cookiesFile: string): Promise<boolean> {
   if (!existsSync(cookiesFile)) return false;
-  const proc = Bun.spawn(
+  // Bounded: this runs from a web request (/api/cookies/validate) and from
+  // the startup check — neither may hang on a dead socket.
+  const { stderr, code } = await spawnBounded(
     [ytDlp(), "--cookies", cookiesFile, "--no-warnings", "--dump-single-json", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-    { stdout: "pipe", stderr: "pipe" },
+    { timeoutMs: 90_000 },
   );
-  const [, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
   return code === 0 && !stderr.toLowerCase().includes("login required");
 }
 
 async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; version: string }> {
   try {
-    const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe" });
-    const [out, err, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    const { stdout: out, stderr: err, code } = await spawnBounded([bin, ...args], { timeoutMs: 30_000 });
     const firstLine = (out || err || "")
       .split("\n")
       .map((l) => l.trim())

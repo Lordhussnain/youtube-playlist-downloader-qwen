@@ -10,7 +10,9 @@ import { join } from "node:path";
 import { db, existingJobIds, peekNextIndex, setNextIndex } from "./db";
 import { cookiesArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
-import { stats } from "./state";
+import { spawnBounded, tailLines } from "./spawn";
+import { abortController, stats } from "./state";
+import { logError } from "./logger";
 import type { Config } from "./config";
 
 export interface ListingItem {
@@ -49,26 +51,85 @@ export async function getPlaylistItems(url: string, config: Config): Promise<Lis
     "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s",
     url,
   ];
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-  const [out, , code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (code !== 0) return [];
-  return out
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((line) => {
-      const [playlist, id, title, duration] = line.split("|||");
-      return {
-        title: (title || "video").trim(),
-        id: (id || "").trim(),
-        playlist: (playlist || "playlist").trim(),
-        duration: parseFloat(duration ?? "NaN"),
+  // Bounded: a flat listing of even a very large channel finishes in minutes;
+  // one stuck on a dead socket used to hang the scan request forever.
+  const { stdout: out, stderr, code, timedOut } = await spawnBounded(args, {
+    timeoutMs: LISTING_TIMEOUT_MS,
+    signal: abortController.signal,
+  });
+  if (timedOut) {
+    logError("scan", `${url}: listing timed out after ${LISTING_TIMEOUT_MS / 60000} min`);
+    return [];
+  }
+  if (code !== 0) {
+    logError("scan", `${url}: yt-dlp exited ${code}: ${tailLines(stderr)}`);
+    return [];
+  }
+  return parseListing(out);
+}
+
+/**
+ * Longest folder name we will create. A 1,000-character playlist title made
+ * `mkdir` throw ENAMETOOLONG and abort the WHOLE ingest, not one item; 120 is
+ * well inside every filesystem's 255-byte component limit even for
+ * multi-byte scripts, and leaves room under Windows' MAX_PATH for the files.
+ */
+export const MAX_FOLDER_CHARS = 120;
+/** Stored title cap; filenames are budgeted separately by fitBaseFilename. */
+export const MAX_TITLE_CHARS = 300;
+
+/** 15 minutes: generous for a 10k-video flat listing, finite for a hang. */
+export const LISTING_TIMEOUT_MS = 15 * 60 * 1000;
+
+const LISTING_SEP = "|||";
+/** What a YouTube video id looks like; anything else is a parse artefact. */
+export const VIDEO_ID_RE = /^[\w-]{6,}$/;
+/** Id characters only (any length) — the ingest-time guard. */
+const SAFE_ID_RE = /^[\w-]+$/;
+
+/**
+ * Parse the `--print "%(playlist_title)s|||%(id)s|||%(title)s|||%(duration)s"`
+ * output. Field-count aware: a title containing the separator used to shift
+ * every field, so the TITLE fragment became the primary key and a
+ * permanently-failing job was inserted under a bogus id. The id is the only
+ * field with a fixed shape, so it anchors the split: playlist is everything
+ * before it, duration is the last field, title is whatever sits between.
+ * Lines whose id does not validate are skipped and logged.
+ */
+export function parseListing(out: string): ListingItem[] {
+  const items: ListingItem[] = [];
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    const parts = line.split(LISTING_SEP);
+    let item: ListingItem | null = null;
+    if (parts.length === 4 && VIDEO_ID_RE.test(parts[1].trim())) {
+      item = {
+        playlist: parts[0].trim() || "playlist",
+        id: parts[1].trim(),
+        title: (parts[2].trim() || "video").slice(0, MAX_TITLE_CHARS),
+        duration: parseFloat(parts[3] ?? "NaN"),
       };
-    })
-    .filter((i) => i.id);
+    } else if (parts.length > 4) {
+      // A separator inside the playlist title or the video title. The id is
+      // the first field (after the first) that validates and is followed by
+      // at least two more fields.
+      const idx = parts.findIndex((p, i) => i >= 1 && i <= parts.length - 3 && VIDEO_ID_RE.test(p.trim()));
+      if (idx > 0) {
+        item = {
+          playlist: parts.slice(0, idx).join(LISTING_SEP).trim() || "playlist",
+          id: parts[idx].trim(),
+          title: (parts.slice(idx + 1, -1).join(LISTING_SEP).trim() || "video").slice(0, MAX_TITLE_CHARS),
+          duration: parseFloat(parts[parts.length - 1] ?? "NaN"),
+        };
+      }
+    }
+    if (!item) {
+      logError("scan", `skipped unparseable listing line: ${line.slice(0, 200)}`);
+      continue;
+    }
+    items.push(item);
+  }
+  return items;
 }
 
 /**
@@ -81,7 +142,7 @@ export async function ingestItems(
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
-  const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos");
+  const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos").slice(0, MAX_FOLDER_CHARS).trim() || "playlist";
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");
@@ -112,6 +173,16 @@ export async function ingestItems(
     );
     const seenInBatch = new Set<string>();
     for (const item of batch) {
+      if (!SAFE_ID_RE.test(item.id)) {
+        // Defence in depth for the RSS path and any future lister: a bogus id
+        // (a title fragment with spaces, an empty string) becomes a
+        // permanently-failing row, so refuse it here too. Shape only — the
+        // length check lives in parseListing, where yt-dlp's output is parsed.
+        logError("ingest", `skipped item with invalid video id ${JSON.stringify(item.id).slice(0, 80)}`);
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
       if (known.has(item.id) || seenInBatch.has(item.id)) {
         // A job parked as waiting_live (stream was live at download time) may
         // have ended by now — any fresh listing that still contains it requeues

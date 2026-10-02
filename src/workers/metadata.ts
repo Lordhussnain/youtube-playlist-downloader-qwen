@@ -28,7 +28,15 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
       await Bun.sleep(2000);
       continue;
     }
-    const job = claimMetadataJob(workerId);
+    let job: ReturnType<typeof claimMetadataJob>;
+    try {
+      job = claimMetadataJob(workerId);
+    } catch (e: any) {
+      // SQLITE_BUSY on the claim is transient: keep the loop (and the slot).
+      logError("metadata", `${workerId}: claim failed (${e?.code || e?.message || e}) — retrying`);
+      await Bun.sleep(1000);
+      continue;
+    }
     if (!job) {
       await Bun.sleep(2000);
       continue;

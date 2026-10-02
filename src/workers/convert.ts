@@ -16,6 +16,7 @@ import { abortController, getConfig, isPaused, stats, workerStatuses } from "../
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
+import { spawnBounded } from "../spawn";
 import type { Config } from "../config";
 
 /** Run ffmpeg with a hard timeout so a wedged encode can never pin a worker. */
@@ -50,15 +51,11 @@ export async function runFfmpeg(
  */
 export async function countAudioStreams(path: string): Promise<number> {
   try {
-    const proc = Bun.spawn([ffmpeg(), "-hide_banner", "-i", path], {
-      stdout: "pipe",
-      stderr: "pipe",
+    // ffmpeg -i with no output exits immediately after the banner; a minute
+    // only matters when the file sits on a wedged network mount.
+    const { stdout: out, stderr: err } = await spawnBounded([ffmpeg(), "-hide_banner", "-i", path], {
+      timeoutMs: 60_000,
     });
-    const [out, err] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
     const banner = `${out}\n${err}`;
     return (banner.match(/^\s*Stream #\d+:\d+[^\n]*:\s*Audio/gm) || []).length;
   } catch {
@@ -77,7 +74,15 @@ export async function converterWorker(id: number, config: Config): Promise<void>
       await Bun.sleep(2000);
       continue;
     }
-    const job = claimConvertJob(workerId);
+    let job: ReturnType<typeof claimConvertJob>;
+    try {
+      job = claimConvertJob(workerId);
+    } catch (e: any) {
+      // SQLITE_BUSY on the claim is transient: keep the loop (and the slot).
+      logError("conversion", `${workerId}: claim failed (${e?.code || e?.message || e}) — retrying`);
+      await Bun.sleep(1000);
+      continue;
+    }
     if (!job) {
       await Bun.sleep(2000);
       continue;

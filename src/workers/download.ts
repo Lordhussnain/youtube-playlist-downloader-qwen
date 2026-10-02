@@ -50,14 +50,24 @@ export async function downloadWorker(id: number, config: Config): Promise<void> 
       continue;
     }
 
-    const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
-    if (!disk.ok) {
-      triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
-      await Bun.sleep(10000);
+    // Everything before the per-job try/catch used to be unguarded: a
+    // SQLITE_BUSY from the claim (or a statfs error) threw out of the loop,
+    // the supervisor restarted the worker 5 s later, and in the meantime the
+    // slot sat idle. Treat these as transient and keep looping.
+    let job: ReturnType<typeof claimDownloadJob>;
+    try {
+      const disk = await checkDiskSpace(config.outputRoot, config.minFreeSpaceGB);
+      if (!disk.ok) {
+        triggerPause(`LOW_DISK_SPACE (${disk.free.toFixed(1)}GB < ${config.minFreeSpaceGB}GB)`);
+        await Bun.sleep(10000);
+        continue;
+      }
+      job = claimDownloadJob(workerId);
+    } catch (e: any) {
+      logError("download", `${workerId}: claim failed (${e?.code || e?.message || e}) — retrying`);
+      await Bun.sleep(1000);
       continue;
     }
-
-    const job = claimDownloadJob(workerId);
     if (!job) {
       await Bun.sleep(500);
       continue;

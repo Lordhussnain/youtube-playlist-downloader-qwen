@@ -7,7 +7,7 @@
 
 import { scanAndIngest } from "./scanner";
 import { logError } from "./logger";
-import { abortController, getConfig } from "./state";
+import { everyInterval, getConfig } from "./state";
 import type { Config } from "./config";
 
 /** One rescan pass over every configured channel/playlist. Never throws. */
@@ -63,13 +63,11 @@ export function startAutonomousPolling(config: Config): ReturnType<typeof setInt
   const intervalMs = config.rescanIntervalHours * 60 * 60 * 1000;
   console.log(`🤖 Daemon mode: full rescan every ${config.rescanIntervalHours}h.`);
   const tick = createRescanTick();
-  const timer = setInterval(() => {
+  return everyInterval(() => {
     // A change to rescanIntervalHours takes effect on the next tick: the
     // interval itself is fixed at startup, but a tick whose interval shrank
     // to 0 simply becomes a no-op rather than a surprise scan.
     if (getConfig().rescanIntervalHours <= 0) return;
     void tick();
   }, intervalMs);
-  abortController.signal.addEventListener("abort", () => clearInterval(timer), { once: true });
-  return timer;
 }

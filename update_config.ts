@@ -146,10 +146,17 @@ async function manageUrlList(
  * way the config manager must stay usable, so every failure returns null and
  * the caller simply omits the live figures.
  */
-function readResumeState(config: Config): { resumable: number; interrupted: number } | null {
+/** Where the engine keeps job state (see engine.ts). */
+const JOB_DB_PATH = "archive.db";
+
+function readResumeState(_config: Config): { resumable: number; interrupted: number } | null {
   try {
-    if (!config.archiveFile || !existsSync(config.archiveFile)) return null;
-    const ro = new Database(config.archiveFile, { readonly: true });
+    // The job state lives in archive.db (engine.ts initDatabase("archive.db")),
+    // NOT in config.archiveFile — that is yt-dlp's plain-text download
+    // archive. Opening the text file as SQLite always failed, so this panel
+    // printed "(No archive database yet)" forever.
+    if (!existsSync(JOB_DB_PATH)) return null;
+    const ro = new Database(JOB_DB_PATH, { readonly: true });
     try {
       const row = ro
         .query(
@@ -483,10 +490,16 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
 }
 
 // ---- View Config -----------------------------------------------------------
+/** A copy of the config with secret-bearing fields masked for display. */
+export function maskSecrets(config: Config): Record<string, unknown> {
+  return { ...config, webToken: config.webToken ? "(set — hidden)" : "" };
+}
+
 async function viewConfig(config: Config) {
   console.clear();
   console.log("📄 Current Configuration\n");
-  console.log(JSON.stringify(config, null, 2));
+  // Never print the token: the view is often pasted into bug reports.
+  console.log(JSON.stringify(maskSecrets(config), null, 2));
   await ask("\nPress Enter to return to menu...");
 }
 

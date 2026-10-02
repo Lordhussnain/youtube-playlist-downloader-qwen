@@ -16,6 +16,10 @@
 // spawns yt-dlp (one `-J` metadata call per job).
 
 import { cookiesArgs, ytDlp } from "./tools";
+import { spawnBounded, tailLines } from "./spawn";
+
+/** Metadata-only call with its own socket timeout and retries; 2 min is ample. */
+export const PROBE_TIMEOUT_MS = 2 * 60 * 1000;
 import type { MultiAudioMode } from "./config";
 
 export interface AudioTrack {
@@ -181,7 +185,7 @@ export async function probeAudioTracks(
   url: string,
   config: { cookiesFile: string },
 ): Promise<AudioTrack[]> {
-  const proc = Bun.spawn(
+  const { stdout: out, stderr, code, timedOut } = await spawnBounded(
     [
       ytDlp(),
       url,
@@ -196,22 +200,11 @@ export async function probeAudioTracks(
       "--extractor-retries",
       "3",
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { timeoutMs: PROBE_TIMEOUT_MS },
   );
-  const [out, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
+  if (timedOut) throw new Error(`audio-track probe timed out after ${PROBE_TIMEOUT_MS / 1000}s`);
   if (code !== 0) {
-    throw new Error(
-      stderr
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .slice(-3)
-        .join(" ") || `yt-dlp exited with code ${code}`,
-    );
+    throw new Error(tailLines(stderr) || `yt-dlp exited with code ${code}`);
   }
   let info: unknown;
   try {

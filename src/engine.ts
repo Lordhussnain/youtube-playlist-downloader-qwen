@@ -30,16 +30,25 @@ import { downloadWorker } from "./workers/download";
 import { metadataWorker } from "./workers/metadata";
 import { converterWorker } from "./workers/convert";
 import { logError } from "./logger";
-import { getConfig, setConfig } from "./state";
+import { everyInterval, getConfig, setConfig } from "./state";
 
 // The web server handle, assigned in main() and stopped during shutdown.
 let webServer: { stop: (closeActive?: boolean) => void } | null = null;
 
 export async function main(): Promise<void> {
-  process.on("SIGINT", () => handleShutdown("SIGINT", webServer));
-  process.on("SIGTERM", () => handleShutdown("SIGTERM", webServer));
+  // handleShutdown must never be a floating promise: a throw inside it (a
+  // failed DB write while persisting state) used to be an unhandled rejection
+  // with the process half stopped. On failure, log and exit non-zero.
+  const shutdown = (sig: string) =>
+    handleShutdown(sig, webServer).catch((e: any) => {
+      logError("shutdown", `${sig}: ${e?.stack || e}`);
+      console.error("❌ Shutdown failed:", e?.message || e);
+      process.exit(1);
+    });
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
   // Windows: Ctrl+Break / console close events surface as SIGBREAK.
-  process.on("SIGBREAK", () => handleShutdown("SIGBREAK", webServer));
+  process.on("SIGBREAK", () => void shutdown("SIGBREAK"));
   process.on("unhandledRejection", (reason) => {
     logError("process", `unhandledRejection: ${reason instanceof Error ? reason.stack || String(reason) : String(reason)}`);
   });
@@ -94,7 +103,7 @@ export async function main(): Promise<void> {
   // Run history: row created now, heartbeated so hard kills still leave data.
   startRunHistory();
   setTimeout(heartbeatRunHistory, 10_000);
-  setInterval(heartbeatRunHistory, 60_000);
+  everyInterval(heartbeatRunHistory, 60_000);
   // Ensure the output root exists — otherwise statfs fails, the disk check
   // reports 0 GB free, and the engine falsely pauses with LOW_DISK_SPACE.
   await mkdir(config.outputRoot, { recursive: true });
@@ -134,14 +143,16 @@ export async function main(): Promise<void> {
     `Web UI: http://${uiHost}:${config.webPort}${config.webToken ? "  (token required)" : ""}${config.webBind === "0.0.0.0" ? "  — listening on ALL interfaces" : ""}`,
   );
 
-  networkMonitor();
-  setInterval(() => reapStaleClaims(getConfig()), 60_000);
+  // Supervised like a worker: if the monitor loop ever throws it is restarted
+  // instead of silently leaving the engine with no connectivity watchdog.
+  supervise("network-monitor", networkMonitor);
+  everyInterval(() => reapStaleClaims(getConfig()), 60_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
-  setInterval(autoscaleTick, 15_000);
+  everyInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.
-  setInterval(() => requeueFailedJobs(getConfig()), 60_000);
+  everyInterval(() => requeueFailedJobs(getConfig()), 60_000);
   // Cookies sweep: notice cookies.txt appearing / changing / vanishing mid-run.
-  setInterval(() => cookiesWatch(getConfig()), 60_000);
+  everyInterval(() => cookiesWatch(getConfig()), 60_000);
   // Cheap new-upload watcher (no-op when rssEnabled=false or no channels).
   startRssPolling(config);
 
@@ -159,6 +170,6 @@ export async function main(): Promise<void> {
 
   if (config.daemonMode) startAutonomousPolling(config);
 
-  setInterval(renderDashboard, 2000);
+  everyInterval(renderDashboard, 2000);
   console.log("🚀 Engine started. Resilient, autonomous, proxy-free.");
 }
