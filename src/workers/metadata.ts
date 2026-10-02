@@ -49,20 +49,21 @@ export async function metadataWorker(id: number, config: Config): Promise<void> 
   }
 }
 
-async function runMetadataJob(job: Job, config: Config, id: number): Promise<void> {
-  updateMetadataWorkerLine(id, `📎 Metadata | ${job.title}`, config);
-
-  if (!job.file_path || !existsSync(job.file_path)) {
-    throw new Error("Downloaded file missing — cannot fetch metadata");
-  }
-
+/**
+ * The yt-dlp argv (without argv[0]) for a sidecar pass. Pure — exported for
+ * tests: which sidecars are requested, the `--convert-subs` format, and that
+ * everything lands next to the media file under the same basename.
+ */
+export function buildMetadataArgs(
+  job: Pick<Job, "url" | "file_path" | "want_subtitles" | "want_thumbnail" | "want_description">,
+  config: Pick<Config, "cookiesFile" | "subtitleFormat" | "writeInfoJson">,
+): string[] {
   // Write sidecars next to the downloaded file using the same basename.
-  const mediaDir = dirname(job.file_path);
-  const mediaBase = basename(job.file_path).replace(/\.[^.]+$/, "");
+  const mediaDir = dirname(job.file_path!);
+  const mediaBase = basename(job.file_path!).replace(/\.[^.]+$/, "");
   const outTemplate = join(mediaDir, `${mediaBase}.%(ext)s`);
 
   const args = [
-    ytDlp(),
     job.url,
     ...cookiesArgs(config),
     "--skip-download",
@@ -84,6 +85,19 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
   if (job.want_thumbnail) args.push("--write-thumbnail", "--convert-thumbnails", "jpg");
   if (job.want_description) args.push("--write-description");
   if (config.writeInfoJson) args.push("--write-info-json");
+  return args;
+}
+
+async function runMetadataJob(job: Job, config: Config, id: number): Promise<void> {
+  updateMetadataWorkerLine(id, `📎 Metadata | ${job.title}`, config);
+
+  if (!job.file_path || !existsSync(job.file_path)) {
+    throw new Error("Downloaded file missing — cannot fetch metadata");
+  }
+
+  const mediaDir = dirname(job.file_path);
+  const mediaBase = basename(job.file_path).replace(/\.[^.]+$/, "");
+  const args = [ytDlp(), ...buildMetadataArgs(job, config)];
 
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 10 * 60 * 1000);

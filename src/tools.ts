@@ -120,20 +120,27 @@ async function probeBinary(bin: string, args: string[]): Promise<{ ok: boolean; 
 
 // Candidate search order: explicit config path → PATH → app folder → folder of
 // the compiled exe → common Windows package-manager shims.
-function toolCandidates(cfgPath: string, posixNames: string[], winNames: string[]): string[] {
+export function toolCandidates(
+  cfgPath: string,
+  posixNames: string[],
+  winNames: string[],
+  env: { platform?: NodeJS.Platform; cwd?: string; execPath?: string; home?: string; vars?: Record<string, string | undefined> } = {},
+): string[] {
   const cands: string[] = [];
   if (cfgPath && cfgPath.trim()) cands.push(cfgPath.trim());
-  const cwd = process.cwd();
-  const exeDir = dirname(process.execPath);
+  const cwd = env.cwd ?? process.cwd();
+  const exeDir = dirname(env.execPath ?? process.execPath);
+  const platform = env.platform ?? process.platform;
+  const vars = env.vars ?? process.env;
   for (const n of posixNames) {
     cands.push(n); // bare name → PATH lookup
     cands.push(join(cwd, n)); // next to config.json / working dir
     cands.push(join(exeDir, n)); // next to the compiled archive.exe
   }
-  if (process.platform === "win32") {
-    const home = os.homedir();
-    const progData = process.env.ProgramData || "C:\\ProgramData";
-    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+  if (platform === "win32") {
+    const home = env.home ?? os.homedir();
+    const progData = vars.ProgramData || "C:\\ProgramData";
+    const localAppData = vars.LOCALAPPDATA || join(home, "AppData", "Local");
     for (const n of winNames) {
       cands.push(
         join(cwd, n),

@@ -506,7 +506,7 @@ CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
 same three steps on Ubuntu and Windows — the suite compiles its mocks per
 platform, so both must stay green.
 
-~350 tests across 26 files. Tests share one process, so any file that touches the
+~395 tests across 30 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -751,7 +751,7 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 ## 12. Definition of done
 
 - `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
-  `check:ui` script gate, and the full suite — ~350 tests across 26 files).
+  `check:ui` script gate, and the full suite — ~395 tests across 30 files).
   CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.

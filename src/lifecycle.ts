@@ -73,16 +73,27 @@ export async function handleShutdown(sig: string, webServer: { stop: (closeActiv
 }
 
 /** Restart crashed worker loops with a short backoff instead of dying silently. */
-export function supervise(name: string, fn: () => Promise<void>): void {
+export function supervise(
+  name: string,
+  fn: () => Promise<void>,
+  opts: { restartDelayMs?: number; signal?: AbortSignal; onRestart?: (name: string) => void } = {},
+): void {
+  const delay = opts.restartDelayMs ?? 5000;
+  const signal = opts.signal ?? abortController.signal;
   fn()
     .catch((err) => {
       logError("worker", `${name} crashed: ${err?.stack || err}`);
       console.error(`❌ Worker ${name} crashed:`, err?.message || err);
     })
     .finally(() => {
-      if (!abortController.signal.aborted) {
-        console.log(`♻️ Restarting ${name} in 5s...`);
-        setTimeout(() => supervise(name, fn), 5000);
+      // A loop that returned normally is restarted too: the worker loops only
+      // exit on abort, so a clean return before that is still "stopped early".
+      if (!signal.aborted) {
+        console.log(`♻️ Restarting ${name} in ${Math.round(delay / 1000)}s...`);
+        opts.onRestart?.(name);
+        setTimeout(() => {
+          if (!signal.aborted) supervise(name, fn, opts);
+        }, delay);
       }
     });
 }

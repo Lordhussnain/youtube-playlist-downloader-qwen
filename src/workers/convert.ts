@@ -253,46 +253,71 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
     throw new Error(`Source file missing: ${sourcePath || "(null)"}`);
   }
   let finalPath = sourcePath;
-  if (wantsMp3 && !sourcePath.endsWith(".mp3")) {
-    // Audio archive: encode to the target .mp3 instead of leaving the
-    // source container (webm/m4a) untouched.
-    const mp3Path = sourcePath.replace(/\.[^.]+$/, ".mp3");
-    const res = await runFfmpeg(
-      ["-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", mp3Path],
-      60 * 60 * 1000,
-    );
+  const plan = planConversion(sourcePath, targetFmt, wantsMp3);
+  if (plan) {
+    if (plan.kind === "remux") {
+      // Multi-audio archives land as MKV holding every selected track. MP4
+      // cannot carry them without re-encoding each dub, so a file with more
+      // than one audio stream is kept exactly as yt-dlp muxed it.
+      const audioStreams = await countAudioStreams(sourcePath);
+      if (audioStreams >= 2) {
+        updateConvertWorkerLine(id, `🎧 Remuxing ${audioStreams} audio tracks | ${job.title}`, config);
+      }
+    }
+    const res = await runFfmpeg(plan.args, plan.timeoutMs);
     if (res.code !== 0) {
       throw new Error(
-        `FFmpeg mp3 encode ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
+        `FFmpeg ${plan.label} ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
       );
     }
-    finalPath = mp3Path;
-    db.run(`UPDATE jobs SET file_path = ? WHERE id = ?`, [finalPath, job.id]);
-    await deleteConvertedSource(job, config, workerId, sourcePath);
-  } else if (!wantsMp3 && !sourcePath.endsWith(`.${targetFmt}`)) {
-    // Multi-audio archives land as MKV holding every selected track. MP4
-    // cannot carry them without re-encoding each dub, so a file with more
-    // than one audio stream is kept exactly as yt-dlp muxed it.
-    const audioStreams = await countAudioStreams(sourcePath);
-    if (audioStreams >= 2) {
-      updateConvertWorkerLine(id, `🎧 Remuxing ${audioStreams} audio tracks | ${job.title}`, config);
-    }
-    const targetPath = sourcePath.replace(/\.[^.]+$/, `.${targetFmt}`);
-    const ffmpegArgs =
-      targetFmt === "mp4"
-        ? ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", targetPath]
-        : ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "copy", targetPath];
-    const res = await runFfmpeg(ffmpegArgs, 30 * 60 * 1000);
-    if (res.code !== 0) {
-      throw new Error(
-        `FFmpeg remux to .${targetFmt} ${res.timedOut ? "timed out" : "failed"}: ${res.stderr.split("\n").filter((l) => l.trim()).slice(-2).join(" ")}`,
-      );
-    }
-    finalPath = targetPath;
+    finalPath = plan.outputPath;
     db.run(`UPDATE jobs SET file_path = ? WHERE id = ?`, [finalPath, job.id]);
     await deleteConvertedSource(job, config, workerId, sourcePath);
   }
   await finalizeConversion(job, config, id, workerId, finalPath);
+}
+
+export interface ConversionPlan {
+  kind: "encode-mp3" | "remux";
+  /** Human label for error messages ("mp3 encode", "remux to .mkv"). */
+  label: string;
+  outputPath: string;
+  /** ffmpeg argv (without argv[0]). */
+  args: string[];
+  timeoutMs: number;
+}
+
+/**
+ * What ffmpeg should do for this source/target pair — or null when the file
+ * is already in the target container and nothing needs to run. Pure;
+ * exported for tests (the mp4 / mkv / webm / m4a / mp3 branches).
+ *
+ *   • mp3 target: audio-only encode of the first audio stream (libmp3lame q2)
+ *   • mp4 target: copy video, transcode audio to AAC (webm/opus cannot ride
+ *     in mp4), +faststart for streaming
+ *   • any other container (mkv/webm/m4a…): pure stream copy — every audio
+ *     track is kept, which is what multi-audio archives rely on
+ */
+export function planConversion(sourcePath: string, targetFmt: string, wantsMp3: boolean): ConversionPlan | null {
+  const fmt = (targetFmt || "mp4").toLowerCase();
+  if (wantsMp3) {
+    if (sourcePath.endsWith(".mp3")) return null;
+    const outputPath = sourcePath.replace(/\.[^.]+$/, ".mp3");
+    return {
+      kind: "encode-mp3",
+      label: "mp3 encode",
+      outputPath,
+      args: ["-y", "-i", sourcePath, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2", outputPath],
+      timeoutMs: 60 * 60 * 1000,
+    };
+  }
+  if (sourcePath.endsWith(`.${fmt}`)) return null;
+  const outputPath = sourcePath.replace(/\.[^.]+$/, `.${fmt}`);
+  const args =
+    fmt === "mp4"
+      ? ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", outputPath]
+      : ["-y", "-i", sourcePath, "-map", "0:v:0?", "-map", "0:a?", "-map_metadata", "0", "-c:v", "copy", "-c:a", "copy", outputPath];
+  return { kind: "remux", label: `remux to .${fmt}`, outputPath, args, timeoutMs: 30 * 60 * 1000 };
 }
 
 /**
