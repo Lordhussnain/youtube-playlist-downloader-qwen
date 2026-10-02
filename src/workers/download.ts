@@ -14,7 +14,7 @@ import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
-import { computeBackoffMs, isDownloaderArgsError, isTransientDownloadError } from "../retry";
+import { computeBackoffMs, decideFailureOutcome } from "../retry";
 import { buildDownloadPlan, jobBaseFilename } from "../download-args";
 import {
   parseSelectionJson,
@@ -299,60 +299,74 @@ export async function runSpawnedDownload(
  *   • retry budget spent               → park as failed for the sweep
  */
 async function handleDownloadFailure(id: number, job: Job, config: Config, err: any): Promise<void> {
-  if (isPaused()) {
-    parkPaused(job);
-    updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
-    return;
-  }
-  // A per-job user pause outranks every failure class below: the operator
-  // asked for this video to stop, so it parks (partial kept) instead of being
-  // written back to 'pending' by the transient branch.
-  if (userPauseRequested(job.id)) {
-    parkPaused(job, "user");
-    updateWorkerLine(id, `⏸️ Paused by user | ${job.title}`, config);
-    return;
-  }
-
+  // Thin applier: gather context → decideFailureOutcome() (pure, table-tested
+  // in tests/retry.test.ts) → perform the I/O the outcome asks for. No
+  // policy lives here; add new failure classes in retry.ts.
   const errMsg = String(err?.message || err);
-  const lower = errMsg.toLowerCase();
   const base = baseNameOf(job);
+  const { retryCount, bestProgress, progress } = readProgressState(job.id);
+  const partial =
+    job.partial_file_path && existsSync(job.partial_file_path)
+      ? job.partial_file_path
+      : await findPartialFile(job.output_directory, base);
 
-  // Signature challenge broke (yt-dlp extractor changed) — self-heal by
-  // updating yt-dlp, then retry immediately with a clean budget.
-  if (lower.includes("signature") || lower.includes("unable to extract")) {
-    console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
-    const outcome = await selfUpdateYtDlp(id);
-    resetForRetry(job.id);
-    updateWorkerLine(id, `🔄 yt-dlp self-update ${outcome}, retrying... | ${job.title}`, config);
-    return;
-  }
+  const outcome = decideFailureOutcome({
+    error: errMsg,
+    isPaused: isPaused(),
+    userPaused: userPauseRequested(job.id),
+    retryCount,
+    retryCap: perVideoCap(config),
+    resumeCount: job.resume_count || 0,
+    maxResume: config.maxResumeAttempts,
+    progress,
+    bestProgress,
+    hasPartial: !!partial,
+  });
 
-  // aria2c rejected the command line (exit 28 + the option's help block): a
-  // global misconfiguration, not a video problem. Retrying videos cannot fix
-  // it — every job would fail identically until the circuit breaker trips —
-  // so park this job and pause the engine with an actionable reason.
-  if (isDownloaderArgsError(errMsg)) {
-    logError(
-      "download",
-      `${job.id} ${job.title}: aria2c rejected the downloader arguments (exit 28). ` +
-        `Check connectionsPerDownload/minSplitSize. ${errMsg.slice(0, 300)}`,
-    );
-    parkPaused(job);
-    triggerPause(`BAD_DOWNLOADER_ARGS (${errMsg.slice(0, 120)})`);
-    updateWorkerLine(id, `⚙️ aria2c rejected downloader args — paused | ${job.title}`, config);
-    return;
-  }
+  switch (outcome.kind) {
+    case "park": {
+      parkPaused(job, outcome.pauseReason);
+      updateWorkerLine(id, `⏸️ ${outcome.pauseReason === "user" ? "Paused by user" : "Paused"} | ${job.title}`, config);
+      return;
+    }
 
-  // Corrupt/incomplete partial: delete the .part file so yt-dlp restarts that
-  // transfer — but only after the resume budget is spent. Until then we keep
-  // the partial and let --continue resume from it.
-  if (lower.includes("unable to resume") || lower.includes("incomplete") || lower.includes("corrupt")) {
-    const resumeCount = (job.resume_count || 0) + 1;
-    const partial =
-      job.partial_file_path && existsSync(job.partial_file_path)
-        ? job.partial_file_path
-        : await findPartialFile(job.output_directory, base);
-    if (resumeCount >= Math.max(1, config.maxResumeAttempts) || !partial) {
+    case "self-update": {
+      // Signature challenge broke (yt-dlp extractor changed) — self-heal by
+      // updating yt-dlp, then retry immediately with a clean budget.
+      console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
+      const result = await selfUpdateYtDlp(id);
+      resetForRetry(job.id);
+      updateWorkerLine(id, `🔄 yt-dlp self-update ${result}, retrying... | ${job.title}`, config);
+      return;
+    }
+
+    case "bad-args": {
+      // aria2c rejected the command line: a global misconfiguration, not a
+      // video problem. Park this job and pause the engine with an actionable
+      // reason instead of burning every retry budget in the playlist.
+      logError(
+        "download",
+        `${job.id} ${job.title}: aria2c rejected the downloader arguments (exit 28). ` +
+          `Check connectionsPerDownload/minSplitSize. ${errMsg.slice(0, 300)}`,
+      );
+      parkPaused(job);
+      triggerPause(`BAD_DOWNLOADER_ARGS (${errMsg.slice(0, 120)})`);
+      updateWorkerLine(id, `⚙️ aria2c rejected downloader args — paused | ${job.title}`, config);
+      return;
+    }
+
+    case "resume": {
+      // Keep the partial, count the resume attempt, and try again shortly.
+      db.run(
+        `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [outcome.resumeCount, errMsg.slice(0, 500), job.id],
+      );
+      updateWorkerLine(id, `⏳ Resuming (attempt ${outcome.resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
+      await Bun.sleep(computeBackoffMs(outcome.backoffAttempt, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
+      return;
+    }
+
+    case "restart-fresh": {
       // Budget spent (or nothing to resume): throw the partial away and
       // restart this video from scratch. The aria2c control file goes first —
       // stranding it makes aria2c refuse to restart (see removePartialFiles).
@@ -378,74 +392,56 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
       updateWorkerLine(id, `🗑️ Restarting from scratch | ${job.title}`, config);
       return;
     }
-    // Keep the partial, count the resume attempt, and try again shortly.
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', resume_count = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [resumeCount, errMsg.slice(0, 500), job.id],
-    );
-    updateWorkerLine(id, `⏳ Resuming (attempt ${resumeCount}/${config.maxResumeAttempts}) | ${job.title}`, config);
-    await Bun.sleep(computeBackoffMs(resumeCount, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds));
-    return;
-  }
 
-  // --download-archive recorded the id but our copy is gone (deleted by
-  // hand, moved, or the folder was cleaned). Scrub the id from the archive
-  // so yt-dlp will actually download it on the retry.
-  if (lower.includes("output file could not be located")) {
-    removeFromArchive(config.archiveFile, job.id);
-    resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
-    updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
-    return;
-  }
+    case "archive-scrub": {
+      // --download-archive recorded the id but our copy is gone. Scrub the id
+      // so yt-dlp will actually download it on the retry.
+      removeFromArchive(config.archiveFile, job.id);
+      resetForRetry(job.id, { incrementRetry: true, clearPartial: true });
+      updateWorkerLine(id, `Re-downloading (archive entry scrubbed) | ${job.title}`, config);
+      return;
+    }
 
-  // archiveLiveStreams mode: yt-dlp refused the job because the stream is
-  // live right now. Park it until the next full rescan or a manual retry —
-  // scans flip waiting_live jobs back to pending once a VOD exists.
-  if (lower.includes("does not pass filter") || lower.includes("is live") || lower.includes("live event")) {
-    db.run(
-      `UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [errMsg.slice(0, 500), job.id],
-    );
-    updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
-    return;
-  }
+    case "wait-live": {
+      // Park until the next full rescan or a manual retry — scans flip
+      // waiting_live jobs back to pending once a VOD exists.
+      db.run(
+        `UPDATE jobs SET download_status = 'waiting_live', download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [errMsg.slice(0, 500), job.id],
+      );
+      updateWorkerLine(id, `Live now — waiting for VOD | ${job.title}`, config);
+      return;
+    }
 
-  // Transient failure: remember where the .part file is so the next attempt
-  // can resume from it, then requeue with exponential backoff.
-  if (isTransientDownloadError(errMsg)) {
-    const partial = await findPartialFile(job.output_directory, base);
-    const { retryCount, bestProgress, progress } = readProgressState(job.id);
-    // The retry budget only shrinks when the video makes no forward progress:
-    // a flaky connection that keeps advancing is forgiven, a video stuck at
-    // the same percentage eventually exhausts its budget.
-    const nextRetry = progress > bestProgress ? retryCount : retryCount + 1;
-    db.run(
-      `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, partial_file_path = ?,
-         download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [nextRetry, Math.max(bestProgress, progress), partial || null, errMsg.slice(0, 500), job.id],
-    );
-    const backoff = computeBackoffMs(nextRetry, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
-    updateWorkerLine(id, `🌐 Transient error, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
-    await Bun.sleep(backoff);
-    return;
-  }
+    case "transient": {
+      // Remember where the .part is so the next attempt resumes from it.
+      db.run(
+        `UPDATE jobs SET download_status = 'pending', retry_count = ?, best_progress = ?, partial_file_path = ?,
+           download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [outcome.retryCount, outcome.bestProgress, partial || null, errMsg.slice(0, 500), job.id],
+      );
+      const backoff = computeBackoffMs(outcome.backoffAttempt, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);
+      updateWorkerLine(id, `🌐 Transient error, retrying in ${Math.round(backoff / 1000)}s | ${job.title}`, config);
+      await Bun.sleep(backoff);
+      return;
+    }
 
-  // Permanent or unknown error: spend the retry budget, then park as failed
-  // for the periodic sweep (which skips permanent errors entirely).
-  const { retryCount } = readProgressState(job.id);
-  const cap = perVideoCap(config);
-  const newStatus = retryCount + 1 >= cap ? "failed" : "pending";
-  const partial = newStatus === "failed" ? null : await findPartialFile(job.output_directory, base);
-  db.run(
-    `UPDATE jobs SET download_status = ?, retry_count = ?, partial_file_path = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [newStatus, retryCount + 1, partial, errMsg.slice(0, 500), job.id],
-  );
-  if (newStatus === "failed") {
-    stats.failed++;
-    logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
-    notePipelineFailure("dl", config);
+    case "permanent": {
+      // Spend the retry budget, then park as failed for the periodic sweep
+      // (which skips permanent errors entirely).
+      db.run(
+        `UPDATE jobs SET download_status = ?, retry_count = ?, partial_file_path = ?, download_claimed_by = NULL, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [outcome.status, outcome.retryCount, outcome.status === "failed" ? null : partial || null, errMsg.slice(0, 500), job.id],
+      );
+      if (outcome.tripBreaker) {
+        stats.failed++;
+        logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
+        notePipelineFailure("dl", config);
+      }
+      updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
+      return;
+    }
   }
-  updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
 }
 
 // --- yt-dlp self-update -------------------------------------------------------

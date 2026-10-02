@@ -284,8 +284,9 @@ re-queues a failed sidecar pass on an already-converted job.
 | Download watchdog | `retry.ts computeDownloadTimeoutMs()` | 3× duration + 5 min, clamped to config min/max; unknown duration → min |
 | Transient vs permanent errors | `retry.ts isTransientDownloadError / isPermanentDownloadError` | permanent = private/removed/age-gated/geo-blocked/404/410/copyright |
 | Bad downloader arguments | `retry.ts isDownloaderArgsError` → pause in `workers/download.ts` | aria2c exit 28 + option help block; parks the job, pauses the engine (`BAD_DOWNLOADER_ARGS`) |
-| Retry-budget forgiveness | `workers/download.ts handleDownloadFailure()` | `retry_count` only increments when `progress <= best_progress` |
-| Resume budget | `workers/download.ts` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded |
+| Failure outcome (the whole policy) | `retry.ts decideFailureOutcome(ctx)` | pure, table-tested; `workers/download.ts handleDownloadFailure()` is only the applier (gathers context, performs the I/O the outcome asks for) |
+| Retry-budget forgiveness | `retry.ts decideFailureOutcome()` transient branch | `retry_count` only increments when `progress <= best_progress` |
+| Resume budget | `retry.ts decideFailureOutcome()` corrupt branch | `.part` kept until `resume_count >= maxResumeAttempts`, then discarded (`restart-fresh`) |
 | Partial-file bookkeeping | `workers/download.ts` + `reconcile.ts findPartialFile()` | recorded on failure, cleared on success |
 | Partial-path freeze | `reconcile.ts recordJobPartial() / recordPartialPaths()` | records the on-disk `.part` before a job stops being `downloading`, so a paused/interrupted job really resumes instead of restarting |
 | Pause bookkeeping | `workers/download.ts parkPaused()` | parks an in-flight job as `paused` **and** freezes its partial path |
@@ -300,13 +301,20 @@ re-queues a failed sidecar pass on an already-converted job.
 | Failed-job sweep | `reconcile.ts requeueFailedJobs()` | cooldown + per-video cap + permanent-error skip; `ignoreCooldown` for the UI button |
 | Partial-file cleanup | `reconcile.ts cleanOrphanedFiles()` | keeps resume-able partials, deletes exhausted (>cap) and day-old orphans |
 | Archive scrubbing | `archive.ts removeFromArchive()` | needed whenever a file disappears, else yt-dlp skips it forever |
-| Signature self-heal | `workers/download.ts` | auto-runs `yt-dlp -U` and retries with a clean budget |
+| Signature self-heal | `retry.ts decideFailureOutcome()` → `workers/download.ts selfUpdateYtDlp()` | single-flight `yt-dlp -U` (120 s cap, registered in `activeProcs` under a negative key), then retries with a clean budget |
+| Sweep error registry | `reconcile.ts recordSweepError() / sweepError()` | every sweep's last swallowed failure, shown as `sweeps[].error` on `/api/reliability` and a red pill in the dashboard |
+| Bounded probes | `spawn.ts spawnBounded()` | every run-to-completion child (listing, channel-id, audio probe, cookie check, binary probe, ffmpeg stream count) has a deadline and is SIGKILLed on it |
+| Abort-scoped timers | `state.ts everyInterval()` | every periodic sweep clears itself when the engine aborts |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
 
-**Adding a new failure class:** extend the classifiers in `retry.ts` (pure,
-unit-tested), then handle it in `workers/download.ts handleDownloadFailure()`
-in the right precedence order: signature → downloader-args → corrupt →
-archive-scrub → live → transient → permanent/budget.
+**Adding a new failure class:** add a classifier in `retry.ts` (pure), insert
+it into `decideFailureOutcome()` at the right precedence — pause (global, then
+per-job user hold) → signature → downloader-args → corrupt → archive-scrub →
+live → transient → permanent/budget — with a new `FailureOutcome` variant, add
+the row to the table in `tests/retry.test.ts`, and then give the variant a
+`case` in `workers/download.ts handleDownloadFailure()`. The applier must stay
+policy-free: if you find yourself writing an `if` on the error message there,
+it belongs in `retry.ts`.
 
 The **downloader-args** class (`retry.ts isDownloaderArgsError`, aria2c exit 28
 + the option's help block) is a global misconfiguration, not a video problem:
@@ -731,7 +739,7 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 | Task | Where |
 | --- | --- |
 | Add a config key | `src/config.ts` (schema + defaults) → `update_config.ts` prompt → test (coverage guard: `tests/config-manager.test.ts`) |
-| Add a failure class | `src/retry.ts` classifier → `src/workers/download.ts` handler branch → unit test |
+| Add a failure class | `src/retry.ts` classifier + `decideFailureOutcome()` branch + table row in `tests/retry.test.ts` → `case` in `src/workers/download.ts handleDownloadFailure()` |
 | Add an API endpoint | `src/web.ts` `ROUTES` table (after the auth gate; pattern `:params`, `{ok}` envelope) → `web_ui.html` caller |
 | Add a dashboard field | `src/web.ts` response → `web_ui.html` render function |
 | Change claim semantics | `src/db.ts` claim transactions + `tests/db.test.ts` atomicity tests |

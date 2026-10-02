@@ -126,3 +126,121 @@ export function isDownloaderArgsError(message: string | null | undefined): boole
     m.includes("possible values:")
   );
 }
+
+// --- Failure outcome decision ---------------------------------------------------
+// The whole "what happens to a failed download" policy, as one pure function.
+// workers/download.ts handleDownloadFailure() gathers the context (DB state,
+// whether a partial exists on disk), calls this, and applies the outcome —
+// it holds no policy of its own. Precedence, top to bottom:
+//
+//   pause (global, then per-job user hold) → signature → downloader-args →
+//   corrupt (resume budget) → archive-scrub → live → transient → permanent/budget
+
+export interface FailureContext {
+  /** The error message (String(err.message || err)). */
+  error: string;
+  /** Global engine pause is in effect. */
+  isPaused: boolean;
+  /** The dashboard asked for THIS job to pause while it was in flight. */
+  userPaused: boolean;
+  /** jobs.retry_count as it is now. */
+  retryCount: number;
+  /** perVideoCap(config): min(maxRetryAttempts, maxFailuresPerVideo). */
+  retryCap: number;
+  /** jobs.resume_count as it is now. */
+  resumeCount: number;
+  /** config.maxResumeAttempts. */
+  maxResume: number;
+  /** jobs.progress / jobs.best_progress (percent). */
+  progress: number;
+  bestProgress: number;
+  /** A resumable partial exists on disk for this job. */
+  hasPartial: boolean;
+}
+
+export type FailureOutcome =
+  /** Park as 'paused' (reason null → auto-resumable, "user" → held). */
+  | { kind: "park"; pauseReason: "user" | null }
+  /** Run `yt-dlp -U`, then re-queue with a clean budget. */
+  | { kind: "self-update" }
+  /** Park the job and pause the engine (BAD_DOWNLOADER_ARGS). */
+  | { kind: "bad-args" }
+  /** Corrupt partial, budget left: keep it, bump resume_count, back off. */
+  | { kind: "resume"; resumeCount: number; backoffAttempt: number }
+  /** Corrupt partial, budget spent (or none on disk): discard and restart. */
+  | { kind: "restart-fresh"; retryDelta: 1; discardPartial: true }
+  /** Archive says downloaded but the file is gone: scrub + restart. */
+  | { kind: "archive-scrub"; retryDelta: 1; discardPartial: true; scrubArchive: true }
+  /** Stream is live now: park as waiting_live until a rescan or manual retry. */
+  | { kind: "wait-live" }
+  /** Transient: re-queue, forgiving the budget when progress advanced. */
+  | { kind: "transient"; retryCount: number; bestProgress: number; backoffAttempt: number }
+  /** Permanent/unknown: spend budget; 'failed' trips the breaker. */
+  | { kind: "permanent"; status: "failed" | "pending"; retryCount: number; tripBreaker: boolean };
+
+/** Message classes that mean the partial itself is unusable. */
+export function isCorruptPartialError(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("unable to resume") || m.includes("incomplete") || m.includes("corrupt");
+}
+
+/** yt-dlp's extractor broke (signature / "unable to extract"). */
+export function isSignatureError(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("signature") || m.includes("unable to extract");
+}
+
+/** --download-archive has the id but our copy is gone. */
+export function isArchiveMismatchError(message: string): boolean {
+  return message.toLowerCase().includes("output file could not be located");
+}
+
+/** archiveLiveStreams: the video is a live stream right now. */
+export function isLiveNowError(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("does not pass filter") || m.includes("is live") || m.includes("live event");
+}
+
+export function decideFailureOutcome(ctx: FailureContext): FailureOutcome {
+  if (ctx.isPaused) return { kind: "park", pauseReason: null };
+  // A per-job user pause outranks every failure class: the operator asked for
+  // this video to stop, so it parks (partial kept) instead of being written
+  // back to 'pending' by the transient branch.
+  if (ctx.userPaused) return { kind: "park", pauseReason: "user" };
+
+  const msg = ctx.error;
+  if (isSignatureError(msg)) return { kind: "self-update" };
+  if (isDownloaderArgsError(msg)) return { kind: "bad-args" };
+
+  if (isCorruptPartialError(msg)) {
+    const resumeCount = (ctx.resumeCount || 0) + 1;
+    if (resumeCount >= Math.max(1, ctx.maxResume) || !ctx.hasPartial) {
+      return { kind: "restart-fresh", retryDelta: 1, discardPartial: true };
+    }
+    return { kind: "resume", resumeCount, backoffAttempt: resumeCount };
+  }
+
+  if (isArchiveMismatchError(msg)) {
+    return { kind: "archive-scrub", retryDelta: 1, discardPartial: true, scrubArchive: true };
+  }
+
+  if (isLiveNowError(msg)) return { kind: "wait-live" };
+
+  if (isTransientDownloadError(msg)) {
+    // The retry budget only shrinks when the video makes no forward progress:
+    // a flaky connection that keeps advancing is forgiven, a video stuck at
+    // the same percentage eventually exhausts its budget.
+    const forgiven = ctx.progress > ctx.bestProgress;
+    const retryCount = forgiven ? ctx.retryCount : ctx.retryCount + 1;
+    return {
+      kind: "transient",
+      retryCount,
+      bestProgress: Math.max(ctx.bestProgress, ctx.progress),
+      backoffAttempt: retryCount,
+    };
+  }
+
+  const retryCount = ctx.retryCount + 1;
+  const status = retryCount >= Math.max(1, ctx.retryCap) ? "failed" : "pending";
+  return { kind: "permanent", status, retryCount, tripBreaker: status === "failed" };
+}

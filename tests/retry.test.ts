@@ -134,3 +134,71 @@ describe("isDownloaderArgsError", () => {
     expect(isDownloaderArgsError(null)).toBe(false);
   });
 });
+
+// --- decideFailureOutcome — the whole failure policy as one table -------------
+import { decideFailureOutcome, type FailureContext, type FailureOutcome } from "../src/retry";
+
+const baseCtx = (o: Partial<FailureContext> = {}): FailureContext => ({
+  error: "something odd happened",
+  isPaused: false,
+  userPaused: false,
+  retryCount: 0,
+  retryCap: 3,
+  resumeCount: 0,
+  maxResume: 3,
+  progress: 0,
+  bestProgress: 0,
+  hasPartial: false,
+  ...o,
+});
+
+describe("decideFailureOutcome (plan 4.1)", () => {
+  const table: Array<[string, Partial<FailureContext>, Partial<FailureOutcome> & { kind: FailureOutcome["kind"] }]> = [
+    // precedence: pause first, whatever the error says
+    ["global pause parks (auto-resumable) even on a permanent error", { isPaused: true, error: "Video unavailable" }, { kind: "park", pauseReason: null }],
+    ["per-job user pause parks with the user hold", { userPaused: true, error: "timeout" }, { kind: "park", pauseReason: "user" }],
+    ["global pause outranks the user hold", { isPaused: true, userPaused: true }, { kind: "park", pauseReason: null }],
+    // signature
+    ["signature → self-update", { error: "ERROR: Unable to extract nsig function" }, { kind: "self-update" }],
+    ["'signature' keyword → self-update", { error: "signature solving failed" }, { kind: "self-update" }],
+    // downloader args
+    ["aria2c exit 28 → bad-args", { error: "aria2c exited with code 28 Possible Values: 1-16" }, { kind: "bad-args" }],
+    ["signature outranks bad-args", { error: "unable to extract; exited with code 28" }, { kind: "self-update" }],
+    // corrupt partial / resume budget
+    ["corrupt with budget and a partial → resume #1", { error: "unable to resume", hasPartial: true }, { kind: "resume", resumeCount: 1, backoffAttempt: 1 }],
+    ["corrupt, second time → resume #2", { error: "corrupt", hasPartial: true, resumeCount: 1 }, { kind: "resume", resumeCount: 2 }],
+    ["corrupt, budget spent → restart-fresh", { error: "incomplete", hasPartial: true, resumeCount: 2, maxResume: 3 }, { kind: "restart-fresh", retryDelta: 1, discardPartial: true }],
+    ["corrupt with no partial on disk → restart-fresh immediately", { error: "unable to resume", hasPartial: false }, { kind: "restart-fresh" }],
+    ["maxResume 0 is treated as 1", { error: "corrupt", hasPartial: true, maxResume: 0 }, { kind: "restart-fresh" }],
+    // archive mismatch
+    ["archive says done but the file is gone → scrub", { error: "output file could not be located" }, { kind: "archive-scrub", scrubArchive: true, discardPartial: true, retryDelta: 1 }],
+    // live
+    ["live now → wait-live", { error: "video does not pass filter (!is_live)" }, { kind: "wait-live" }],
+    ["'is live' → wait-live", { error: "This video is live" }, { kind: "wait-live" }],
+    // transient
+    ["transient with no progress spends the budget", { error: "HTTP Error 503", retryCount: 1, progress: 10, bestProgress: 10 }, { kind: "transient", retryCount: 2, bestProgress: 10, backoffAttempt: 2 }],
+    ["transient that advanced is forgiven", { error: "connection reset", retryCount: 1, progress: 40, bestProgress: 10 }, { kind: "transient", retryCount: 1, bestProgress: 40, backoffAttempt: 1 }],
+    ["transient never flips to failed by itself", { error: "timed out", retryCount: 99, retryCap: 3 }, { kind: "transient", retryCount: 100 }],
+    // permanent / unknown
+    ["permanent with budget left → pending, no breaker", { error: "Video unavailable", retryCount: 0, retryCap: 3 }, { kind: "permanent", status: "pending", retryCount: 1, tripBreaker: false }],
+    ["permanent that exhausts the cap → failed + breaker", { error: "Private video", retryCount: 2, retryCap: 3 }, { kind: "permanent", status: "failed", retryCount: 3, tripBreaker: true }],
+    ["unknown error is treated like permanent", { error: "???", retryCount: 0, retryCap: 1 }, { kind: "permanent", status: "failed", retryCount: 1, tripBreaker: true }],
+    ["retryCap 0 still fails on the first strike", { error: "???", retryCap: 0 }, { kind: "permanent", status: "failed" }],
+  ];
+
+  for (const [name, ctx, expected] of table) {
+    test(name, () => {
+      const out = decideFailureOutcome(baseCtx(ctx)) as any;
+      for (const [k, v] of Object.entries(expected)) expect(out[k]).toEqual(v);
+    });
+  }
+
+  test("is pure: the same context always yields the same outcome and does not mutate it", () => {
+    const ctx = baseCtx({ error: "timeout", retryCount: 1, progress: 5, bestProgress: 5 });
+    const snapshot = JSON.stringify(ctx);
+    const a = decideFailureOutcome(ctx);
+    const b = decideFailureOutcome(ctx);
+    expect(a).toEqual(b);
+    expect(JSON.stringify(ctx)).toBe(snapshot);
+  });
+});
