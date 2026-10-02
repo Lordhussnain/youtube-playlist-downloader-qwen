@@ -16,6 +16,7 @@
 //   FAKE_HANG=1             hang forever (watchdog test)
 //   FAKE_PROGRESS_THEN_HANG=1  write a .part, report progress once, then hang
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
+//   FAKE_INCLUDE_SHORT=1    add a 45-second "short" as a 4th listing entry
 
 import { rename } from "node:fs/promises";
 
@@ -91,6 +92,7 @@ if (flag("--flat-playlist")) {
     "Mock Playlist|||mockvid002|||Second Mock Video|||640",
     "Mock Playlist|||mockvid003|||Third Mock Video (long)|||7320",
   ];
+  if (process.env.FAKE_INCLUDE_SHORT === "1") lines.push("Mock Playlist|||mockshort1|||A Short #shorts|||45");
   console.log(lines.join("\n"));
   process.exit(0);
 }

@@ -1156,3 +1156,96 @@ describe("integration: aria2c option validation", () => {
     }
   }, TEST_TIMEOUT);
 });
+
+// ---------------------------------------------------------------------------
+describe("integration: resilience policies (plan 4.5)", () => {
+  test("the circuit breaker pauses the engine after N consecutive download failures", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(
+      dir,
+      4101,
+      BASE_CONFIG(4101, {
+        maxRetryAttempts: 1,
+        maxFailuresPerVideo: 1,
+        maxFailures: 2, // breaker trips on the second consecutive failure
+        requeueFailedAfterMinutes: 0,
+      }),
+      { FAKE_FAIL_TIMES: "999", FAKE_FAIL_MODE: "permanent", FAKE_DELAY_MS: "20" },
+    );
+    try {
+      await waitFor("engine pauses with TOO_MANY_FAILURES", async () => {
+        const st = await engine.api("/api/status");
+        return st.isPaused === true && String(st.pauseReason || "").includes("TOO_MANY_FAILURES");
+      }, 40_000);
+      // The reason is actionable (carries the limit), and resume clears it.
+      const st = await engine.api("/api/status");
+      expect(st.pauseReason).toContain("limit 2");
+      const resumed = await engine.api("/api/resume", { method: "POST" });
+      expect(resumed.ok).toBe(true);
+      await waitFor("engine running again", async () => (await engine.api("/api/status")).isPaused === false, 10_000);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("secondary storage: converted media + sidecars move to the NAS path, SHA-256 recorded", async () => {
+    const dir = await makeRunDir();
+    const nas = join(dir, "nas");
+    const engine = await startEngine(
+      dir,
+      4102,
+      BASE_CONFIG(4102, { videoQuality: "audio", secondaryStoragePath: nas, verifyIntegrity: true }),
+    );
+    try {
+      const jobs = await waitForAllJobs(
+        engine,
+        (j) => j.download_status === "downloaded" && j.metadata_status === "done" && j.conversion_status === "done",
+      );
+      const nasDir = join(nas, "Mock Playlist");
+      for (const job of jobs) {
+        expect(job.file_path!.startsWith(nasDir)).toBe(true);
+        expect(existsSync(job.file_path!)).toBe(true);
+        // The recorded hash is the file's real SHA-256.
+        const detail = await engine.api(`/api/jobs/${job.id}`);
+        const bytes = new Uint8Array(await Bun.file(job.file_path!).arrayBuffer());
+        const sha = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+        expect(detail.job.integrity).toBe(sha);
+      }
+      // Sidecars travelled with the media; nothing of theirs is left behind.
+      const moved = await readdir(nasDir);
+      expect(moved.some((f) => f.endsWith(".en.vtt"))).toBe(true);
+      expect(moved.some((f) => f.endsWith(".info.json"))).toBe(true);
+      const left = await readdir(join(dir, "downloads", "Mock Playlist")).catch(() => [] as string[]);
+      expect(left.filter((f) => f.endsWith(".mp3") || f.endsWith(".en.vtt") || f.endsWith(".info.json"))).toEqual([]);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("shorts are skipped by default and ingested when downloadShorts is on", async () => {
+    const dirA = await makeRunDir();
+    const skip = await startEngine(dirA, 4103, BASE_CONFIG(4103, { skipShorts: true, downloadShorts: false }), {
+      FAKE_INCLUDE_SHORT: "1",
+    });
+    try {
+      await waitFor("3 jobs ingested (short skipped)", async () => (await getJobs(skip)).length === 3);
+      await Bun.sleep(500);
+      const jobs = await getJobs(skip);
+      expect(jobs.length).toBe(3);
+      expect(jobs.some((j) => j.id === "mockshort1")).toBe(false);
+    } finally {
+      await skip.stop();
+    }
+
+    const dirB = await makeRunDir();
+    const keep = await startEngine(dirB, 4104, BASE_CONFIG(4104, { skipShorts: true, downloadShorts: true }), {
+      FAKE_INCLUDE_SHORT: "1",
+    });
+    try {
+      await waitFor("4 jobs ingested (short kept)", async () => (await getJobs(keep)).length === 4);
+      expect((await getJobs(keep)).some((j) => j.id === "mockshort1")).toBe(true);
+    } finally {
+      await keep.stop();
+    }
+  }, TEST_TIMEOUT);
+});
