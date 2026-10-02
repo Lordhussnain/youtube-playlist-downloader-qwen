@@ -66,6 +66,28 @@ go through `diskUsage()`), and Windows does not reparent orphans, so the mocks'
 
 ---
 
+### 2.1 Repo hygiene (what must never be committed)
+
+`.gitignore` excludes everything the engine creates at runtime and everything
+that is a credential or a media artifact:
+
+| Pattern | Why |
+| --- | --- |
+| `cookies.txt` | a live browser session — treat like a password |
+| `archive.db`, `archive.db-wal`, `archive.db-shm`, `downloaded_videos.txt` | per-machine job state |
+| `downloads/`, `*.mp4 *.mkv *.webm *.mp3 *.m4a`, `*.part *.ytdl *.aria2`, `test_*.mp4` | media and partials (tens of MB each) |
+| `node_modules/`, `dist/`, `*.log` | installs, builds, rotating logs |
+| `/get`, `/get.*` | stray `curl`/`wget` output |
+
+`bun.lock` is the only lockfile — do not add a `package-lock.json`. The mock
+tools in `tests/mocks/` must stay executable (`100755`); a Windows checkout
+that drops the bit makes every integration scenario fail with "yt-dlp: not
+found" (the harness re-applies `chmod +x` on POSIX as a belt-and-braces).
+
+Auth posture (documented, not changed): an empty `webToken` means an open
+API; combined with `webBind: "0.0.0.0"` that is open to the LAN. The config
+manager warns about the combination and masks the token in **View**.
+
 ## 3. Architecture
 
 ```

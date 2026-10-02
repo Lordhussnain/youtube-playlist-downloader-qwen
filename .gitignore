@@ -1,4 +1,34 @@
+# Dependencies
 node_modules/
+
+# Logs
 *.log
 .DS_Store
 
+# Build output
+dist/
+
+# Runtime state (cwd-relative, created by the engine)
+archive.db
+archive.db-wal
+archive.db-shm
+downloaded_videos.txt
+downloads/
+
+# Credentials — never commit a browser cookie jar
+cookies.txt
+
+# Media / download artifacts
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.part
+*.ytdl
+*.aria2
+test_*.mp4
+
+# Stray curl/wget output
+/get
+/get.*

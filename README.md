@@ -67,26 +67,36 @@ bun install
 
 ## Configuration
 
-Define your batch in `config.json`:
+`config.json` is created from defaults on the first run (`bun run start`) and
+edited interactively with `bun run config`. It is a flat object validated by the
+Zod schema in `src/config.ts`; any key you omit falls back to its default, so a
+minimal file looks like:
 
 ```json
 {
-  "output_directory": "D:/Downloads/YT",
-  "target_format": "mp4",
-  "download": {
-    "subtitles": true,
-    "thumbnail": true,
-    "description": false
-  },
-  "links": [
-    "https://www.youtube.com/playlist?list=...",
-    "https://www.youtube.com/watch?v=..."
-  ]
+  "playlists": ["https://www.youtube.com/playlist?list=..."],
+  "channels": ["https://www.youtube.com/@somechannel"],
+  "channelPlaylists": [],
+  "outputRoot": "D:/Downloads/YT",
+  "videoQuality": "1080p",
+  "targetFormat": "mp4",
+  "subtitleFormat": "srt",
+  "downloadSubtitles": true,
+  "writeThumbnail": true,
+  "writeDescription": true,
+  "writeInfoJson": true
 }
 ```
 
-Per-link overrides (format, output folder, subtitle/thumbnail flags) are
-supported alongside these global defaults.
+### Output format settings
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `videoQuality` | `"1080p"` | Format preset: `highest`, `1080p`, `720p`, `480p`, or `audio` (mp3 only). |
+| `targetFormat` | `"mp4"` | Container the converter remuxes into: `mp4`, `mkv`, `webm`, `mp3`, or `m4a`. `mp4` keeps the video stream and re-encodes audio to AAC; the other containers stream-copy both. A file that already carries the target extension skips conversion, and multi-audio MKVs are never remuxed to mp4 (that would drop the dubs). |
+| `subtitleFormat` | `"srt"` | yt-dlp `--convert-subs` target for downloaded subtitles: `srt`, `vtt`, `ass`, or `lrc`. |
+| `deleteSourceAfterConvert` | `true` | Remove the pre-conversion source once the converted file is recorded. |
+| `secondaryStoragePath` | `""` | Optional NAS/second drive the converter moves finished files (and their sidecars) into. |
 
 ### Reliability settings
 
@@ -159,7 +169,7 @@ video with different tracks).
 
 The **⚙️ Settings** button opens an editor for the downloader, concurrency, and
 reliability knobs. Changes are validated against the same Zod schema the engine
-uses, written to , and applied to the running engine — the next
+uses, written to `config.json`, and applied to the running engine — the next
 download picks them up without a restart. The panel deliberately exposes only
 tuning keys: playlists, credentials, and the network binding are not editable
 from the browser, and a request naming anything outside the allow-list is
@@ -240,20 +250,19 @@ partial is unusable it deletes the `.part` **and** its control file: aria2c
 defaults to `--allow-overwrite=false`, under which a control file whose data is
 gone makes it neither resume nor restart, wedging the job permanently.
 
-Edit these interactively with `bun run config` → **Change Download Settings**.
-Settings**, or from the web dashboard's reliability panel.
+Edit these interactively with `bun run config` → **Change Download Settings**,
+or from the web dashboard's **⚙️ Settings** panel.
 
 ## Usage
 
 ```bash
-bun run start
+bun run start        # reads ./config.json from the current directory
+bun run config       # interactive config manager
 ```
 
-With CLI overrides:
-
-```bash
-bun run start --config ./my-config.json --format mkv
-```
+There are no CLI flags: everything is read from `config.json` in the working
+directory (`archive.db`, `error.log`, and `downloaded_videos.txt` are created
+there too), so run the engine from the folder that holds your config.
 
 The TUI shows live status for every video across all active workers. The web
 dashboard (`http://127.0.0.1:3000` by default) adds bulk actions, the failed-job
@@ -315,6 +324,19 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
   API) needs it, via cookie, `Authorization: Bearer`, `X-Web-Token`, or
   `?token=`. The login page sets an `HttpOnly` cookie after the first
   sign-in; comparisons are timing-safe.
+- **Auth posture, stated plainly:** `webToken` defaults to `""`, which means
+  the API is **fully open** to anything that can reach the port — including
+  purge, delete, and the settings editor. That is acceptable on loopback;
+  if you set `"webBind": "0.0.0.0"` you widen the unauthenticated surface to
+  the whole network, so **always set a `webToken` when binding beyond
+  loopback** (the config manager warns about this combination). The engine
+  also sends `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, a
+  restrictive `Content-Security-Policy`, and `Cache-Control: no-store` on
+  every response. The browser receives the token only as an HttpOnly cookie;
+  `bun run config` → View masks it.
+- **Keep `cookies.txt` out of version control** — it is a live browser
+  session. `.gitignore` excludes it (along with `archive.db`, media files, and
+  partial downloads).
 - **Real bandwidth cap** — `maxBandwidthKBps` maps to yt-dlp `--limit-rate`,
   split across the active download slots.
 - **Worker autoscaling** — with `autoscaleEnabled` the engine grows download
@@ -355,6 +377,7 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [ ] Deduplicate identical videos across playlists by content hash
 - [ ] Per-link quality/format overrides in the web dashboard
 - [ ] Desktop notifications (Discord/webhook) on completion and failures
+- [ ] Download scheduling windows, retention policies, chapter/transcript sidecars
 
 ## Windows 11
 
@@ -408,4 +431,4 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 
 ## License
 
-MIT — replace with your preferred license.
+[MIT](LICENSE).

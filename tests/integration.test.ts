@@ -17,7 +17,7 @@
 //                              on the aria2c path
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -70,7 +70,16 @@ function toolsDirFor(mocksDir: string): Promise<string> {
   let cached = toolsDirCache.get(mocksDir);
   if (!cached) {
     cached = (async () => {
-      if (!WIN) return mocksDir;
+      if (!WIN) {
+        // A checkout made on Windows (or an archive extraction) can drop the
+        // executable bit; without it discovery reports "yt-dlp: not found"
+        // and every scenario fails at startup. Re-apply it — best-effort.
+        for (const name of MOCK_TOOLS) {
+          const source = join(mocksDir, name);
+          if (existsSync(source)) await chmod(source, 0o755).catch(() => {});
+        }
+        return mocksDir;
+      }
       const outDir = await mkdtemp(join(tmpdir(), "yta-mocks-exe-"));
       tmpDirs.push(outDir);
       for (const name of MOCK_TOOLS) {
