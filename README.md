@@ -125,6 +125,20 @@ minimal file looks like:
 
 Edit these interactively with `bun run config` → **Change Reliability & Resume**.
 
+### Integrity & dedupe
+
+```json
+{
+  "verifyIntegrity": true,
+  "dedupeByHash": false
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `verifyIntegrity` | Record each finished file's SHA-256 in `jobs.integrity` (shown in the job drawer and `GET /api/jobs/:id`). Hashed by the converter for converted files and by the download worker for files that need no conversion |
+| `dedupeByHash` | When a finished file's hash matches an earlier job's, replace it with a **hard link** to the first copy and set `duplicate_of` — the bytes are stored once, every job keeps a valid `file_path`. Same filesystem only; anything else (NAS on another volume, missing original) leaves the file alone. Needs `verifyIntegrity` |
+
 ### Retention policies
 
 ```json
@@ -426,7 +440,8 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
       (`.part` files kept, `--continue`, bounded resume budget)
 - [x] Fully independent, parallel metadata and conversion pipelines
 - [x] Modular architecture with a unit + end-to-end test suite
-- [ ] Deduplicate identical videos across playlists by content hash
+- [x] Deduplicate identical videos across playlists by content hash
+      (`dedupeByHash`: hard link + `duplicate_of`)
 - [x] Per-video format / quality / subtitle overrides from the job drawer
       (`POST /api/jobs/:id/override`, "Apply" or "Apply & re-download")
 - [x] Webhook notifications (Discord or generic JSON) on pause/resume, batched

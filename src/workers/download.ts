@@ -13,6 +13,7 @@ import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
 import { queueFailureNotification } from "../notify";
+import { dedupeAfterHash } from "../dedupe";
 import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
 import { computeBackoffMs, decideFailureOutcome } from "../retry";
@@ -24,7 +25,7 @@ import {
   selectAudioTracks,
   type AudioTrack,
 } from "../audio-tracks";
-import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec } from "../util";
+import { findDownloadedFile, formatBytesPerSec, parseSpeedToBytesPerSec, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
 import { abortController, activeProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { logError } from "../logger";
@@ -152,7 +153,18 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       throw new Error("Download finished but output file could not be located");
     }
     const fileSize = (await stat(filePath)).size;
-    recordSuccess(job.id, filePath, fileSize);
+    // The converter hashes what it produces; a file that needs no conversion
+    // is final right here, so this is its only chance at an integrity hash
+    // (verifyIntegrity used to apply to converted files only).
+    let integrity: string | null = null;
+    if (config.verifyIntegrity && job.conversion_status === "not_needed") {
+      integrity = await hashFile(filePath).catch((e: any) => {
+        logError("download", `${job.id} ${job.title}: could not hash ${filePath}: ${e?.message || e}`);
+        return null;
+      });
+    }
+    recordSuccess(job.id, filePath, fileSize, integrity);
+    await dedupeAfterHash(job, filePath, integrity, config.dedupeByHash);
     stats.downloaded++;
     notePipelineSuccess("dl");
     updateWorkerLine(id, `✅ Downloaded | ${job.title}`, config);
@@ -615,11 +627,12 @@ function resetForRetry(id: string, opts: { incrementRetry?: boolean; clearPartia
   }
 }
 
-function recordSuccess(id: string, filePath: string, fileSize: number): void {
+function recordSuccess(id: string, filePath: string, fileSize: number, integrity: string | null = null): void {
   db.run(
     `UPDATE jobs SET download_status = 'downloaded', file_path = ?, file_size = ?, partial_file_path = NULL,
+       integrity = COALESCE(?, integrity),
        progress = 100, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [filePath, fileSize, id],
+    [filePath, fileSize, integrity, id],
   );
 }
 

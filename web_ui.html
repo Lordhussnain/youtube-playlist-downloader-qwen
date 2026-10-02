@@ -2024,6 +2024,8 @@
           ${detailRow('Resumes', job.resume_count || 0)}
           ${detailRow('Kept partial', parts, true)}
           ${detailRow('aria2c control', control, true)}
+          ${detailRow('SHA-256', job.integrity, true)}
+          ${detailRow('Duplicate of', job.duplicate_of ? `${job.duplicate_of} (hard-linked, stored once)` : null, true)}
           ${detailRow('Last error', job.last_error)}
         </div>
         ${renderOverrideSection(job)}

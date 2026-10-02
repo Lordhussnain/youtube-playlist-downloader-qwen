@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const MOCKS = join(REPO_ROOT, "tests", "mocks");
@@ -286,6 +286,8 @@ interface JobRow {
   file_path: string | null;
   partial_file_path: string | null;
   progress: number;
+  integrity?: string | null;
+  duplicate_of?: string | null;
 }
 
 async function getJobs(engine: EngineHandle): Promise<JobRow[]> {
@@ -1246,6 +1248,43 @@ describe("integration: resilience policies (plan 4.5)", () => {
       expect((await getJobs(keep)).some((j) => j.id === "mockshort1")).toBe(true);
     } finally {
       await keep.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+describe("integration: content-hash dedupe (plan 5.2)", () => {
+  // Every mock download is byte-identical, so with dedupe on the playlist
+  // collapses to one stored copy: the first job is the original, the others
+  // are hard links marked duplicate_of. Hashing of unconverted mp4s happens in
+  // the download worker (verifyIntegrity), which this also pins down.
+  test("identical downloads are hard-linked to the first copy and marked duplicate_of", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 4105, BASE_CONFIG(4105, { verifyIntegrity: true, dedupeByHash: true }));
+    try {
+      let jobs = await waitForAllJobs(engine, (j) => j.download_status === "downloaded" && j.metadata_status === "done");
+      expect(jobs.length).toBeGreaterThanOrEqual(2);
+      // duplicate_of is written a beat after download_status: give the link a moment.
+      await waitFor("duplicates marked", async () => {
+        jobs = await getJobs(engine);
+        return jobs.filter((j) => j.duplicate_of).length === jobs.length - 1;
+      }, 10_000);
+      for (const job of jobs) expect(typeof job.integrity).toBe("string");
+      const hashes = new Set(jobs.map((j) => j.integrity));
+      expect(hashes.size).toBe(1);
+      const originals = jobs.filter((j) => !j.duplicate_of);
+      const dupes = jobs.filter((j) => j.duplicate_of);
+      expect(originals.length).toBe(1);
+      expect(dupes.length).toBe(jobs.length - 1);
+      // file_path is relative to the engine's cwd (the run dir).
+      const abs = (p: string) => resolve(dir, p);
+      const inode = (p: string) => statSync(abs(p)).ino;
+      for (const d of dupes) {
+        expect(d.duplicate_of).toBe(originals[0]!.id);
+        expect(existsSync(abs(d.file_path!))).toBe(true);
+        if (process.platform !== "win32") expect(inode(d.file_path!)).toBe(inode(originals[0]!.file_path!));
+      }
+    } finally {
+      await engine.stop();
     }
   }, TEST_TIMEOUT);
 });

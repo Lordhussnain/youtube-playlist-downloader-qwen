@@ -15,6 +15,7 @@ import { updateAbsoluteLine } from "../dashboard";
 import { abortController, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
 import { queueFailureNotification } from "../notify";
+import { dedupeAfterHash } from "../dedupe";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
 import { spawnBounded } from "../spawn";
@@ -230,6 +231,7 @@ async function finalizeConversion(
     logError("conversion", `${job.id} ${job.title}: conversion claim lost before finalize — files left untouched`);
     return;
   }
+  await dedupeAfterHash(job, finalPath, integrity, config.dedupeByHash);
   stats.converted++;
   notePipelineSuccess("post");
   updateConvertWorkerLine(id, `✅ Done | ${job.title}`, config);

@@ -518,6 +518,9 @@ async function changeFeatureToggles(config: Config): Promise<Config> {
   config.writeDescription = await askYesNo("Write .description sidecar files?", config.writeDescription);
   config.writeThumbnail = await askYesNo("Write .jpg thumbnail sidecar files?", config.writeThumbnail);
   config.verifyIntegrity = await askYesNo("Verify file integrity (SHA256) after download?", config.verifyIntegrity);
+  config.dedupeByHash = config.verifyIntegrity
+    ? await askYesNo("Dedupe byte-identical videos across playlists (hard-link to the first copy)?", config.dedupeByHash)
+    : false;
   config.skipShorts = await askYesNo("Skip YouTube Shorts (< 60s)?", config.skipShorts);
   config.downloadShorts = await askYesNo(
     "Download Shorts into their own folder (when not skipped)?",

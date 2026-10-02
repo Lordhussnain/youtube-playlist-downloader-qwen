@@ -264,6 +264,13 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     help: "Comma-separated local-time ranges like 22:00-07:00 (may wrap past midnight). Outside every window the engine pauses itself and resumes when a window opens. Empty = download any time.",
   },
   {
+    key: "dedupeByHash",
+    label: "Dedupe identical videos",
+    type: "boolean",
+    group: "reliability",
+    help: "When a finished file's SHA-256 matches an earlier job's, replace it with a hard link to the first copy (same filesystem only). Needs integrity verification on.",
+  },
+  {
     key: "runHistoryDays",
     label: "Keep run history (days)",
     type: "number",

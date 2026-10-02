@@ -103,6 +103,7 @@ src/
   db.ts          SQLite schema, migrations, atomic claim transactions, helpers, effectiveQuality()
   notify.ts      webhook notifications (Discord / generic JSON), failure batching, queue-drained edge
   schedule.ts    download windows: PURE window parsing/policy + the 30 s pause/resume tick
+  dedupe.ts      content-hash dedupe: duplicate lookup + atomic hard-link swap after hashing
   retention.ts   retention sweep: run_history age prune, media prune → 'pruned', orphan sidecars (PURE detector)
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
@@ -147,6 +148,7 @@ download-args.ts → audio-tracks, config, db (effectiveQuality), retry, tools, 
 notify.ts → config (types), logger                │ (fire-and-forget; transport injectable)
 schedule.ts → config (types), resilience, state   │ (pure policy + tick)
 retention.ts → config (types), db, logger, reconcile (sweep errors), util
+dedupe.ts → db, logger                           │ (called by both workers after hashing)
 web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
 rss.ts → config, logger, scanner, tools         │
 polling.ts → config, logger, scanner            │
@@ -310,6 +312,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Signature self-heal | `retry.ts decideFailureOutcome()` → `workers/download.ts selfUpdateYtDlp()` | single-flight `yt-dlp -U` (120 s cap, registered in `activeProcs` under a negative key), then retries with a clean budget |
 | Sweep error registry | `reconcile.ts recordSweepError() / sweepError()` | every sweep's last swallowed failure, shown as `sweeps[].error` on `/api/reliability` and a red pill in the dashboard |
 | Bounded probes | `spawn.ts spawnBounded()` | every run-to-completion child (listing, channel-id, audio probe, cookie check, binary probe, ffmpeg stream count) has a deadline and is SIGKILLed on it |
+| Content-hash dedupe | `dedupe.ts dedupeAfterHash()` | after the SHA-256 lands (download worker for `not_needed` conversions, `finalizeConversion` otherwise): `claimDuplicate()` is ONE synchronous SQLite transaction — "nobody points at me yet" + oldest other finished, non-duplicate row with the same `integrity` whose file exists → writes `duplicate_of` — so two workers finishing identical files together cannot each pick the other; then `linkDuplicate()` (temp hard link + rename, never a moment without a file; EXDEV/size mismatch = skipped and the claim released); opt-in `dedupeByHash` |
 | Retention | `retention.ts retentionSweep()` | off unless `runHistoryDays` / `mediaRetentionDays` / `pruneOrphanSidecars` set; media prune marks the job `download_status='pruned'` with `file_path=NULL` (excluded from the missing-files sweep and the scanner's INSERT OR IGNORE; Retry re-queues); `orphanSidecars(names)` is pure; sweep id `retention` on the panel |
 | Scheduling windows | `schedule.ts scheduleTick()` | pure `decideSchedule(windows, now, state)`: pause (`SCHEDULE_WINDOW …`) when outside every `downloadWindows` range and running; resume only a pause *it* created; 30 s tick from `engine.ts` |
 | Webhook notifications | `notify.ts` | `notify()` per event, `queueFailureNotification()` batches permanent failures (30 s / 25 items), `observeQueueState()` fires `complete` on the busy→idle edge; transport injectable for tests; hooks live in `triggerPause/triggerResume` and the three workers' failed branches |
@@ -518,7 +521,7 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 ### 9.1 Running
 
 ```bash
-bun test                       # everything (~150s — the integration scenarios dominate)
+bun test                       # everything (~155s — the integration scenarios dominate)
 bun test tests/retry.test.ts   # one file
 bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
 bun run check:ui               # parse web_ui.html's inline scripts (scripts/check-ui.ts)
@@ -529,7 +532,7 @@ CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
 same three steps on Ubuntu and Windows — the suite compiles its mocks per
 platform, so both must stay green.
 
-~440 tests across 33 files. Tests share one process, so any file that touches the
+~450 tests across 34 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -782,7 +785,7 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 ## 12. Definition of done
 
 - `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
-  `check:ui` script gate, and the full suite — ~440 tests across 33 files).
+  `check:ui` script gate, and the full suite — ~450 tests across 34 files).
   CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.

@@ -243,7 +243,7 @@ const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
                 file_size, progress, speed, eta, duration, partial_file_path,
-                audio_tracks, audio_selection, integrity, quality_override, want_subtitles`;
+                audio_tracks, audio_selection, integrity, quality_override, want_subtitles, duplicate_of`;
 
 /** Audio-track columns are JSON in SQLite; hand the dashboard real values. */
 function mapJobRow(r: any) {

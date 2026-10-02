@@ -38,6 +38,8 @@ export interface Job {
   audio_selection: string | null;
   /** Per-job quality preset (a QUALITY_FORMATS key); null = follow config.videoQuality. */
   quality_override: string | null;
+  /** Id of the earlier job this file is a hard link of (content-hash dedupe). */
+  duplicate_of: string | null;
   folder: string;
   index: number;
   duration: number | null;
@@ -140,6 +142,7 @@ export function initDatabase(path: string = "archive.db"): void {
   ensureColumn("jobs", "metadata_retry_count", "metadata_retry_count INTEGER DEFAULT 0");
   // Per-job overrides (dashboard "Override & retry").
   ensureColumn("jobs", "quality_override", "quality_override TEXT");
+  ensureColumn("jobs", "duplicate_of", "duplicate_of TEXT");
   // Reliability & resume columns.
   ensureColumn("jobs", "conversion_retry_count", "conversion_retry_count INTEGER DEFAULT 0");
   ensureColumn("jobs", "resume_count", "resume_count INTEGER DEFAULT 0");

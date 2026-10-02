@@ -73,6 +73,8 @@ export const ConfigSchema = z
     writeThumbnail: z.boolean(),
     archiveLiveStreams: z.boolean(),
     verifyIntegrity: z.boolean(),
+    /** Replace byte-identical downloads with hard links to the first copy (needs verifyIntegrity). */
+    dedupeByHash: z.boolean(),
     skipShorts: z.boolean(),
     downloadShorts: z.boolean(),
     // --- Failure handling ----------------------------------------------------
@@ -177,6 +179,7 @@ export const DEFAULT_CONFIG: Config = {
   writeThumbnail: true,
   archiveLiveStreams: false,
   verifyIntegrity: true,
+  dedupeByHash: false,
   skipShorts: true,
   downloadShorts: false,
   maxRetryAttempts: 3,
