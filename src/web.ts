@@ -7,7 +7,7 @@
 // the same gate.
 
 import { existsSync, readFileSync } from "node:fs";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
@@ -38,14 +38,25 @@ export function extractWebToken(req: Request, url: URL): string | null {
   if (query) return query.trim();
   const cookie = req.headers.get("cookie") || "";
   const match = cookie.match(/(?:^|;\s*)yta_token=([^;]+)/);
-  if (match) return decodeURIComponent(match[1]).trim();
+  if (match) return safeDecode(match[1])?.trim() ?? null;
   return null;
 }
 
+/** decodeURIComponent that returns null on malformed input instead of throwing. */
+export function safeDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
+}
+
 export function timingSafeEq(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
+  // Compare fixed-length digests so the comparison takes the same time
+  // whatever the presented token's length — a bare length check returned
+  // early and leaked the real token's exact length.
+  const ab = createHash("sha256").update(a).digest();
+  const bb = createHash("sha256").update(b).digest();
   return timingSafeEqual(ab, bb);
 }
 
@@ -112,7 +123,28 @@ export function startWebServer(port: number, config: Config) {
   });
 }
 
+// Applied to EVERY response (README "Auth posture"). The UI is a single
+// inline-scripted page, so script/style must allow 'unsafe-inline'; everything
+// else is locked to the origin, framing is refused, and nothing is cached —
+// the page can carry a token in its URL and the API returns live state.
+export const SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; " +
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store",
+});
+
 export async function handleRequest(req: Request, config: Config): Promise<Response> {
+  const res = await routeRequest(req, config);
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
+  return res;
+}
+
+async function routeRequest(req: Request, config: Config): Promise<Response> {
   const url = new URL(req.url);
 
   if (url.pathname === "/") {
@@ -173,6 +205,16 @@ interface Route {
   handler: RouteHandler;
 }
 
+/**
+ * `?limit=` as a bounded positive integer. `-1` used to mean "no limit" to
+ * SQLite and `abc` became a NaN bind; both now fall back to the default.
+ */
+export function clampLimit(raw: string | null, fallback: number, max: number = 1000): number {
+  const n = Number.parseInt(raw ?? "", 10);
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(max, n);
+}
+
 /** Match a `/api/…/:param` pattern against path segments; null = no match. */
 function matchRoute(pattern: string, segments: string[]): RouteParams | null {
   const parts = pattern.split("/").filter(Boolean);
@@ -182,7 +224,9 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
     const p = parts[i];
     if (p.startsWith(":")) {
       if (!segments[i]) return null; // never bind an empty param
-      params[p.slice(1)] = decodeURIComponent(segments[i]);
+      const decoded = safeDecode(segments[i]);
+      if (decoded === null) return null; // `/api/jobs/%` is a 404, not a 500
+      params[p.slice(1)] = decoded;
     } else if (p !== segments[i]) {
       return null;
     }
@@ -204,6 +248,56 @@ function mapJobRow(r: any) {
     audio_tracks: parseTracksJson(r.audio_tracks) ?? [],
     audio_selection: parseSelectionJson(r.audio_selection),
   };
+}
+
+/**
+ * The scan URL is handed to yt-dlp, which will happily fetch file://, the
+ * local metadata service, or anything on the LAN. Only public http(s) hosts
+ * are accepted; returns an error message or null when the URL is fine.
+ */
+export function validateScanUrl(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0) return "URL required";
+  if (raw.length > 2048) return "URL too long";
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return "Invalid URL";
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "Only http(s) URLs can be scanned";
+  if (u.username || u.password) return "Credentials in the URL are not allowed";
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+    return "Local addresses cannot be scanned";
+  }
+  if (isPrivateAddress(host)) return "Private network addresses cannot be scanned";
+  return null;
+}
+
+/** Loopback, link-local, RFC 1918 / ULA, unspecified and metadata ranges. */
+export function isPrivateAddress(host: string): boolean {
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      a >= 224
+    );
+  }
+  if (host.includes(":")) {
+    const h = host.toLowerCase();
+    if (h === "::" || h === "::1") return true;
+    if (h.startsWith("fe80:") || h.startsWith("fc") || h.startsWith("fd")) return true;
+    if (h.startsWith("::ffff:")) return isPrivateAddress(h.slice(7));
+    return false;
+  }
+  return false;
 }
 
 // --- Live-claim guards ---------------------------------------------------------
@@ -578,8 +672,13 @@ const ROUTES: Route[] = [
       const body = await req.json().catch(() => ({}));
       const { url: scanUrl, folder } = body || {};
       if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
+      const bad = validateScanUrl(scanUrl);
+      if (bad) return Response.json({ ok: false, error: bad }, { status: 400 });
+      if (folder !== undefined && folder !== null && typeof folder !== "string") {
+        return Response.json({ ok: false, error: "folder must be a string" }, { status: 400 });
+      }
       try {
-        const result = await scanAndIngest(scanUrl, getConfig(), folder);
+        const result = await scanAndIngest(scanUrl, getConfig(), folder || undefined);
         invalidateStats();
         const message =
           result.found === 0
@@ -686,7 +785,7 @@ const ROUTES: Route[] = [
     methods: ["GET"],
     pattern: "/api/history",
     handler: ({ url }) => {
-      const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+      const limit = clampLimit(url.searchParams.get("limit"), 20);
       const rows = db.query("SELECT * FROM run_history ORDER BY ended_at DESC LIMIT ?").all(limit);
       return Response.json({ ok: true, history: rows });
     },
@@ -696,7 +795,7 @@ const ROUTES: Route[] = [
     pattern: "/api/logs",
     handler: ({ url }) => {
       const logType = url.searchParams.get("type") || "error";
-      const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+      const limit = clampLimit(url.searchParams.get("limit"), 100);
       let logs: string[] = [];
       try {
         if (logType === "report") {
