@@ -256,6 +256,13 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "reliability",
     help: "Ceiling for the duration-aware timeout.",
   },
+  {
+    key: "downloadWindows",
+    label: "Download windows",
+    type: "list",
+    group: "reliability",
+    help: "Comma-separated local-time ranges like 22:00-07:00 (may wrap past midnight). Outside every window the engine pauses itself and resumes when a window opens. Empty = download any time.",
+  },
   // --- notifications --------------------------------------------------------
   {
     key: "webhookUrl",

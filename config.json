@@ -57,5 +57,6 @@
   "rssPollIntervalMinutes": 15,
   "rescanIntervalHours": 24,
   "webhookUrl": "",
-  "notifyOn": ["failure", "pause"]
+  "notifyOn": ["failure", "pause"],
+  "downloadWindows": []
 }

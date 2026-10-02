@@ -332,6 +332,20 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || "none"}]: `);
   if (nasPath.trim() !== "") config.secondaryStoragePath = nasPath.trim();
 
+  // Scheduling
+  console.log("\n— Scheduling —");
+  const winAns = await ask(
+    `   Download windows, comma-separated HH:MM-HH:MM in local time ('-' = any time) [current: ${config.downloadWindows.length ? config.downloadWindows.join(", ") : "any time"}]: `,
+  );
+  if (winAns.trim() === "-") config.downloadWindows = [];
+  else if (winAns.trim() !== "") {
+    const WIN_RE = /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/;
+    const parts = winAns.split(",").map((s) => s.trim()).filter(Boolean);
+    const bad = parts.filter((p) => !WIN_RE.test(p));
+    if (bad.length) console.log(`   ⚠️  Ignoring malformed window(s): ${bad.join(", ")} (expected HH:MM-HH:MM)`);
+    config.downloadWindows = parts.filter((p) => WIN_RE.test(p));
+  }
+
   // Notifications
   console.log("\n— Notifications —");
   const hookAns = await ask(

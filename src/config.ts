@@ -108,6 +108,10 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
+    /** Local-time download windows "HH:MM-HH:MM" (wrap past midnight allowed); empty = always. */
+    downloadWindows: z.array(
+      z.string().regex(/^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/, 'expected "HH:MM-HH:MM"'),
+    ),
     // --- Notifications -------------------------------------------------------
     // A Discord webhook or any endpoint accepting JSON POSTs. Empty = off.
     webhookUrl: z.string(),
@@ -194,6 +198,7 @@ export const DEFAULT_CONFIG: Config = {
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
+  downloadWindows: [],
   // Notifications
   webhookUrl: "",
   notifyOn: ["failure", "pause"],

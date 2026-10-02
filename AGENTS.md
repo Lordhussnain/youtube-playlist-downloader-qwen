@@ -102,6 +102,7 @@ src/
   config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save, QUALITY_FORMATS
   db.ts          SQLite schema, migrations, atomic claim transactions, helpers, effectiveQuality()
   notify.ts      webhook notifications (Discord / generic JSON), failure batching, queue-drained edge
+  schedule.ts    download windows: PURE window parsing/policy + the 30 s pause/resume tick
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
@@ -143,6 +144,7 @@ dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
 download-args.ts → audio-tracks, config, db (effectiveQuality), retry, tools, util │ (pure)
 notify.ts → config (types), logger                │ (fire-and-forget; transport injectable)
+schedule.ts → config (types), resilience, state   │ (pure policy + tick)
 web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
 rss.ts → config, logger, scanner, tools         │
 polling.ts → config, logger, scanner            │
@@ -306,6 +308,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Signature self-heal | `retry.ts decideFailureOutcome()` → `workers/download.ts selfUpdateYtDlp()` | single-flight `yt-dlp -U` (120 s cap, registered in `activeProcs` under a negative key), then retries with a clean budget |
 | Sweep error registry | `reconcile.ts recordSweepError() / sweepError()` | every sweep's last swallowed failure, shown as `sweeps[].error` on `/api/reliability` and a red pill in the dashboard |
 | Bounded probes | `spawn.ts spawnBounded()` | every run-to-completion child (listing, channel-id, audio probe, cookie check, binary probe, ffmpeg stream count) has a deadline and is SIGKILLed on it |
+| Scheduling windows | `schedule.ts scheduleTick()` | pure `decideSchedule(windows, now, state)`: pause (`SCHEDULE_WINDOW …`) when outside every `downloadWindows` range and running; resume only a pause *it* created; 30 s tick from `engine.ts` |
 | Webhook notifications | `notify.ts` | `notify()` per event, `queueFailureNotification()` batches permanent failures (30 s / 25 items), `observeQueueState()` fires `complete` on the busy→idle edge; transport injectable for tests; hooks live in `triggerPause/triggerResume` and the three workers' failed branches |
 | Abort-scoped timers | `state.ts everyInterval()` | every periodic sweep clears itself when the engine aborts |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
@@ -523,7 +526,7 @@ CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
 same three steps on Ubuntu and Windows — the suite compiles its mocks per
 platform, so both must stay green.
 
-~415 tests across 31 files. Tests share one process, so any file that touches the
+~430 tests across 32 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -768,13 +771,14 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 | Change a yt-dlp / ffmpeg command line | the **pure planners**: `download-args.ts buildDownloadPlan()`, `workers/metadata.ts buildMetadataArgs()`, `workers/convert.ts planConversion()` — each has a table test (`download-args`, `metadata-args`, `convert` test files); the workers only spawn what the planner returns |
 | Change tool discovery | `tools.ts toolCandidates(env)` (pure: candidate paths from an env snapshot) → `tests/tools.test.ts` |
 | Change worker supervision / restart policy | `lifecycle.ts supervise(opts)` (injectable sleep/log) → `tests/lifecycle.test.ts` |
+| Change when the schedule pauses/resumes | `src/schedule.ts decideSchedule()` + the policy table in `tests/schedule.test.ts` |
 | Add a notification event | `src/notify.ts` (`NotifyEvent` union + `notifyOn` enum in `config.ts`) → call `notify(getConfig(), event, …)` at the edge → `tests/notify.test.ts` with the injected transport |
 | Add a per-job override field | `db.ts` (`ensureColumn` + `Job` field) → `web.ts applyJobOverride()` → `JOB_COLUMNS` → drawer form in `web_ui.html renderOverrideSection()` |
 
 ## 12. Definition of done
 
 - `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
-  `check:ui` script gate, and the full suite — ~415 tests across 31 files).
+  `check:ui` script gate, and the full suite — ~430 tests across 32 files).
   CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.

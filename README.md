@@ -108,7 +108,8 @@ minimal file looks like:
   "requeueFailedAfterMinutes": 30,
   "verifyExistingFiles": true,
   "downloadTimeoutMinutes": 15,
-  "maxDownloadMinutes": 180
+  "maxDownloadMinutes": 180,
+  "downloadWindows": []
 }
 ```
 
@@ -120,6 +121,7 @@ minimal file looks like:
 | `verifyExistingFiles` | On startup, verify that files recorded as downloaded still exist; missing ones are scrubbed from the yt-dlp archive and queued again |
 | `downloadTimeoutMinutes` | Minimum per-video download timeout |
 | `maxDownloadMinutes` | Ceiling for the timeout. The effective timeout scales with the video's real duration (3× realtime + 5 min) between the two |
+| `downloadWindows` | Local-time ranges like `["22:00-07:00"]` (may wrap midnight, several allowed). Outside every window the engine pauses itself (`SCHEDULE_WINDOW`, active downloads keep their `.part`) and resumes on its own when a window opens. It never overrides a pause with another reason. `[]` = any time |
 
 Edit these interactively with `bun run config` → **Change Reliability & Resume**.
 
@@ -404,7 +406,10 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
       (`POST /api/jobs/:id/override`, "Apply" or "Apply & re-download")
 - [x] Webhook notifications (Discord or generic JSON) on pause/resume, batched
       failures and queue completion (`webhookUrl` / `notifyOn`)
-- [ ] Download scheduling windows, retention policies, chapter/transcript sidecars
+- [x] Download scheduling windows (`downloadWindows`)
+- [x] Chapters + cover art embedded (`embedMetadata`), auto-transcripts as
+      subtitle sidecars (`downloadSubtitles` writes `--write-auto-subs` too)
+- [ ] Retention policies
 
 ## Windows 11
 
