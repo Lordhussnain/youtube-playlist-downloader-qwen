@@ -36,6 +36,8 @@ export interface Job {
   audio_tracks: string | null;
   /** JSON array of selected language codes (null = follow global mode). */
   audio_selection: string | null;
+  /** Per-job quality preset (a QUALITY_FORMATS key); null = follow config.videoQuality. */
+  quality_override: string | null;
   folder: string;
   index: number;
   duration: number | null;
@@ -47,6 +49,16 @@ export interface Job {
   eta: number;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * The quality preset one job should download with: its own override when
+ * set, else the global setting. Every reader of `config.videoQuality` that is
+ * about a specific job must go through this so an override reaches yt-dlp's
+ * format selector, the audio-track probe and the converter alike.
+ */
+export function effectiveQuality(job: Partial<Pick<Job, "quality_override">>, config: Config): string {
+  return job.quality_override || config.videoQuality;
 }
 
 // Live binding: reassigned by initDatabase(), read by every other module.
@@ -126,6 +138,8 @@ export function initDatabase(path: string = "archive.db"): void {
   ensureColumn("jobs", "metadata_files", "metadata_files TEXT");
   ensureColumn("jobs", "pause_reason", "pause_reason TEXT");
   ensureColumn("jobs", "metadata_retry_count", "metadata_retry_count INTEGER DEFAULT 0");
+  // Per-job overrides (dashboard "Override & retry").
+  ensureColumn("jobs", "quality_override", "quality_override TEXT");
   // Reliability & resume columns.
   ensureColumn("jobs", "conversion_retry_count", "conversion_retry_count INTEGER DEFAULT 0");
   ensureColumn("jobs", "resume_count", "resume_count INTEGER DEFAULT 0");

@@ -100,7 +100,8 @@ archive.db                     SQLite job store (+ -wal/-shm while running)
 error.log                      rotating error log
 src/
   config.ts      Zod schema, DEFAULT_CONFIG, load/loadSafe/save, QUALITY_FORMATS
-  db.ts          SQLite schema, migrations, atomic claim transactions, helpers
+  db.ts          SQLite schema, migrations, atomic claim transactions, helpers, effectiveQuality()
+  notify.ts      webhook notifications (Discord / generic JSON), failure batching, queue-drained edge
   state.ts       shared mutable runtime state (leaf module — imports nothing)
   tools.ts       yt-dlp/ffmpeg/aria2c discovery, cookiesArgs, validateCookies
   download-args.ts PURE yt-dlp command construction (downloader engine, tuning)
@@ -134,18 +135,19 @@ config.ts, util.ts, logger.ts, retry.ts,
 archive.ts, tools.ts                             │ (leaf modules, zero deps)
 audio-tracks.ts → config (types), tools          │ (pure parsing/selection + -J probe)
 db.ts → config                                  │
-resilience.ts → config, db, logger, state       │
+resilience.ts → config, db, logger, notify, state │
 reconcile.ts → archive, config, db, logger, retry│
 scanner.ts → config, db, state, tools, util     │
 autoscale.ts → db, state                        │
 dashboard.ts → autoscale, config, db, state, util│
 report.ts → autoscale, db, state, util          │
-download-args.ts → audio-tracks, config, db (types), retry, tools, util    │ (pure)
+download-args.ts → audio-tracks, config, db (effectiveQuality), retry, tools, util │ (pure)
+notify.ts → config (types), logger                │ (fire-and-forget; transport injectable)
 web.ts → audio-tracks, autoscale, config, db, download-args, logger, reconcile, report, resilience, retry, scanner, state, tools, util
 rss.ts → config, logger, scanner, tools         │
 polling.ts → config, logger, scanner            │
 history.ts → db, logger, state                  │
-lifecycle.ts → dashboard, db, history, logger, resilience, state
+lifecycle.ts → dashboard, db, history, logger, notify, resilience, state
 workers/* → config, dashboard, db, download-args, logger, resilience, retry, state, tools, util (+ autoscale/archive/reconcile; download.ts also audio-tracks)
 engine.ts → everything (composition root)
 ```
@@ -420,6 +422,20 @@ arrays; `POST /api/jobs/<id>/audio-probe` refreshes the list;
 `POST /api/jobs/<id>/audio-tracks` saves (`{tracks:[…]}`) or resets
 (`{tracks:null}`) the per-job selection, applied on the next attempt.
 
+#### Per-job overrides (format / quality / subtitles)
+
+`jobs.target_format` and `jobs.want_subtitles` were always per-row; plan 5.1
+added `jobs.quality_override` (a `QUALITY_FORMATS` key or NULL) and the rule
+that **every job-specific reader of `config.videoQuality` goes through
+`db.ts effectiveQuality(job, config)`** — `buildDownloadPlan` (format
+selector + multi-audio exemption), the audio-track probe and the converter's
+mp3 decision. `web.ts applyJobOverride(row, body)` is the pure validator;
+`POST /api/jobs/<id>/override` writes the row, flips `conversion_status`
+to `pending` when the new target needs the converter, re-opens metadata
+when subtitles were just enabled, and with `retry: true` runs the same
+`retryJobById` as the Retry button. It is refused (409) while any stage is
+`in_progress`, because the worker holds its own copy of the row.
+
 #### Control files: never delete a `.part` without its `.aria2`
 
 aria2c writes a *control file* beside every in-progress download
@@ -507,7 +523,7 @@ CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
 same three steps on Ubuntu and Windows — the suite compiles its mocks per
 platform, so both must stay green.
 
-~410 tests across 31 files. Tests share one process, so any file that touches the
+~415 tests across 31 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -753,7 +769,7 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 ## 12. Definition of done
 
 - `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
-  `check:ui` script gate, and the full suite — ~410 tests across 31 files).
+  `check:ui` script gate, and the full suite — ~415 tests across 31 files).
   CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.

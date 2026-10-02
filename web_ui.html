@@ -486,6 +486,14 @@
       font-size: 0.85rem;
       font-family: inherit;
     }
+    .audio-tracks-box select {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 0.76rem;
+    }
     .setting-row input:focus, .setting-row select:focus {
       outline: none;
       border-color: var(--accent);
@@ -1787,6 +1795,55 @@
     // video: original + auto-dubbed tracks, saved per job and applied on
     // the next download attempt.
     // ------------------------------------------------------------------
+    // Per-job override (format / quality / subtitles). "Apply" rewrites the
+    // row; a changed format on a downloaded job re-runs the converter from the
+    // kept source. "Apply & re-download" also re-queues the download so a new
+    // quality preset actually reaches yt-dlp.
+    const OVERRIDE_FORMATS = ['mp4', 'mkv', 'webm', 'm4a', 'mp3'];
+    const OVERRIDE_QUALITIES = ['highest', '1080p', '720p', '480p', 'audio'];
+    function renderOverrideSection(job) {
+      const fmt = (job.target_format || 'mp4').toLowerCase();
+      const q = job.quality_override || '';
+      const fmtOpts = OVERRIDE_FORMATS.map((f) => `<option value="${f}" ${f === fmt ? 'selected' : ''}>${f}</option>`).join('');
+      const qOpts = ['<option value="" ' + (q ? '' : 'selected') + '>global default</option>']
+        .concat(OVERRIDE_QUALITIES.map((v) => `<option value="${v}" ${v === q ? 'selected' : ''}>${v}</option>`)).join('');
+      return `<div class="audio-tracks-box">
+          <div class="k" style="margin-bottom:6px;">Override for this video</div>
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:0.76rem;">
+            <label>Format <select id="ovFormat" style="padding:3px 6px;">${fmtOpts}</select></label>
+            <label>Quality <select id="ovQuality" style="padding:3px 6px;">${qOpts}</select></label>
+            <label style="display:flex; align-items:center; gap:6px; cursor:pointer;"><input type="checkbox" id="ovSubs" ${job.want_subtitles ? 'checked' : ''}/> Subtitles</label>
+          </div>
+          <div style="font-size:0.7rem; color: var(--text-secondary); margin:6px 0 8px;">A format change on a downloaded video only re-runs the converter. A quality change needs a re-download.</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn btn-secondary" style="padding:5px 10px; font-size:0.73rem;" onclick="applyJobOverride('${job.id}', false)">💾 Apply</button>
+            <button class="btn btn-success" style="padding:5px 10px; font-size:0.73rem;" onclick="applyJobOverride('${job.id}', true)">⬇️ Apply &amp; re-download</button>
+          </div>
+        </div>`;
+    }
+
+    async function applyJobOverride(id, retry) {
+      const body = {
+        targetFormat: document.getElementById('ovFormat').value,
+        quality: document.getElementById('ovQuality').value || null,
+        wantSubtitles: document.getElementById('ovSubs').checked,
+        retry: !!retry,
+      };
+      try {
+        const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/override`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 409) { showNotification('⏳ Job is in progress — wait for the current stage to finish', 'warning'); return; }
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Override failed');
+        showNotification(retry ? '⬇️ Override saved — re-download queued' : '💾 Override saved', 'success');
+        openJobDetailById(id);
+        fetchStatus();
+      } catch (err) {
+        showNotification(`❌ ${err.message}`, 'error');
+      }
+    }
+
     function renderAudioTrackSection(job) {
       const tracks = Array.isArray(job.audio_tracks) ? job.audio_tracks : [];
       const sel = Array.isArray(job.audio_selection) ? job.audio_selection : null;
@@ -1902,6 +1959,7 @@
           ${detailRow('aria2c control', control, true)}
           ${detailRow('Last error', job.last_error)}
         </div>
+        ${renderOverrideSection(job)}
         ${renderAudioTrackSection(job)}
         ${job.last_error ? `<div style="margin-top:14px; font-size:0.74rem; color: var(--text-secondary); line-height:1.4;">A kept partial means the next attempt resumes from it. Permanent failures (private / removed / age-gated / geo-blocked) are never retried automatically.</div>` : ''}
         <div style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">

@@ -22,6 +22,7 @@ import { cookiesArgs } from "./tools";
 import { fitBaseFilename, sanitizeFileName } from "./util";
 import { computeDownloadTimeoutMs } from "./retry";
 import { QUALITY_FORMATS, type Config } from "./config";
+import { effectiveQuality } from "./db";
 import { multiAudioFormatSelector, type AudioTrack } from "./audio-tracks";
 import type { Job } from "./db";
 
@@ -92,7 +93,7 @@ export interface DownloadPlan {
 }
 
 export interface BuildDownloadPlanOptions {
-  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration">;
+  job: Pick<Job, "id" | "url" | "title" | "index" | "output_directory" | "duration"> & Partial<Pick<Job, "quality_override">>;
   config: Config;
   /** Slots currently allowed to claim work (drives the bandwidth split). */
   activeSlots: number;
@@ -121,11 +122,12 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const { job, config, activeSlots, aria2cAvailable } = opts;
 
   const engine = resolveDownloaderEngine(config, aria2cAvailable);
-  const format: string = QUALITY_FORMATS[config.videoQuality] ?? QUALITY_FORMATS["1080p"]!;
+  const quality = effectiveQuality(job, config);
+  const format: string = QUALITY_FORMATS[quality] ?? QUALITY_FORMATS["1080p"]!;
   // Multi-audio: splice the discovered track ids into the quality preset so
   // every wanted language is downloaded (YouTube's "Audio track" menu). The
   // audio-only preset is exempt — an mp3 cannot carry several tracks.
-  const audioTracks = config.videoQuality === "audio" ? [] : opts.audioTracks ?? [];
+  const audioTracks = quality === "audio" ? [] : opts.audioTracks ?? [];
   const effectiveFormat =
     audioTracks.length > 0 ? multiAudioFormatSelector(format, audioTracks) : format;
   const baseFilename = fitBaseFilename(

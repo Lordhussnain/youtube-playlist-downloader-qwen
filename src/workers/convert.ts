@@ -8,7 +8,7 @@
 import { cp, mkdir, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { claimConvertJob, db, perVideoCap, type Job } from "../db";
+import { claimConvertJob, db, perVideoCap, type Job, effectiveQuality } from "../db";
 import { computeBackoffMs } from "../retry";
 import { SIDECAR_SUFFIXES, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
@@ -240,7 +240,7 @@ async function convertJob(job: Job, config: Config, id: number): Promise<void> {
   updateConvertWorkerLine(id, `🔄 Converting | ${job.title}`, config);
   const sourcePath = job.file_path!;
   const targetFmt = (job.target_format || config.targetFormat || "mp4").toLowerCase();
-  const wantsMp3 = targetFmt === "mp3" || config.videoQuality === "audio";
+  const wantsMp3 = targetFmt === "mp3" || effectiveQuality(job, config) === "audio";
   if (!sourcePath || !existsSync(sourcePath)) {
     // Crash-window recovery: a previous attempt may have finished the encode
     // and died before recording it. Adopt the finished output instead of

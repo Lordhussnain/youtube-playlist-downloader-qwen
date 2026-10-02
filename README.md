@@ -249,6 +249,7 @@ Bearer`, `X-Web-Token`, or `?token=`).
 | `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows). |
 | `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). |
 | `POST /api/jobs/:id/reset-failures` | Clear the per-stage failure counters (alias: `POST /api/failcount/reset/:id`). |
+| `POST /api/jobs/:id/override` | Per-video override: `{targetFormat?, quality?, wantSubtitles?, retry?}`. A format change on a downloaded video only re-runs the converter; `retry: true` re-queues the download (needed for a new quality). 409 while the job is mid-flight. |
 | `POST /api/jobs/:id/audio-tracks` | Save the per-video audio-track selection (`tracks: null` resets). |
 | `POST /api/jobs/:id/audio-probe` | Discover the audio tracks YouTube offers for this video. |
 | `DELETE /api/jobs/:id` | Delete one job row. |
@@ -399,7 +400,8 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [x] Fully independent, parallel metadata and conversion pipelines
 - [x] Modular architecture with a unit + end-to-end test suite
 - [ ] Deduplicate identical videos across playlists by content hash
-- [ ] Per-link quality/format overrides in the web dashboard
+- [x] Per-video format / quality / subtitle overrides from the job drawer
+      (`POST /api/jobs/:id/override`, "Apply" or "Apply & re-download")
 - [x] Webhook notifications (Discord or generic JSON) on pause/resume, batched
       failures and queue completion (`webhookUrl` / `notifyOn`)
 - [ ] Download scheduling windows, retention policies, chapter/transcript sidecars

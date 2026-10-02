@@ -285,3 +285,89 @@ describe("mutating routes refuse jobs that are in progress", () => {
     expect(getJob("idle-r").retry_count).toBe(0);
   });
 });
+
+// --- per-job overrides (plan 5.1) -------------------------------------------
+
+import { applyJobOverride } from "../src/web";
+import { effectiveQuality } from "../src/db";
+import { buildDownloadPlan } from "../src/download-args";
+
+const post = (path: string, body: unknown) =>
+  api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+describe("applyJobOverride (pure)", () => {
+  const row = { target_format: "mp4", quality_override: null, want_subtitles: 0 };
+
+  test("omitted fields keep their values; mp4 without audio needs no conversion", () => {
+    const r = applyJobOverride(row, {});
+    expect(r).toEqual({ target_format: "mp4", quality_override: null, want_subtitles: 0, needsConversion: false });
+  });
+
+  test("a non-mp4 format or the audio preset routes through the converter", () => {
+    expect((applyJobOverride(row, { targetFormat: "MKV" }) as any).needsConversion).toBe(true);
+    expect((applyJobOverride(row, { quality: "audio" }) as any).needsConversion).toBe(true);
+    expect((applyJobOverride(row, { quality: "720p" }) as any).needsConversion).toBe(false);
+  });
+
+  test("quality null clears the override; bad values are rejected", () => {
+    expect((applyJobOverride({ ...row, quality_override: "480p" }, { quality: null }) as any).quality_override).toBeNull();
+    expect("error" in applyJobOverride(row, { targetFormat: "avi" })).toBe(true);
+    expect("error" in applyJobOverride(row, { quality: "4k" })).toBe(true);
+    expect("error" in applyJobOverride(row, { wantSubtitles: "yes" })).toBe(true);
+  });
+});
+
+describe("effectiveQuality reaches the download plan", () => {
+  test("a per-job preset replaces config.videoQuality in the format selector", () => {
+    const cfg = baseConfig({ videoQuality: "1080p" });
+    const job = { id: "ovq00000001", url: "u", title: "t", index: 1, output_directory: "/tmp/out", duration: 100, quality_override: "480p" };
+    expect(effectiveQuality(job, cfg)).toBe("480p");
+    const plan = buildDownloadPlan({ job, config: cfg, activeSlots: 0, aria2cAvailable: false });
+    const fmt = plan.args[plan.args.indexOf("--format") + 1];
+    expect(fmt).toContain("height<=480");
+    const plain = buildDownloadPlan({ job: { ...job, quality_override: null }, config: cfg, activeSlots: 0, aria2cAvailable: false });
+    expect(plain.args[plain.args.indexOf("--format") + 1]).toContain("height<=1080");
+  });
+});
+
+describe("POST /api/jobs/:id/override", () => {
+  test("format-only change on a downloaded job re-opens conversion without a re-download", async () => {
+    insertJob("ov000000001", { download_status: "downloaded", conversion_status: "not_needed", file_path: "/tmp/out/a.mp4" });
+    const res = await post("/api/jobs/ov000000001/override", { targetFormat: "mkv" });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(data.retried).toBe(false);
+    const j = getJob("ov000000001");
+    expect(j.target_format).toBe("mkv");
+    expect(j.conversion_status).toBe("pending");
+    expect(j.download_status).toBe("downloaded");
+  });
+
+  test("retry: true re-queues the download with the new quality and is reported in GET", async () => {
+    insertJob("ov000000002", { download_status: "failed", last_error: "boom", retry_count: 3 });
+    const res = await post("/api/jobs/ov000000002/override", { quality: "720p", wantSubtitles: true, retry: true });
+    expect(res.status).toBe(200);
+    const j = getJob("ov000000002");
+    expect(j.quality_override).toBe("720p");
+    expect(j.want_subtitles).toBe(1);
+    expect(j.metadata_status).toBe("pending");
+    expect(j.download_status).toBe("pending");
+    expect(j.retry_count).toBe(0);
+    expect(j.last_error).toBeNull();
+    const got = await (await api("/api/jobs/ov000000002")).json();
+    expect(got.job.quality_override).toBe("720p");
+    expect(got.job.want_subtitles).toBe(1);
+  });
+
+  test("refuses mid-flight jobs (409), unknown ids (404) and bad bodies (400)", async () => {
+    insertJob("ov000000003", { download_status: "downloading" });
+    expect((await post("/api/jobs/ov000000003/override", { targetFormat: "mkv" })).status).toBe(409);
+    expect(getJob("ov000000003").target_format).toBe("mp4");
+    expect((await post("/api/jobs/nope0000001/override", { targetFormat: "mkv" })).status).toBe(404);
+    insertJob("ov000000004");
+    const bad = await post("/api/jobs/ov000000004/override", { targetFormat: "avi" });
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toContain("targetFormat");
+  });
+});

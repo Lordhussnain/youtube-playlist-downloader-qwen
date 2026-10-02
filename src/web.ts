@@ -9,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import os from "node:os";
-import { db } from "./db";
+import { db, type Job } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
 import { activeProcs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
@@ -23,7 +23,7 @@ import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-t
 import { formatBytesPerSec, formatDuration } from "./util";
 import { getStatsSnapshot, invalidateStats } from "./stats";
 import { errorLogPath, logError } from "./logger";
-import type { Config } from "./config";
+import { QUALITY_FORMATS, type Config } from "./config";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request must present it — as a cookie (set after
@@ -242,7 +242,7 @@ const JOB_COLUMNS = `id, url, title, folder, output_directory, file_path, target
                 download_status, conversion_status, metadata_status, pause_reason, metadata_files,
                 retry_count, conversion_retry_count, resume_count, best_progress, last_error,
                 file_size, progress, speed, eta, duration, partial_file_path,
-                audio_tracks, audio_selection, integrity`;
+                audio_tracks, audio_selection, integrity, quality_override, want_subtitles`;
 
 /** Audio-track columns are JSON in SQLite; hand the dashboard real values. */
 function mapJobRow(r: any) {
@@ -355,6 +355,45 @@ function retryJobById(id: string): number {
      WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`,
     [id],
   ).changes;
+}
+
+export const OVERRIDE_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"] as const;
+
+/**
+ * Validate an override request against the job's current row and return the
+ * columns to write. Pure: exported for unit tests. Fields left out of `body`
+ * keep their current values; `quality: null` clears the override.
+ */
+export function applyJobOverride(
+  row: Pick<Job, "target_format" | "quality_override" | "want_subtitles">,
+  body: any,
+):
+  | { target_format: string; quality_override: string | null; want_subtitles: number; needsConversion: boolean }
+  | { error: string } {
+  let target_format = (row.target_format || "mp4").toLowerCase();
+  let quality_override = row.quality_override;
+  let want_subtitles = row.want_subtitles ? 1 : 0;
+
+  if (body?.targetFormat !== undefined) {
+    const f = String(body.targetFormat || "").toLowerCase();
+    if (!(OVERRIDE_FORMATS as readonly string[]).includes(f)) {
+      return { error: `targetFormat must be one of ${OVERRIDE_FORMATS.join(", ")}` };
+    }
+    target_format = f;
+  }
+  if (body?.quality !== undefined) {
+    if (body.quality === null || body.quality === "") quality_override = null;
+    else if (typeof body.quality === "string" && body.quality in QUALITY_FORMATS) quality_override = body.quality;
+    else return { error: `quality must be one of ${Object.keys(QUALITY_FORMATS).join(", ")} or null` };
+  }
+  if (body?.wantSubtitles !== undefined) {
+    if (typeof body.wantSubtitles !== "boolean") return { error: "wantSubtitles must be a boolean" };
+    want_subtitles = body.wantSubtitles ? 1 : 0;
+  }
+  // mp4 straight from yt-dlp needs no remux; anything else (or audio-only,
+  // which the converter turns into mp3) goes through the conversion stage.
+  const needsConversion = target_format !== "mp4" || quality_override === "audio";
+  return { target_format, quality_override, want_subtitles, needsConversion };
 }
 
 /** Shared by the canonical retry route and its legacy alias. */
@@ -557,6 +596,52 @@ const ROUTES: Route[] = [
       const changed = resetFailCounters(id);
       if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       return Response.json({ ok: true });
+    },
+  },
+  {
+    methods: ["POST"],
+    pattern: "/api/jobs/:id/override",
+    handler: async ({ req, id }) => {
+      // Per-job format / quality / subtitles override (plan 5.1). One UPDATE
+      // plus an optional re-queue: a format-only change on a downloaded job
+      // just re-runs the converter from the kept source; a quality change
+      // needs `retry: true` so the video is fetched again with the new
+      // selector. Refused while the job is mid-flight — the running worker
+      // holds its own copy of the row.
+      const row = db.query(
+        "SELECT id, target_format, quality_override, want_subtitles, download_status FROM jobs WHERE id = ?",
+      ).get(id) as Pick<Job, "id" | "target_format" | "quality_override" | "want_subtitles" | "download_status"> | null;
+      if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      if (jobsInProgress([id]).length > 0) return conflictInProgress([id]);
+      const body = await req.json().catch(() => ({}));
+      const next = applyJobOverride(row, body);
+      if ("error" in next) return Response.json({ ok: false, error: next.error }, { status: 400 });
+      db.run(
+        `UPDATE jobs SET target_format = ?, quality_override = ?, want_subtitles = ?,
+           conversion_status = CASE WHEN conversion_status = 'not_needed' AND ? = 1 THEN 'pending'
+                                    ELSE conversion_status END,
+           metadata_status = CASE WHEN ? = 1 AND metadata_status IN ('not_needed', 'completed') THEN 'pending'
+                                  ELSE metadata_status END,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [
+          next.target_format,
+          next.quality_override,
+          next.want_subtitles,
+          next.needsConversion ? 1 : 0,
+          next.want_subtitles && !row.want_subtitles ? 1 : 0,
+          id,
+        ],
+      );
+      if (body?.retry === true) retryJobById(id);
+      invalidateStats();
+      return Response.json({
+        ok: true,
+        target_format: next.target_format,
+        quality_override: next.quality_override,
+        want_subtitles: next.want_subtitles,
+        retried: body?.retry === true,
+      });
     },
   },
   {

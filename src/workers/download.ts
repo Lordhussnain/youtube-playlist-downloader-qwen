@@ -8,7 +8,7 @@
 
 import { stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
+import { claimDownloadJob, db, perVideoCap, type Job, effectiveQuality } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
@@ -515,7 +515,7 @@ async function selfUpdateYtDlp(workerId: number): Promise<string> {
  * the classic single-track plan.
  */
 async function resolveJobAudioTracks(job: Job, config: Config): Promise<AudioTrack[] | null> {
-  if (config.videoQuality === "audio") return null;
+  if (effectiveQuality(job, config) === "audio") return null;
   const known = parseTracksJson(job.audio_tracks);
   if (known) return known;
   const selection = parseSelectionJson(job.audio_selection) || [];
