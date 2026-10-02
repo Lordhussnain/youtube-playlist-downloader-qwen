@@ -14,7 +14,7 @@ import { autoscaler, activeDlSlots } from "./autoscale";
 import { activeProcs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
-import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
+import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS, sweepError } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
@@ -832,6 +832,9 @@ function reliabilityHandler(config: Config): Response {
   // The four self-healing sweeps, with what each currently has in scope.
   // `pending: null` means "not counted here" — the missing-files sweep has to
   // stat every recorded file, which is far too expensive to run per poll.
+  // `error` is the sweep's last swallowed failure (null when its last run was
+  // clean) — a sweep that keeps failing is otherwise indistinguishable from
+  // one with nothing to do.
   const sweeps = [
     {
       id: "crashed",
@@ -839,13 +842,15 @@ function reliabilityHandler(config: Config): Response {
       cadence: "startup",
       detail: "Jobs interrupted mid-flight are re-queued and resume from their partial.",
       pending: interrupted?.count || 0,
+      error: sweepError("crashed"),
     },
     {
       id: "staleClaims",
       label: "Stale claims reclaimed",
       cadence: "every 60s",
-      detail: "Claims orphaned by a dead worker are re-queued after a timeout.",
+      detail: `Claims with no progress for ${t.downloadMinutes} min (downloads), 3 h (conversions) or 15 min (metadata) are re-queued.`,
       pending: staleClaims?.count || 0,
+      error: sweepError("staleClaims"),
     },
     {
       id: "missingFiles",
@@ -853,6 +858,7 @@ function reliabilityHandler(config: Config): Response {
       cadence: "startup",
       detail: "Files recorded as downloaded but no longer on disk are queued again.",
       pending: null,
+      error: sweepError("missingFiles"),
     },
     {
       id: "requeueFailed",
@@ -860,6 +866,15 @@ function reliabilityHandler(config: Config): Response {
       cadence: "every 60s",
       detail: "Failed jobs retry after a cooldown; permanent failures never do.",
       pending: resumableFailed,
+      error: sweepError("requeueFailed"),
+    },
+    {
+      id: "orphanPartials",
+      label: "Stale partials cleaned",
+      cadence: "startup",
+      detail: "Exhausted and orphaned .part files (and stranded aria2c control files) are removed; resumable partials are kept.",
+      pending: null,
+      error: sweepError("orphanPartials"),
     },
   ];
 

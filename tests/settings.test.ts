@@ -294,13 +294,15 @@ describe("GET /api/reliability — resume + self-healing state", () => {
     const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
     const body = await res.json();
     const ids = body.sweeps.map((s: any) => s.id);
-    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed"]);
+    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed", "orphanPartials"]);
     for (const s of body.sweeps) {
       expect(s.label.length).toBeGreaterThan(0);
       expect(s.cadence.length).toBeGreaterThan(0);
       expect(s.detail.length).toBeGreaterThan(0);
       // pending is a count, or null when the sweep is too expensive to poll.
       expect(s.pending === null || typeof s.pending === "number").toBe(true);
+      // error is the last swallowed failure, null when the last run was clean.
+      expect(s.error === null || typeof s.error.message === "string").toBe(true);
     }
     // The missing-files sweep stats every recorded file, so it is not counted.
     const missing = body.sweeps.find((s: any) => s.id === "missingFiles");

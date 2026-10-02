@@ -21,12 +21,43 @@ import { isPermanentDownloadError } from "./retry";
 import { jobBaseFilename } from "./download-args";
 import type { Config } from "./config";
 
+// --- Sweep error registry -------------------------------------------------------
+// Every sweep swallows its own exceptions so a bad row can never take the
+// engine down — but "swallowed" must not mean "invisible". The last failure of
+// each sweep is kept here and surfaced by GET /api/reliability (sweeps[].error)
+// so an operator can see that, say, the failed-job sweep has not actually run
+// for an hour.
+export type SweepId = "crashed" | "staleClaims" | "missingFiles" | "requeueFailed" | "orphanPartials";
+const sweepErrors = new Map<SweepId, { at: string; message: string }>();
+
+export function recordSweepError(id: SweepId, err: unknown): void {
+  const message = String((err as any)?.message || err).slice(0, 300);
+  sweepErrors.set(id, { at: new Date().toISOString(), message });
+  logError(id, message);
+}
+export function clearSweepError(id: SweepId): void {
+  sweepErrors.delete(id);
+}
+/** Last recorded failure per sweep (null when the last run was clean). */
+export function sweepError(id: SweepId): { at: string; message: string } | null {
+  return sweepErrors.get(id) ?? null;
+}
+
 /**
  * Interrupted mid-download jobs become 'paused' + 'interrupted' so they are
  * visible as paused AND automatically re-claimed (resuming where they left
  * off via yt-dlp --continue). User-paused jobs stay held.
  */
 export function reconcileCrashedJobs(): void {
+  try {
+    reconcileCrashedJobsInner();
+    clearSweepError("crashed");
+  } catch (e: any) {
+    recordSweepError("crashed", e);
+  }
+}
+
+function reconcileCrashedJobsInner(): void {
   const stmt = db.run(
     `UPDATE jobs SET
        download_status = CASE WHEN download_status = 'downloading' THEN 'paused' ELSE download_status END,
@@ -123,8 +154,9 @@ export function reapStaleClaims(config: Pick<Config, "maxDownloadMinutes">): voi
       );
       logError("reaper", `reclaimed stale claims: downloads=${dl.changes} conversions=${cv.changes} metadata=${md.changes}`);
     }
+    clearSweepError("staleClaims");
   } catch (e: any) {
-    logError("reaper", String(e?.message || e));
+    recordSweepError("staleClaims", e);
   }
 }
 
@@ -180,8 +212,9 @@ export function reconcileMissingFiles(config: Config): number {
     if (fixed > 0) {
       console.log(`🔍 Startup check: ${fixed} downloaded file(s) missing — re-queued for download.`);
     }
+    clearSweepError("missingFiles");
   } catch (e: any) {
-    logError("reconcile", String(e?.message || e));
+    recordSweepError("missingFiles", e);
   }
   return fixed;
 }
@@ -318,8 +351,9 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
         `♻️ Re-queued ${result.downloads} download(s), ${result.conversions} conversion(s), ${result.metadata} metadata job(s) after cooldown.`,
       );
     }
+    clearSweepError("requeueFailed");
   } catch (e: any) {
-    logError("requeue", String(e?.message || e));
+    recordSweepError("requeueFailed", e);
   }
   return result;
 }
@@ -581,5 +615,10 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
     }
 
     if (removed > 0) console.log(`🧹 Cleaned ${removed} stale partial file(s).`);
-  } catch {}
+    clearSweepError("orphanPartials");
+  } catch (e: any) {
+    // An unreadable output root (unmounted NAS, permissions) used to vanish
+    // here; now it is in error.log and on the reliability panel.
+    recordSweepError("orphanPartials", e);
+  }
 }

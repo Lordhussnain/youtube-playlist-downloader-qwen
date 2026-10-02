@@ -57,8 +57,16 @@ export async function handleShutdown(sig: string, webServer: { stop: (closeActiv
     // self-contained after the process exits.
     try {
       db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-    } catch {}
-  } catch {}
+    } catch (e: any) {
+      logError("shutdown", `WAL checkpoint failed: ${e?.message || e}`);
+    }
+  } catch (e: any) {
+    // If this fails the next start sees 'downloading' rows it must reconcile
+    // itself — recoverable, but the operator should know the shutdown was
+    // not clean.
+    logError("shutdown", `could not persist the interrupted pipeline: ${e?.stack || e}`);
+    console.error("⚠️ Shutdown: could not persist job state:", e?.message || e);
+  }
   webServer?.stop(true);
   resetTerminal();
   process.exit(0);

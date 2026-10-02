@@ -629,6 +629,8 @@
     .sweep-row .sweep-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sweep-row .sweep-cadence { color: var(--text-secondary); font-size: 0.68rem; white-space: nowrap; }
     .sweep-row .pill { font-size: 0.66rem; padding: 1px 7px; }
+    .sweep-row.sweep-error .sweep-name { color: var(--danger); }
+    .pill.danger { color: var(--danger); border-color: #991b1b; }
 
 
     @media (max-width: 768px) {
@@ -1265,12 +1267,20 @@
         sweepsEl.innerHTML = sweeps.length
           ? `<div class="sweep-list">${sweeps.map(sw => {
               const pending = sw.pending;
-              const badge = pending === null || pending === undefined
-                ? '<span class="pill">–</span>'
-                : pending > 0
-                  ? `<span class="pill warn">${pending}</span>`
-                  : '<span class="pill ok">0</span>';
-              return `<div class="sweep-row" title="${escapeHtml(sw.detail || '')}">
+              // A sweep whose last run threw shows a red pill with the error
+              // in the tooltip — otherwise a failing sweep looks exactly like
+              // one with nothing to do.
+              const badge = sw.error
+                ? '<span class="pill danger">error</span>'
+                : pending === null || pending === undefined
+                  ? '<span class="pill">–</span>'
+                  : pending > 0
+                    ? `<span class="pill warn">${pending}</span>`
+                    : '<span class="pill ok">0</span>';
+              const tip = sw.error
+                ? `Last run failed at ${sw.error.at}: ${sw.error.message}`
+                : (sw.detail || '');
+              return `<div class="sweep-row${sw.error ? ' sweep-error' : ''}" title="${escapeHtml(tip)}">
                   <span class="sweep-name">${escapeHtml(sw.label || '')}</span>
                   <span class="sweep-cadence">${escapeHtml(sw.cadence || '')}</span>
                   ${badge}

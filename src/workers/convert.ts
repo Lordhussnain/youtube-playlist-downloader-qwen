@@ -181,10 +181,25 @@ async function finalizeConversion(
       if (!SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx))) continue;
       const sideSrc = join(srcDir, f);
       const sideDest = join(destDir, f);
-      await rename(sideSrc, sideDest).catch(async () => {
-        await cp(sideSrc, sideDest, { force: true }).catch(() => {});
-        await unlink(sideSrc).catch(() => {});
-      });
+      try {
+        await rename(sideSrc, sideDest);
+      } catch {
+        // Cross-device: copy, then delete the original ONLY if the copy
+        // succeeded. A failed copy used to drop the error and unlink anyway,
+        // silently losing the sidecar.
+        try {
+          await cp(sideSrc, sideDest, { force: true });
+        } catch (e: any) {
+          logError(
+            "conversion",
+            `${job.id} ${job.title}: could not move sidecar ${f} to ${destDir}: ${e?.code || e?.message || e} — left in place`,
+          );
+          continue;
+        }
+        await unlink(sideSrc).catch((e: any) =>
+          logError("conversion", `${job.id} ${job.title}: sidecar copied but original ${sideSrc} could not be removed: ${e?.code || e}`),
+        );
+      }
     }
     const destPath = join(destDir, basename(finalPath));
     await rename(finalPath, destPath).catch(async () => {
