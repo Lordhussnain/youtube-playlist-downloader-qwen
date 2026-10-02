@@ -42,7 +42,7 @@ const TRACK_INDEX_SUFFIX = /-(\d+)$/;
 /** Track index encoded in a YouTube audio format id (`251-2` → 2). */
 export function trackIndexOf(formatId: string): number {
   const m = formatId.match(TRACK_INDEX_SUFFIX);
-  return m ? parseInt(m[1], 10) : 0;
+  return m?.[1] ? parseInt(m[1], 10) : 0;
 }
 
 function trackLabel(f: Record<string, unknown>, language: string): string {
@@ -113,7 +113,7 @@ export function extractAudioTracks(info: unknown): AudioTrack[] {
   const tracks: AudioTrack[] = [];
   for (const bucket of groups.values()) {
     bucket.sort(preferStream);
-    tracks.push(bucket[0]);
+    if (bucket[0]) tracks.push(bucket[0]);
   }
   tracks.sort(
     (a, b) =>
@@ -169,9 +169,9 @@ export function multiAudioFormatSelector(
   baseFormat: string,
   tracks: AudioTrack[],
 ): string {
-  const [primary, ...fallbackParts] = baseFormat.split("/");
+  const [primary = "", ...fallbackParts] = baseFormat.split("/");
   const fallback = fallbackParts.join("/");
-  const videoSide = primary.split("+")[0];
+  const videoSide = primary.split("+")[0] ?? "";
   const ids = tracks.map((t) => t.formatId).join("+");
   return fallback ? `${videoSide}+${ids}/${fallback}` : `${videoSide}+${ids}`;
 }

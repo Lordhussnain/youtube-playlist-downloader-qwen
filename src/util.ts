@@ -34,7 +34,7 @@ export function formatBytesPerSec(bps: number): string {
 export function parseSpeedToBytesPerSec(speedStr: string): number {
   if (!speedStr || speedStr.trim() === "" || speedStr.toLowerCase() === "na") return 0;
   const match = speedStr.match(/([\d.]+)\s*([KMGT]?i?B)/i);
-  if (!match) return 0;
+  if (!match?.[1] || !match[2]) return 0;
   const val = parseFloat(match[1]);
   const unit = match[2].toLowerCase().replace("ib", "b");
   const multipliers: Record<string, number> = { b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3, tb: 1024 ** 4 };
@@ -59,7 +59,7 @@ export function hardenName(name: string): string {
   let n = name.replace(/[\x00-\x1f]/g, " ").replace(/\s+/g, " ").trim();
   n = n.replace(/[. ]+$/g, "");
   if (!n) return "";
-  const stem = n.split(".")[0];
+  const stem = n.split(".")[0] ?? n;
   if (WINDOWS_RESERVED.test(stem)) n = `_${n}`;
   return n;
 }

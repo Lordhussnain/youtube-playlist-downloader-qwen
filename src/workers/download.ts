@@ -237,12 +237,16 @@ export async function runSpawnedDownload(
 
       for (const line of lines) {
         if (line.startsWith("PROGRESS:")) {
-          const parts = line.slice("PROGRESS:".length).split("|");
-          const bps = parseSpeedToBytesPerSec(parts[1]);
+          // percent|speed|eta|total_bytes|downloaded_bytes — any field may be
+          // "NA" or missing on the first lines; every parse below tolerates that.
+          const [pctRaw = "", speedRaw = "", etaRaw = "", sizeRaw = "", dlRaw = ""] = line
+            .slice("PROGRESS:".length)
+            .split("|");
+          const bps = parseSpeedToBytesPerSec(speedRaw);
           if (bps > 0) autoscaler.recordSpeed(id, bps);
-          const sizeNum = parseInt(parts[3], 10);
-          const dlNum = parseInt(parts[4], 10);
-          let pctNum = parseFloat(parts[0]);
+          const sizeNum = parseInt(sizeRaw, 10);
+          const dlNum = parseInt(dlRaw, 10);
+          let pctNum = parseFloat(pctRaw);
           if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
           if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
             // Backfill file_size from progress so the global ETA has a total to work with.
@@ -250,9 +254,9 @@ export async function runSpawnedDownload(
             // best_progress is the high-water mark of this job's attempts: it is
             // what lets the retry budget forgive repeated failures at increasing
             // completion percentages (see handleDownloadFailure).
-            updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+            updateJobProgress(job.id, pctNum, bps, parseFloat(etaRaw) || 0, totalBytes);
             const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
-            const etaNum = parseFloat(parts[2]);
+            const etaNum = parseFloat(etaRaw);
             const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
             updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
             lastProgressUpdate = Date.now();
@@ -263,7 +267,7 @@ export async function runSpawnedDownload(
           // Capture paths embedded in yt-dlp status lines (merger output,
           // etc.) and the bare `--print after_move:filepath` line.
           const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
-          pathCandidates.push(m ? m[1] : trimmed);
+          pathCandidates.push(m?.[1] ?? trimmed);
           if (pathCandidates.length > MAX_PATH_CANDIDATES) pathCandidates.shift();
         }
       }

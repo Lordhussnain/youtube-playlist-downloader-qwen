@@ -53,7 +53,8 @@ async function askChoice(q: string, options: string[], current: string): Promise
     const ans = await ask("Select number (or Enter to keep): ");
     if (ans.trim() === "") return current;
     const idx = parseInt(ans, 10) - 1;
-    if (idx >= 0 && idx < options.length) return options[idx];
+    const picked = options[idx];
+    if (picked !== undefined) return picked;
     console.log("   ⚠️ Invalid selection.");
   }
 }

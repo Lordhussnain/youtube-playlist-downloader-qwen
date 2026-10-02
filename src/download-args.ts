@@ -121,7 +121,7 @@ export function buildDownloadPlan(opts: BuildDownloadPlanOptions): DownloadPlan 
   const { job, config, activeSlots, aria2cAvailable } = opts;
 
   const engine = resolveDownloaderEngine(config, aria2cAvailable);
-  const format = QUALITY_FORMATS[config.videoQuality] || QUALITY_FORMATS["1080p"];
+  const format: string = QUALITY_FORMATS[config.videoQuality] ?? QUALITY_FORMATS["1080p"]!;
   // Multi-audio: splice the discovered track ids into the quality preset so
   // every wanted language is downloaded (YouTube's "Audio track" menu). The
   // audio-only preset is exempt — an mp3 cannot carry several tracks.

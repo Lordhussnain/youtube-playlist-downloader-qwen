@@ -287,7 +287,7 @@ describe("buildDownloadPlan with audio tracks", () => {
       config: cfg(),
       activeSlots: 3,
       aria2cAvailable: true,
-      audioTracks: [tracks[0]],
+      audioTracks: [tracks[0]!],
     });
     expect(flagValue(plan.args, "--format")).toBe("bv[height<=1080]+251-0/b[height<=1080]");
     expect(plan.args).not.toContain("--audio-multistreams");

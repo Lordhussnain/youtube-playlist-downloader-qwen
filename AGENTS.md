@@ -41,7 +41,8 @@ bun run start          # run the engine (reads ./config.json, creates it if abse
 bun run config         # interactive config manager (TTY)
 bun run typecheck      # tsc --noEmit
 bun test               # full suite: unit + end-to-end (~45s, no network needed)
-bun run check          # typecheck + tests
+bun run check          # typecheck + UI script gate + tests (what CI runs)
+bun run check:ui       # parse the dashboard's inline <script> blocks
 bun run build:win      # cross-compile dist/youtube-archive.exe (Windows)
                          start-archive.bat runs it from dist\ first, then the
                          app folder, then falls back to `bun run`
@@ -489,10 +490,15 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 bun test                       # everything (~130s — the integration scenarios dominate)
 bun test tests/retry.test.ts   # one file
 bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
-bun run check                  # typecheck + full suite (what CI/the definition of done means)
+bun run check:ui               # parse web_ui.html's inline scripts (scripts/check-ui.ts)
+bun run check                  # typecheck + check:ui + full suite (what CI/the definition of done means)
 ```
 
-279 tests across 20 files. Tests share one process, so any file that touches the
+CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
+same three steps on Ubuntu and Windows — the suite compiles its mocks per
+platform, so both must stay green.
+
+~350 tests across 26 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -587,6 +593,7 @@ Mock controls (environment variables):
 | `FAKE_FAIL_MODE` | `transient` \| `permanent` \| `corrupt` (which error message to emit) |
 | `FAKE_DELAY_MS` | artificial per-attempt delay |
 | `FAKE_HANG=1` | never exit (watchdog testing) |
+| `FAKE_PROGRESS_THEN_HANG=1` | write a `.part`, print one `PROGRESS:` line, then hang (child-lifecycle testing — see `tests/download-worker.test.ts`) |
 | `FAKE_ARIA2C_BIN` | absolute path of the sibling aria2c mock (set by the integration harness so that hop never depends on PATH) |
 | `FAKE_ARIA2C_FAIL_TIMES=N` | fail the first N attempts *inside* aria2c, leaving the `.part` + `.part.aria2` pair |
 | `FAKE_ARIA2C_FAIL_MODE` | `transient` \| `corrupt` (which aria2c-side error message to emit) |
@@ -598,13 +605,12 @@ mocking internals** — the mocks are the contract boundary.
 ### 9.4 Editing `web_ui.html`
 
 ```bash
-python3 - <<'PY'
-import re
-html = open('web_ui.html').read()
-open('/tmp/inline.js','w').write('\n;\n'.join(re.findall(r'<script>(.*?)</script>', html, re.S)))
-PY
-node --check /tmp/inline.js   # syntax gate before committing UI changes
+bun run check:ui   # parses every inline <script> block; part of `bun run check`
 ```
+
+`scripts/check-ui.ts` extracts the inline scripts and parses them with Bun's
+transpiler (no execution). It is wired into `bun run check` and CI, so a
+stray brace fails the gate instead of showing up as a blank dashboard.
 
 ---
 
@@ -736,7 +742,9 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 279 tests across 20 files).
+- `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
+  `check:ui` script gate, and the full suite — ~350 tests across 26 files).
+  CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

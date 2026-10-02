@@ -18,7 +18,7 @@ const channelIdCache = new Map<string, string>();
 export async function resolveChannelId(channelUrl: string, config: Config): Promise<string | null> {
   // /channel/UC... URLs carry the id directly — no yt-dlp call needed.
   const direct = channelUrl.match(/channel\/(UC[\w-]{10,})/);
-  if (direct) return direct[1];
+  if (direct?.[1]) return direct[1];
   const cached = channelIdCache.get(channelUrl);
   if (cached) return cached;
   try {
@@ -50,7 +50,7 @@ export function parseRssFeed(xml: string): { feedTitle: string; items: ListingIt
     xml
       .match(/<feed[^>]*>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]
       ?.trim() || "RSS Channel";
-  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1]);
+  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map((m) => m[1] ?? "");
   const items: ListingItem[] = [];
   for (const entry of entries) {
     const id = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/)?.[1];

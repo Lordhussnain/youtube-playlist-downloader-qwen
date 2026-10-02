@@ -48,8 +48,8 @@ describe("extractAudioTracks", () => {
 
   test("keeps the best stream per track (bitrate, then opus)", () => {
     const tracks = extractAudioTracks(INFO);
-    expect(tracks[0].tbr).toBe(160);
-    expect(tracks[0].acodec).toBe("opus");
+    expect(tracks[0]!.tbr).toBe(160);
+    expect(tracks[0]!.acodec).toBe("opus");
   });
 
   test("carries language, label, and the original/default flag", () => {
@@ -66,7 +66,7 @@ describe("extractAudioTracks", () => {
       ],
     });
     expect(tracks).toHaveLength(1);
-    expect(tracks[0].isDefault).toBe(true);
+    expect(tracks[0]!.isDefault).toBe(true);
   });
 
   test("tolerates garbage input", () => {

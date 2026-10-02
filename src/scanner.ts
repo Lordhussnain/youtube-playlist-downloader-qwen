@@ -102,12 +102,13 @@ export function parseListing(out: string): ListingItem[] {
     if (!line.trim()) continue;
     const parts = line.split(LISTING_SEP);
     let item: ListingItem | null = null;
-    if (parts.length === 4 && VIDEO_ID_RE.test(parts[1].trim())) {
+    const [p0 = "", p1 = "", p2 = "", p3 = "NaN"] = parts;
+    if (parts.length === 4 && VIDEO_ID_RE.test(p1.trim())) {
       item = {
-        playlist: parts[0].trim() || "playlist",
-        id: parts[1].trim(),
-        title: (parts[2].trim() || "video").slice(0, MAX_TITLE_CHARS),
-        duration: parseFloat(parts[3] ?? "NaN"),
+        playlist: p0.trim() || "playlist",
+        id: p1.trim(),
+        title: (p2.trim() || "video").slice(0, MAX_TITLE_CHARS),
+        duration: parseFloat(p3),
       };
     } else if (parts.length > 4) {
       // A separator inside the playlist title or the video title. The id is
@@ -117,7 +118,7 @@ export function parseListing(out: string): ListingItem[] {
       if (idx > 0) {
         item = {
           playlist: parts.slice(0, idx).join(LISTING_SEP).trim() || "playlist",
-          id: parts[idx].trim(),
+          id: (parts[idx] ?? "").trim(),
           title: (parts.slice(idx + 1, -1).join(LISTING_SEP).trim() || "video").slice(0, MAX_TITLE_CHARS),
           duration: parseFloat(parts[parts.length - 1] ?? "NaN"),
         };
@@ -142,7 +143,10 @@ export async function ingestItems(
   overrideFolderName?: string,
 ): Promise<{ found: number; added: number; skipped: number }> {
   if (items.length === 0) return { found: 0, added: 0, skipped: 0 };
-  const folder = sanitizeFolderName(overrideFolderName || items[0].playlist || "Single Videos").slice(0, MAX_FOLDER_CHARS).trim() || "playlist";
+  const folder =
+    sanitizeFolderName(overrideFolderName || items[0]?.playlist || "Single Videos")
+      .slice(0, MAX_FOLDER_CHARS)
+      .trim() || "playlist";
   const outputDir = join(config.outputRoot, folder);
   await mkdir(outputDir, { recursive: true });
   const targetFormat = config.videoQuality === "audio" ? "mp3" : (config.targetFormat || "mp4");

@@ -30,16 +30,16 @@ describe("parseListing (3.4)", () => {
   test("a separator inside the title no longer corrupts the id", () => {
     const items = parseListing("List|||dQw4w9WgXcQ|||Part A ||| Part B|||100");
     expect(items.length).toBe(1);
-    expect(items[0].id).toBe("dQw4w9WgXcQ");
-    expect(items[0].title).toBe("Part A ||| Part B");
-    expect(items[0].duration).toBe(100);
+    expect(items[0]!.id).toBe("dQw4w9WgXcQ");
+    expect(items[0]!.title).toBe("Part A ||| Part B");
+    expect(items[0]!.duration).toBe(100);
   });
 
   test("a separator inside the playlist title is tolerated too", () => {
     const items = parseListing("A ||| B|||dQw4w9WgXcQ|||Title|||5");
-    expect(items[0].playlist).toBe("A ||| B");
-    expect(items[0].id).toBe("dQw4w9WgXcQ");
-    expect(items[0].title).toBe("Title");
+    expect(items[0]!.playlist).toBe("A ||| B");
+    expect(items[0]!.id).toBe("dQw4w9WgXcQ");
+    expect(items[0]!.title).toBe("Title");
   });
 
   test("lines whose id does not validate are skipped, not inserted", () => {
@@ -49,8 +49,8 @@ describe("parseListing (3.4)", () => {
 
   test("empty fields fall back to placeholders", () => {
     const [item] = parseListing("|||dQw4w9WgXcQ||||||NA");
-    expect(item.playlist).toBe("playlist");
-    expect(item.title).toBe("video");
+    expect(item!.playlist).toBe("playlist");
+    expect(item!.title).toBe("video");
   });
 });
 
@@ -62,7 +62,7 @@ describe("ingestItems hardening (3.4 / 3.5)", () => {
     expect(r.added).toBe(1);
     const dirs = readdirSync(root);
     expect(dirs.length).toBe(1);
-    expect(dirs[0].length).toBeLessThanOrEqual(MAX_FOLDER_CHARS);
+    expect(dirs[0]!.length).toBeLessThanOrEqual(MAX_FOLDER_CHARS);
     const row = db.query("SELECT folder, output_directory FROM jobs WHERE id = 'dQw4w9WgXcQ'").get() as any;
     expect(existsSync(row.output_directory)).toBe(true);
   });

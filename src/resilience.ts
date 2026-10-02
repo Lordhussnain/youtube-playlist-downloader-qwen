@@ -222,7 +222,7 @@ async function getPSDriveFreeSpace(drive: string): Promise<DiskUsage | null> {
     if (!result) return null; // shell never answered
     const [out, code] = result;
     if (code !== 0) return null;
-    const [free, used] = out.trim().split(/\s+/).map((n) => parseFloat(n));
+    const [free = NaN, used = NaN] = out.trim().split(/\s+/).map((n) => parseFloat(n));
     if (!Number.isFinite(free)) return null;
     return {
       freeBytes: free,

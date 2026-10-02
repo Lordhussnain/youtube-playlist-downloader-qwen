@@ -38,7 +38,7 @@ export function extractWebToken(req: Request, url: URL): string | null {
   if (query) return query.trim();
   const cookie = req.headers.get("cookie") || "";
   const match = cookie.match(/(?:^|;\s*)yta_token=([^;]+)/);
-  if (match) return safeDecode(match[1])?.trim() ?? null;
+  if (match?.[1]) return safeDecode(match[1])?.trim() ?? null;
   return null;
 }
 
@@ -197,6 +197,8 @@ type RouteHandler = (ctx: {
   config: Config;
   url: URL;
   params: RouteParams;
+  /** The `:id` segment — every per-job route binds one; "" when absent. */
+  id: string;
 }) => Response | Promise<Response>;
 
 interface Route {
@@ -221,13 +223,14 @@ function matchRoute(pattern: string, segments: string[]): RouteParams | null {
   if (parts.length !== segments.length) return null;
   const params: RouteParams = {};
   for (let i = 0; i < parts.length; i++) {
-    const p = parts[i];
+    const p = parts[i] ?? "";
+    const seg = segments[i];
     if (p.startsWith(":")) {
-      if (!segments[i]) return null; // never bind an empty param
-      const decoded = safeDecode(segments[i]);
+      if (!seg) return null; // never bind an empty param
+      const decoded = safeDecode(seg);
       if (decoded === null) return null; // `/api/jobs/%` is a 404, not a 500
       params[p.slice(1)] = decoded;
-    } else if (p !== segments[i]) {
+    } else if (p !== seg) {
       return null;
     }
   }
@@ -536,8 +539,8 @@ const ROUTES: Route[] = [
   {
     methods: ["GET"],
     pattern: "/api/jobs/:id",
-    handler: ({ params }) => {
-      const row = db.query(`SELECT ${JOB_COLUMNS} FROM jobs WHERE id = ?`).get(params.id) as any;
+    handler: ({ id }) => {
+      const row = db.query(`SELECT ${JOB_COLUMNS} FROM jobs WHERE id = ?`).get(id) as any;
       if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       return Response.json({ ok: true, job: mapJobRow(row) });
     },
@@ -545,13 +548,13 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/retry",
-    handler: ({ params }) => retryRoute(params.id),
+    handler: ({ id }) => retryRoute(id),
   },
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/reset-failures",
-    handler: ({ params }) => {
-      const changed = resetFailCounters(params.id);
+    handler: ({ id }) => {
+      const changed = resetFailCounters(id);
       if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       return Response.json({ ok: true });
     },
@@ -559,12 +562,11 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/audio-tracks",
-    handler: async ({ req, params }) => {
+    handler: async ({ req, id }) => {
       // Per-job audio-track picker (YouTube multi-language audio): save which
       // languages the next download attempt should keep. `tracks: null` resets
       // the job to the global multi-audio mode. Takes effect on the next
       // attempt — use Retry job to fetch an already-downloaded video again.
-      const id = params.id;
       const row = db.query("SELECT id FROM jobs WHERE id = ?").get(id);
       if (!row) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       const body = await req.json().catch(() => ({}));
@@ -591,10 +593,9 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/audio-probe",
-    handler: async ({ req, config, params }) => {
+    handler: async ({ req, config, id }) => {
       // Discover (or refresh) the audio tracks YouTube offers for one job —
       // the dashboard's track picker needs the list before a download has run.
-      const id = params.id;
       const job = db.query("SELECT id, url FROM jobs WHERE id = ?").get(id) as
         | { id: string; url: string }
         | null;
@@ -617,9 +618,9 @@ const ROUTES: Route[] = [
   {
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
-    handler: ({ params }) => {
-      if (jobsInProgress([params.id]).length > 0) return conflictInProgress([params.id]);
-      const result = db.run(`DELETE FROM jobs WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`, [params.id]);
+    handler: ({ id }) => {
+      if (jobsInProgress([id]).length > 0) return conflictInProgress([id]);
+      const result = db.run(`DELETE FROM jobs WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`, [id]);
       if (result.changes === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       invalidateStats();
       return Response.json({ ok: true, deleted: result.changes });
@@ -655,13 +656,13 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/retry/:id",
-    handler: ({ params }) => retryRoute(params.id),
+    handler: ({ id }) => retryRoute(id),
   },
   {
     methods: ["POST"],
     pattern: "/api/failcount/reset/:id",
-    handler: ({ params }) => {
-      resetFailCounters(params.id);
+    handler: ({ id }) => {
+      resetFailCounters(id);
       return Response.json({ ok: true });
     },
   },
@@ -846,7 +847,7 @@ async function handleApi(req: Request, config: Config, url: URL, pathname: strin
       for (const m of route.methods) allow.add(m);
       continue;
     }
-    return await route.handler({ req, config, url, params });
+    return await route.handler({ req, config, url, params, id: params.id ?? "" });
   }
   if (allow.size > 0) {
     return methodNotAllowed(req.method, pathname, [...allow]);

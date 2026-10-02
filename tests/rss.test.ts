@@ -59,11 +59,11 @@ describe("parseRssFeed", () => {
 
   test("extracts titles and durations when present", () => {
     const { items } = parseRssFeed(SAMPLE_FEED);
-    expect(items[0].title).toBe("First Video &amp; &lt;Intro&gt;"); // raw feed text, as yt-dlp sees it
-    expect(items[0].duration).toBe(365);
-    expect(items[1].duration).toBe(45);
+    expect(items[0]!.title).toBe("First Video &amp; &lt;Intro&gt;"); // raw feed text, as yt-dlp sees it
+    expect(items[0]!.duration).toBe(365);
+    expect(items[1]!.duration).toBe(45);
     // Missing media:duration → NaN, which bypasses the shorts filter.
-    expect(Number.isNaN(items[2].duration)).toBe(true);
+    expect(Number.isNaN(items[2]!.duration)).toBe(true);
   });
 
   test("falls back to the video id when a title is missing", () => {
@@ -71,7 +71,7 @@ describe("parseRssFeed", () => {
       <entry><yt:videoId>zzzzzzzzzzz</yt:videoId></entry></feed>`;
     const { items } = parseRssFeed(xml);
     expect(items).toHaveLength(1);
-    expect(items[0].title).toBe("zzzzzzzzzzz");
+    expect(items[0]!.title).toBe("zzzzzzzzzzz");
   });
 
   test("handles CDATA titles", () => {
@@ -79,7 +79,7 @@ describe("parseRssFeed", () => {
       <entry><yt:videoId>yyyyyyyyyyy</yt:videoId><title><![CDATA[A CDATA Title]]></title></entry></feed>`;
     const { feedTitle, items } = parseRssFeed(xml);
     expect(feedTitle).toBe("CDATA Channel");
-    expect(items[0].title).toBe("A CDATA Title");
+    expect(items[0]!.title).toBe("A CDATA Title");
   });
 
   test("returns empty results for an empty or malformed feed", () => {
