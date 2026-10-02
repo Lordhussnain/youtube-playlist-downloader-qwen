@@ -180,3 +180,108 @@ describe("the route table", () => {
     expect(Array.isArray(data.workers)).toBe(true);
   });
 });
+
+// --- Live-claim guards (1.2) --------------------------------------------------
+// A job some worker is actively working on must not be retried, deleted,
+// purged or flipped by the dashboard: the download guard would otherwise pass
+// and yt-dlp would write over the file ffmpeg is reading.
+describe("mutating routes refuse jobs that are in progress", () => {
+  const LIVE = {
+    downloading: { download_status: "downloading", download_claimed_by: "dl-7", download_claimed_at: "2030-01-01 00:00:00" },
+    converting: { download_status: "downloaded", conversion_status: "in_progress", conversion_claimed_by: "cv-1" },
+    metadata: { download_status: "downloaded", metadata_status: "in_progress", conversion_status: "pending" },
+  } as const;
+
+  const snapshot = (id: string) => {
+    const j = getJob(id);
+    return [j.download_status, j.conversion_status, j.metadata_status, j.download_claimed_by, j.conversion_claimed_by, j.retry_count];
+  };
+
+  for (const [label, cols] of Object.entries(LIVE)) {
+    test(`retry → 409 while ${label}, and nothing changes`, async () => {
+      insertJob("busy1", { ...cols, retry_count: 2 });
+      const before = snapshot("busy1");
+      for (const path of ["/api/jobs/busy1/retry", "/api/retry/busy1"]) {
+        const res = await api(path, { method: "POST" });
+        expect(res.status).toBe(409);
+        const body = await res.json();
+        expect(body.ok).toBe(false);
+        expect(body.error).toBe("job is in progress");
+        expect(body.inProgress).toEqual(["busy1"]);
+      }
+      expect(snapshot("busy1")).toEqual(before);
+    });
+
+    test(`delete → 409 while ${label}`, async () => {
+      insertJob("busy2", cols);
+      const res = await api("/api/jobs/busy2", { method: "DELETE" });
+      expect(res.status).toBe(409);
+      expect(getJob("busy2")).toBeTruthy();
+    });
+
+    test(`bulk delete → 409 while ${label}, idle siblings untouched`, async () => {
+      insertJob("busy3", cols);
+      insertJob("idle3");
+      const res = await api("/api/jobs", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ids: ["busy3", "idle3"] }),
+      });
+      expect(res.status).toBe(409);
+      expect((await res.json()).inProgress).toEqual(["busy3"]);
+      expect(getJob("busy3")).toBeTruthy();
+      expect(getJob("idle3")).toBeTruthy();
+    });
+  }
+
+  test("purge skips rows holding a live claim", async () => {
+    insertJob("p-pending"); // deleted
+    insertJob("p-failed", { download_status: "failed" }); // deleted
+    insertJob("p-paused-claimed", { download_status: "paused", download_claimed_by: "dl-2" }); // kept
+    insertJob("p-failed-converting", { download_status: "failed", conversion_status: "in_progress" }); // kept
+    insertJob("p-downloaded", { download_status: "downloaded" }); // not in scope anyway
+    const res = await api("/api/queue/purge", { method: "POST" });
+    expect(res.status).toBe(200);
+    expect((await res.json()).deleted).toBe(2);
+    expect(getJob("p-pending")).toBeNull();
+    expect(getJob("p-failed")).toBeNull();
+    expect(getJob("p-paused-claimed")).toBeTruthy();
+    expect(getJob("p-failed-converting")).toBeTruthy();
+    expect(getJob("p-downloaded")).toBeTruthy();
+  });
+
+  test("bulk pause parks queued jobs, flags in-flight downloads, refuses post-processing", async () => {
+    insertJob("pp-pending");
+    insertJob("pp-dl", LIVE.downloading);
+    insertJob("pp-cv", LIVE.converting);
+    const res = await api("/api/jobs/pause", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: ["pp-pending", "pp-dl", "pp-cv"] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.paused).toBe(1);
+    expect(body.interrupting).toBe(1);
+    expect(body.inProgress).toEqual(["pp-cv"]);
+    // queued → parked immediately
+    expect(getJob("pp-pending").download_status).toBe("paused");
+    expect(getJob("pp-pending").pause_reason).toBe("user");
+    // in flight → status + claim untouched, reason recorded for the worker
+    expect(getJob("pp-dl").download_status).toBe("downloading");
+    expect(getJob("pp-dl").download_claimed_by).toBe("dl-7");
+    expect(getJob("pp-dl").pause_reason).toBe("user");
+    // converting → refused, untouched
+    expect(getJob("pp-cv").conversion_status).toBe("in_progress");
+    expect(getJob("pp-cv").pause_reason).toBeNull();
+  });
+
+  test("retry of an idle job still works and clears a user pause", async () => {
+    insertJob("idle-r", { download_status: "paused", pause_reason: "user", retry_count: 3 });
+    const res = await api("/api/jobs/idle-r/retry", { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(getJob("idle-r").download_status).toBe("pending");
+    expect(getJob("idle-r").pause_reason).toBeNull();
+    expect(getJob("idle-r").retry_count).toBe(0);
+  });
+});

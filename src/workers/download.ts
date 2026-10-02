@@ -174,6 +174,17 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
     return;
   }
+  // Per-job user pause (POST /api/jobs/pause while this job was downloading):
+  // the route recorded pause_reason='user' and SIGINTed yt-dlp. An interrupted
+  // transfer is parked with its .part frozen; one that finished anyway is
+  // recorded as downloaded — work already done is never thrown away — and
+  // keeps pause_reason='user' so the metadata/convert claims hold it until an
+  // explicit Resume.
+  if (code !== 0 && userPauseRequested(job.id)) {
+    parkPaused(job, "user");
+    updateWorkerLine(id, `⏸️ Paused by user | ${job.title}`, config);
+    return;
+  }
 
   if (timedOut) throw new Error(`Process timed out (${Math.round(timeoutMs / 60000)}m)`);
 
@@ -223,6 +234,14 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   if (isPaused()) {
     parkPaused(job);
     updateWorkerLine(id, `⏸️ Paused | ${job.title}`, config);
+    return;
+  }
+  // A per-job user pause outranks every failure class below: the operator
+  // asked for this video to stop, so it parks (partial kept) instead of being
+  // written back to 'pending' by the transient branch.
+  if (userPauseRequested(job.id)) {
+    parkPaused(job, "user");
+    updateWorkerLine(id, `⏸️ Paused by user | ${job.title}`, config);
     return;
   }
 
@@ -434,10 +453,20 @@ function readProgressState(id: string): { retryCount: number; bestProgress: numb
   };
 }
 
-function parkPaused(job: Job): void {
+/** True when the dashboard asked for THIS job to pause while it was in flight. */
+function userPauseRequested(id: string): boolean {
+  const row = db.query("SELECT pause_reason FROM jobs WHERE id = ?").get(id) as { pause_reason: string | null } | null;
+  return row?.pause_reason === "user";
+}
+
+/**
+ * Park an in-flight job as paused. With no reason the row is auto-resumable
+ * (global pause / shutdown); `"user"` holds it until an explicit Resume.
+ */
+function parkPaused(job: Job, reason: "user" | null = null): void {
   db.run(
-    `UPDATE jobs SET download_status = 'paused', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-    [job.id],
+    `UPDATE jobs SET download_status = 'paused', pause_reason = ?, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [reason, job.id],
   );
   // Freeze the resume point: the .part is on disk, and without recording it the
   // job is paused with no resumable partial, so the next attempt restarts the

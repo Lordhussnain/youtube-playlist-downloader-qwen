@@ -1065,13 +1065,16 @@
       selectedJobs.clear();
       updateBulkActions();
       let okCount = 0;
+      let busyCount = 0;
       for (const id of ids) {
         try {
           const res = await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
           if (res.ok) okCount++;
+          else if (res.status === 409) busyCount++;
         } catch {}
       }
-      showNotification(`🔄 Queued ${okCount} job(s) for retry`, 'success');
+      const busyNote = busyCount > 0 ? ` — ${busyCount} skipped (in progress)` : '';
+      showNotification(`🔄 Queued ${okCount} job(s) for retry${busyNote}`, busyCount > 0 ? 'warning' : 'success');
       refreshData();
     }
 
@@ -1087,7 +1090,10 @@
         });
         const data = await res.json();
         if (data.ok) {
-          showNotification(`⏸️ Paused ${data.paused} job(s)`, 'success');
+          const parts = [`⏸️ Paused ${data.paused} job(s)`];
+          if (data.interrupting > 0) parts.push(`${data.interrupting} in-flight download(s) stopping`);
+          if (data.inProgress && data.inProgress.length > 0) parts.push(`${data.inProgress.length} busy converting/fetching metadata — try again later`);
+          showNotification(parts.join(' · '), data.inProgress && data.inProgress.length > 0 ? 'warning' : 'success');
           selectedJobs.clear();
           updateBulkActions();
           refreshData();
@@ -1115,6 +1121,8 @@
           selectedJobs.clear();
           updateBulkActions();
           refreshData();
+        } else if (res.status === 409) {
+          showNotification(`⏳ ${data.inProgress.length} selected job(s) are in progress — pause or wait for them, then delete`, 'warning');
         } else {
           showNotification(`❌ ${data.error || 'Delete failed'}`, 'error');
         }
@@ -1389,8 +1397,15 @@
     }
     
     async function retryJob(id) {
-      await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
-      showNotification('🔄 Job queued for retry', 'success');
+      try {
+        const res = await fetch(`/api/retry/${encodeURIComponent(id)}`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) showNotification('🔄 Job queued for retry', 'success');
+        else if (res.status === 409) showNotification('⏳ Job is in progress — wait for the current stage to finish', 'warning');
+        else showNotification(`❌ ${data.error || 'Retry failed'}`, 'error');
+      } catch {
+        showNotification('❌ Retry failed', 'error');
+      }
       refreshData();
     }
     

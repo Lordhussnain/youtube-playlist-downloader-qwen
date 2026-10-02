@@ -188,6 +188,9 @@ export function initDatabase(path: string = "archive.db"): void {
            SELECT id FROM jobs
            WHERE download_status = 'downloaded' AND conversion_status = 'pending'
              AND metadata_status IN ('done', 'not_needed', 'failed')
+             -- A per-job user pause halts the whole pipeline at its next
+             -- stage boundary until an explicit Resume clears the reason.
+             AND COALESCE(pause_reason, '') != 'user'
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,
@@ -211,6 +214,7 @@ export function initDatabase(path: string = "archive.db"): void {
              -- is still eligible — a failed-then-requeued metadata stage runs
              -- after conversion on purpose.
              AND COALESCE(conversion_status, '') != 'in_progress'
+             AND COALESCE(pause_reason, '') != 'user'
            ORDER BY created_at, rowid LIMIT 1
          )
          RETURNING *`,

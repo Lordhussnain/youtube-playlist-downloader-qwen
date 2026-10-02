@@ -34,8 +34,22 @@ export function triggerResume(): void {
       `UPDATE jobs SET download_status = 'pending', pause_reason = NULL, download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE download_status = 'paused' AND download_claimed_by IS NULL`,
     );
-    if (stmt.changes > 0) console.log(`▶️ Re-queued ${stmt.changes} paused job(s).`);
-  } catch {}
+    // A per-job user pause that landed after the download finished (or is
+    // still pending on an in-flight transfer) holds the row's later stages;
+    // Resume All releases those too.
+    const released = db.run(
+      `UPDATE jobs SET pause_reason = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE pause_reason = 'user' AND download_status != 'paused'`,
+    );
+    if (stmt.changes > 0 || released.changes > 0) {
+      console.log(`▶️ Re-queued ${stmt.changes} paused job(s)${released.changes > 0 ? `, released ${released.changes} user-held job(s)` : ""}.`);
+    }
+  } catch (e: any) {
+    // Loud, not silent: a failed re-queue here means "Resume" reported
+    // success while every paused job stayed paused.
+    logError("resume", `re-queue of paused jobs failed: ${e?.message || e}`);
+    console.error("❌ Resume: could not re-queue paused jobs:", e?.message || e);
+  }
   // A human resumed the engine — give the failure circuit a clean slate.
   failureCircuit.dl = 0;
   failureCircuit.post = 0;

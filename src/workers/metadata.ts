@@ -112,10 +112,18 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
       SIDECAR_SUFFIXES.some((sfx) => f.endsWith(sfx)) &&
       f !== basename(job.file_path!),
   );
-  db.run(
-    `UPDATE jobs SET metadata_status = 'done', metadata_files = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+  // Guarded: if the stale-claim reaper (or a restart) already re-queued this
+  // stage while we were running, the row is no longer ours to mark done — the
+  // next pass will record the sidecars it finds.
+  const done = db.run(
+    `UPDATE jobs SET metadata_status = 'done', metadata_files = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND metadata_status = 'in_progress'`,
     [JSON.stringify(sidecars), job.id],
   );
+  if (done.changes === 0) {
+    logError("metadata", `${job.id} ${job.title}: metadata claim lost mid-job — result left for the next pass`);
+    return;
+  }
   stats.metadata++;
   notePipelineSuccess("post");
   updateMetadataWorkerLine(id, `✅ Metadata done (${sidecars.length} file(s)) | ${job.title}`, config);

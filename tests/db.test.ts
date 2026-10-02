@@ -29,6 +29,7 @@ import {
   requeueFailedJobs,
 } from "../src/reconcile";
 import { removeFromArchive } from "../src/archive";
+import { triggerResume } from "../src/resilience";
 
 function testConfig(overrides: Partial<Config> = {}): Config {
   return { ...DEFAULT_CONFIG, ...overrides };
@@ -649,5 +650,40 @@ describe("pipeline claim exclusion", () => {
       metadata_status: "done",
     });
     expect(claimConvertJob("cv-6")?.id).toBe("cx6");
+  });
+});
+
+describe("per-job user pause holds the pipeline at the next stage (1.5)", () => {
+  test("convert and metadata claims skip rows with pause_reason = 'user'", () => {
+    insertJob("held", {
+      download_status: "downloaded",
+      conversion_status: "pending",
+      metadata_status: "pending",
+      pause_reason: "user",
+      file_path: "/tmp/out/held.mp4",
+    });
+    insertJob("free", {
+      download_status: "downloaded",
+      conversion_status: "pending",
+      metadata_status: "pending",
+      file_path: "/tmp/out/free.mp4",
+    });
+    expect(claimMetadataJob("md-1")?.id).toBe("free");
+    expect(claimMetadataJob("md-2")).toBeNull();
+    // Metadata done on both so the converter claim is reachable.
+    db.run("UPDATE jobs SET metadata_status = 'done'");
+    expect(claimConvertJob("cv-1")?.id).toBe("free");
+    expect(claimConvertJob("cv-2")).toBeNull();
+  });
+
+  test("Resume All releases user-held rows whose download already finished", () => {
+    insertJob("held2", { download_status: "downloaded", conversion_status: "pending", metadata_status: "done", pause_reason: "user" });
+    insertJob("paused2", { download_status: "paused", pause_reason: "user" });
+    triggerResume();
+    expect(getJob("held2").pause_reason).toBeNull();
+    expect(getJob("held2").download_status).toBe("downloaded");
+    expect(getJob("paused2").download_status).toBe("pending");
+    expect(getJob("paused2").pause_reason).toBeNull();
+    expect(claimConvertJob("cv-1")?.id).toBe("held2");
   });
 });

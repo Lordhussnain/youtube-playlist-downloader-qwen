@@ -11,7 +11,7 @@ import { timingSafeEqual } from "node:crypto";
 import os from "node:os";
 import { db } from "./db";
 import { autoscaler, activeDlSlots } from "./autoscale";
-import { getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
+import { activeProcs, getConfig, getPauseReason, isPaused, workerStatuses } from "./state";
 import { scanAndIngest } from "./scanner";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
@@ -206,7 +206,41 @@ function mapJobRow(r: any) {
   };
 }
 
-/** Re-queue a job with fresh budgets (download + any failed side stages). */
+// --- Live-claim guards ---------------------------------------------------------
+// The three worker claims are mutually exclusive on the stage that owns the
+// media file (db.ts, gotcha 24). The routes below used to bypass that: a retry
+// flipped conversion_status 'in_progress' → 'pending' and nulled the claim, so
+// the download guard passed and yt-dlp wrote over the very file ffmpeg was
+// reading. Every mutating per-job route now refuses (409) while any stage is
+// live, and the purge skips rows holding a claim.
+
+/** SQL predicate: some worker currently owns this job's file. */
+const JOB_IN_PROGRESS_SQL = `(download_status = 'downloading'
+  OR COALESCE(conversion_status, '') = 'in_progress'
+  OR COALESCE(metadata_status, '') = 'in_progress')`;
+
+/** Of `ids`, the ones a worker is actively working on right now. */
+export function jobsInProgress(ids: string[]): string[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .query(`SELECT id FROM jobs WHERE id IN (${placeholders}) AND ${JOB_IN_PROGRESS_SQL}`)
+    .all(...ids) as { id: string }[];
+  return rows.map((r) => r.id);
+}
+
+function conflictInProgress(ids: string[]): Response {
+  return Response.json(
+    { ok: false, error: "job is in progress", inProgress: ids },
+    { status: 409 },
+  );
+}
+
+/**
+ * Re-queue a job with fresh budgets (download + any failed side stages).
+ * Returns 0 when the job does not exist OR is in progress — callers check
+ * `jobsInProgress` first so the two cases answer 409 vs 404.
+ */
 function retryJobById(id: string): number {
   // Re-queue download AND any failed metadata/conversion work; preserve
   // conversion_status='not_needed'. Also clears a user pause and resets the
@@ -221,9 +255,17 @@ function retryJobById(id: string): number {
          ELSE metadata_status END,
        metadata_retry_count = 0,
        last_error = NULL, download_claimed_by = NULL, conversion_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
+     WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`,
     [id],
   ).changes;
+}
+
+/** Shared by the canonical retry route and its legacy alias. */
+function retryRoute(id: string): Response {
+  if (jobsInProgress([id]).length > 0) return conflictInProgress([id]);
+  const changed = retryJobById(id);
+  if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+  return Response.json({ ok: true });
 }
 
 /** Clear every per-stage failure counter for one job. */
@@ -242,9 +284,62 @@ async function deleteJobsBulk(req: Request): Promise<Response> {
     ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500)
     : [];
   if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
+  const busy = jobsInProgress(ids);
+  if (busy.length > 0) return conflictInProgress(busy);
   const placeholders = ids.map(() => "?").join(",");
-  const result = db.run(`DELETE FROM jobs WHERE id IN (${placeholders})`, ids);
+  const result = db.run(
+    `DELETE FROM jobs WHERE id IN (${placeholders}) AND NOT ${JOB_IN_PROGRESS_SQL}`,
+    ids,
+  );
   return Response.json({ ok: true, deleted: result.changes });
+}
+
+/**
+ * Per-job user pause. Three cases, none of which fight a worker for the file:
+ *   • pending / paused / failed  → parked as paused+user immediately
+ *   • downloading                → pause_reason = 'user' is recorded on the
+ *     row (status and claim stay), the owning yt-dlp gets SIGINT, and the
+ *     worker's handler parks the job itself (workers/download.ts) — so the
+ *     .part is frozen and nothing already fetched is lost
+ *   • conversion / metadata in progress → refused with the live ids so the
+ *     caller can retry once the stage finishes
+ */
+export function pauseJobsByUser(ids: string[]): { ok: boolean; paused: number; interrupting: number; inProgress?: string[]; error?: string } {
+  const placeholders = ids.map(() => "?").join(",");
+  const postBusy = (
+    db
+      .query(
+        `SELECT id FROM jobs WHERE id IN (${placeholders})
+           AND (COALESCE(conversion_status, '') = 'in_progress' OR COALESCE(metadata_status, '') = 'in_progress')`,
+      )
+      .all(...ids) as { id: string }[]
+  ).map((r) => r.id);
+  const parked = db.run(
+    `UPDATE jobs SET download_status = 'paused', pause_reason = 'user', download_claimed_by = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE id IN (${placeholders}) AND download_status IN ('pending', 'paused', 'failed', 'waiting_live')
+       AND COALESCE(conversion_status, '') != 'in_progress' AND COALESCE(metadata_status, '') != 'in_progress'`,
+    ids,
+  ).changes;
+  const inflight = db
+    .query(
+      `UPDATE jobs SET pause_reason = 'user', updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders}) AND download_status = 'downloading'
+       RETURNING download_claimed_by`,
+    )
+    .all(...ids) as { download_claimed_by: string | null }[];
+  for (const row of inflight) {
+    const m = /^dl-(\d+)$/.exec(row.download_claimed_by || "");
+    const proc = m ? activeProcs.get(Number(m[1])) : undefined;
+    try {
+      proc?.kill("SIGINT");
+    } catch {}
+  }
+  return {
+    ok: true,
+    paused: parked,
+    interrupting: inflight.length,
+    ...(postBusy.length > 0 ? { inProgress: postBusy, error: "some jobs have a conversion or metadata pass in progress" } : {}),
+  };
 }
 
 const ROUTES: Route[] = [
@@ -371,11 +466,7 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/jobs/:id/retry",
-    handler: ({ params }) => {
-      const changed = retryJobById(params.id);
-      if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true });
-    },
+    handler: ({ params }) => retryRoute(params.id),
   },
   {
     methods: ["POST"],
@@ -448,7 +539,8 @@ const ROUTES: Route[] = [
     methods: ["DELETE"],
     pattern: "/api/jobs/:id",
     handler: ({ params }) => {
-      const result = db.run(`DELETE FROM jobs WHERE id = ?`, [params.id]);
+      if (jobsInProgress([params.id]).length > 0) return conflictInProgress([params.id]);
+      const result = db.run(`DELETE FROM jobs WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`, [params.id]);
       if (result.changes === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
       return Response.json({ ok: true, deleted: result.changes });
     },
@@ -464,15 +556,7 @@ const ROUTES: Route[] = [
         ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500)
         : [];
       if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
-      const placeholders = ids.map(() => "?").join(",");
-      const result = db.run(
-        `UPDATE jobs SET download_status = 'paused', pause_reason = 'user',
-           download_claimed_by = CASE WHEN download_status = 'downloading' THEN download_claimed_by ELSE NULL END,
-           updated_at = CURRENT_TIMESTAMP
-         WHERE id IN (${placeholders}) AND download_status IN ('pending', 'downloading', 'paused')`,
-        ids,
-      );
-      return Response.json({ ok: true, paused: result.changes });
+      return Response.json(pauseJobsByUser(ids));
     },
   },
   {
@@ -489,11 +573,7 @@ const ROUTES: Route[] = [
   {
     methods: ["POST"],
     pattern: "/api/retry/:id",
-    handler: ({ params }) => {
-      const changed = retryJobById(params.id);
-      if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
-      return Response.json({ ok: true });
-    },
+    handler: ({ params }) => retryRoute(params.id),
   },
   {
     methods: ["POST"],
@@ -527,7 +607,15 @@ const ROUTES: Route[] = [
     methods: ["POST"],
     pattern: "/api/queue/purge",
     handler: () => {
-      const result = db.run("DELETE FROM jobs WHERE download_status IN ('pending', 'paused', 'waiting_live', 'failed')");
+      // Never delete a row a worker is holding: a 'paused' row can still carry
+      // a live download claim (user pause of an in-flight job), and a failed
+      // download may have a conversion/metadata pass in progress.
+      const result = db.run(
+        `DELETE FROM jobs
+          WHERE download_status IN ('pending', 'paused', 'waiting_live', 'failed')
+            AND download_claimed_by IS NULL
+            AND NOT ${JOB_IN_PROGRESS_SQL}`,
+      );
       return Response.json({ ok: true, deleted: result.changes });
     },
   },
