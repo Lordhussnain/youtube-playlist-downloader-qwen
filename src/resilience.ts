@@ -11,13 +11,15 @@ import { statfs } from "node:fs/promises";
 import { resolve } from "node:path";
 import { db } from "./db";
 import { logError } from "./logger";
-import { activeMetadataProcs, activeProcs, abortController, isPaused, getPauseReason, setPaused } from "./state";
+import { activeMetadataProcs, activeProcs, abortController, getConfig, isPaused, getPauseReason, setPaused } from "./state";
+import { notify } from "./notify";
 import type { Config } from "./config";
 
 export function triggerPause(reason: string): void {
   if (isPaused() && getPauseReason() === reason) return;
   setPaused(true, reason);
   console.log(`⏸️ Triggering pause: ${reason}`);
+  void notify(getConfig(), "pause", `⏸️ Engine paused: ${reason}`, { reason });
   for (const [, proc] of activeProcs.entries()) {
     try {
       proc.kill("SIGINT");
@@ -26,7 +28,9 @@ export function triggerPause(reason: string): void {
 }
 
 export function triggerResume(): void {
+  const wasPaused = isPaused();
   setPaused(false, null);
+  if (wasPaused) void notify(getConfig(), "resume", "▶️ Engine resumed");
   try {
     // Re-queue ALL paused jobs (global + user-paused) on an explicit Resume All.
     // In-flight jobs still holding a claim finish naturally in their worker.

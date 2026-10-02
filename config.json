@@ -55,5 +55,7 @@
   "webToken": "",
   "rssEnabled": true,
   "rssPollIntervalMinutes": 15,
-  "rescanIntervalHours": 24
+  "rescanIntervalHours": 24,
+  "webhookUrl": "",
+  "notifyOn": ["failure", "pause"]
 }

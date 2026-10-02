@@ -14,6 +14,7 @@ import { SIDECAR_SUFFIXES, hashFile } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
 import { abortController, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
+import { queueFailureNotification } from "../notify";
 import { logError } from "../logger";
 import { ffmpeg } from "../tools";
 import { spawnBounded } from "../spawn";
@@ -338,6 +339,7 @@ async function handleConvertFailure(job: Job, config: Config, err: any, id: numb
     stats.failed++;
     logError("conversion", `${job.id} ${job.title}: ${errMsg}`);
     notePipelineFailure("post", config);
+    queueFailureNotification({ id: job.id, title: job.title, stage: "convert", error: errMsg });
     updateConvertWorkerLine(id, `❌ Failed | ${job.title}`, config);
   } else {
     const backoff = computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);

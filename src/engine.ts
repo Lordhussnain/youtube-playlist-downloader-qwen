@@ -31,6 +31,8 @@ import { metadataWorker } from "./workers/metadata";
 import { converterWorker } from "./workers/convert";
 import { logError } from "./logger";
 import { everyInterval, getConfig, setConfig } from "./state";
+import { observeQueueState, setNotifyConfigReader } from "./notify";
+import { getStatsSnapshot } from "./stats";
 
 // The web server handle, assigned in main() and stopped during shutdown.
 let webServer: { stop: (closeActive?: boolean) => void } | null = null;
@@ -147,6 +149,10 @@ export async function main(): Promise<void> {
   // instead of silently leaving the engine with no connectivity watchdog.
   supervise("network-monitor", networkMonitor);
   everyInterval(() => reapStaleClaims(getConfig()), 60_000);
+  // Webhook notifications: failures batch through the live config; the
+  // "complete" event fires on the busy → idle edge of the pipeline.
+  setNotifyConfigReader(getConfig);
+  everyInterval(() => observeQueueState(getConfig(), getStatsSnapshot(getConfig())), 15_000);
   // Dynamic download-slot autoscaling (no-op when autoscaleEnabled=false).
   everyInterval(autoscaleTick, 15_000);
   // Failed-job sweep: re-queue transient failures after their cooldown.

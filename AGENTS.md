@@ -304,6 +304,7 @@ re-queues a failed sidecar pass on an already-converted job.
 | Signature self-heal | `retry.ts decideFailureOutcome()` → `workers/download.ts selfUpdateYtDlp()` | single-flight `yt-dlp -U` (120 s cap, registered in `activeProcs` under a negative key), then retries with a clean budget |
 | Sweep error registry | `reconcile.ts recordSweepError() / sweepError()` | every sweep's last swallowed failure, shown as `sweeps[].error` on `/api/reliability` and a red pill in the dashboard |
 | Bounded probes | `spawn.ts spawnBounded()` | every run-to-completion child (listing, channel-id, audio probe, cookie check, binary probe, ffmpeg stream count) has a deadline and is SIGKILLed on it |
+| Webhook notifications | `notify.ts` | `notify()` per event, `queueFailureNotification()` batches permanent failures (30 s / 25 items), `observeQueueState()` fires `complete` on the busy→idle edge; transport injectable for tests; hooks live in `triggerPause/triggerResume` and the three workers' failed branches |
 | Abort-scoped timers | `state.ts everyInterval()` | every periodic sweep clears itself when the engine aborts |
 | WAL checkpoint | `lifecycle.ts handleShutdown()` | keeps `archive.db` self-contained after exit |
 
@@ -506,7 +507,7 @@ CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile` and the
 same three steps on Ubuntu and Windows — the suite compiles its mocks per
 platform, so both must stay green.
 
-~400 tests across 30 files. Tests share one process, so any file that touches the
+~410 tests across 31 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -752,7 +753,7 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 ## 12. Definition of done
 
 - `bun run check` passes (strict typecheck with `noUncheckedIndexedAccess`, the
-  `check:ui` script gate, and the full suite — ~400 tests across 30 files).
+  `check:ui` script gate, and the full suite — ~410 tests across 31 files).
   CI runs the same on Ubuntu and Windows.
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.

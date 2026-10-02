@@ -24,7 +24,7 @@ export interface SettingField {
   options?: { value: string; label: string }[];
   /** Rough unit hint for the UI (KB/s, minutes, …). */
   unit?: string;
-  group: "downloader" | "media" | "concurrency" | "reliability";
+  group: "downloader" | "media" | "concurrency" | "reliability" | "notifications";
 }
 
 /**
@@ -255,6 +255,21 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     unit: "min",
     group: "reliability",
     help: "Ceiling for the duration-aware timeout.",
+  },
+  // --- notifications --------------------------------------------------------
+  {
+    key: "webhookUrl",
+    label: "Webhook URL",
+    type: "text",
+    group: "notifications",
+    help: "A Discord webhook URL or any endpoint that accepts JSON POSTs. Leave empty to disable notifications.",
+  },
+  {
+    key: "notifyOn",
+    label: "Notify on",
+    type: "list",
+    group: "notifications",
+    help: "Comma-separated events: failure (batched permanent failures), pause (engine paused itself: cookies, disk, circuit breaker), resume, complete (queue drained).",
   },
 ];
 

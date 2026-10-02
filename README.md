@@ -123,6 +123,24 @@ minimal file looks like:
 
 Edit these interactively with `bun run config` → **Change Reliability & Resume**.
 
+### Notifications (webhook)
+
+```json
+{
+  "webhookUrl": "",
+  "notifyOn": ["failure", "pause"]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `webhookUrl` | A Discord webhook URL (gets a `{content}` message) or any endpoint accepting JSON POSTs (gets `{event, message, at, details}`). Empty = notifications off |
+| `notifyOn` | Which events to send: `failure` (permanent failures, **batched** into one message per 30 s), `pause` (the engine paused itself — cookies, disk, circuit breaker, bad downloader args), `resume`, `complete` (the queue drained) |
+
+Webhooks are fire-and-forget: a slow or failing endpoint is logged to
+`error.log` and never slows the pipeline. Both keys are editable from the
+dashboard's **Settings → Notifications** group and `bun run config`.
+
 ### Download performance settings
 
 | Key | Default | What it does |
@@ -200,9 +218,12 @@ not a static list of settings:
   it cannot advertise a timeout the sweep does not enforce. (Downloads refresh
   their claim timestamp on every progress tick, so a long but healthy transfer
   is never reclaimed from under a live yt-dlp.)
-- **Self-healing sweeps** — the four sweeps with their cadence and a pending
-  count. Deleted-files is `startup`-only and stats every recorded file, so its
-  count is reported as unknown rather than guessed.
+- **Self-healing sweeps** — the five sweeps with their cadence, a pending
+  count, and the sweep's **last error** if its most recent run threw (a red
+  `error` pill with the message in the tooltip — a failing sweep is otherwise
+  indistinguishable from one with nothing to do). Deleted-files is
+  `startup`-only and stats every recorded file, so its count is reported as
+  unknown rather than guessed.
 
 Every count comes from `GET /api/reliability`, which reads the live config (not
 a startup snapshot) and the job table.
@@ -379,7 +400,8 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [x] Modular architecture with a unit + end-to-end test suite
 - [ ] Deduplicate identical videos across playlists by content hash
 - [ ] Per-link quality/format overrides in the web dashboard
-- [ ] Desktop notifications (Discord/webhook) on completion and failures
+- [x] Webhook notifications (Discord or generic JSON) on pause/resume, batched
+      failures and queue completion (`webhookUrl` / `notifyOn`)
 - [ ] Download scheduling windows, retention policies, chapter/transcript sidecars
 
 ## Windows 11

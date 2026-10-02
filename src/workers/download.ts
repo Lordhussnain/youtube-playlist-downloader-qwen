@@ -12,6 +12,7 @@ import { claimDownloadJob, db, perVideoCap, type Job } from "../db";
 import { activeDlSlots, autoscaler } from "../autoscale";
 import { aria2cPath, ytDlp } from "../tools";
 import { checkDiskSpace, notePipelineFailure, notePipelineSuccess, triggerPause } from "../resilience";
+import { queueFailureNotification } from "../notify";
 import { findPartialFile, recordJobPartial, removePartialFiles } from "../reconcile";
 import { removeFromArchive } from "../archive";
 import { computeBackoffMs, decideFailureOutcome } from "../retry";
@@ -437,6 +438,7 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
         stats.failed++;
         logError("download", `${job.id} ${job.title}: ${errMsg.slice(0, 500)}`);
         notePipelineFailure("dl", config);
+        queueFailureNotification({ id: job.id, title: job.title, stage: "download", error: errMsg });
       }
       updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
       return;

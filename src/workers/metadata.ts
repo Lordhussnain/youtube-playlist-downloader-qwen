@@ -14,6 +14,7 @@ import { SIDECAR_SUFFIXES } from "../util";
 import { updateAbsoluteLine } from "../dashboard";
 import { abortController, activeMetadataProcs, getConfig, isPaused, stats, workerStatuses } from "../state";
 import { notePipelineFailure, notePipelineSuccess } from "../resilience";
+import { queueFailureNotification } from "../notify";
 import { logError } from "../logger";
 import type { Config } from "../config";
 
@@ -182,6 +183,7 @@ async function handleMetadataFailure(job: Job, config: Config, err: any, id: num
     stats.failed++;
     logError("metadata", `${job.id} ${job.title}: ${errMsg}`);
     notePipelineFailure("post", config);
+    queueFailureNotification({ id: job.id, title: job.title, stage: "metadata", error: errMsg });
     updateMetadataWorkerLine(id, `❌ Metadata failed | ${job.title}`, config);
   } else {
     const backoff = computeBackoffMs(attempts, config.retryBackoffBaseSeconds, config.retryBackoffMaxSeconds);

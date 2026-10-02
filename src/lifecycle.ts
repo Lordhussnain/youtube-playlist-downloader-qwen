@@ -11,6 +11,7 @@ import { heartbeatRunHistory } from "./history";
 import { logError } from "./logger";
 import { resetTerminal } from "./dashboard";
 import { abortController, setPaused } from "./state";
+import { flushFailureNotifications } from "./notify";
 import { recordPartialPaths } from "./reconcile";
 
 let isShuttingDown = false;
@@ -27,6 +28,8 @@ export async function handleShutdown(sig: string, webServer: { stop: (closeActiv
 
   // Kill any still-running child processes.
   killActiveChildren();
+  // A failure batch waiting on its timer would otherwise be lost with the process.
+  await flushFailureNotifications().catch(() => false);
 
   try {
     // Freeze the resume state first: every in-flight download's `.part` path is

@@ -1647,6 +1647,7 @@
         ['media', '🎵 Media & audio'],
         ['concurrency', '⚡ Concurrency'],
         ['reliability', '🛡️ Reliability & resume'],
+        ['notifications', '🔔 Notifications'],
       ];
       const byGroup = new Map(groups.map(g => [g[0], []]));
       for (const f of settingsSnapshot.fields) byGroup.get(f.group)?.push(f);

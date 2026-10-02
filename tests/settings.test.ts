@@ -68,7 +68,7 @@ describe("the editable allow-list", () => {
     for (const f of EDITABLE_SETTINGS) {
       expect(f.label.length).toBeGreaterThan(0);
       expect(f.help.length).toBeGreaterThan(0);
-      expect(["downloader", "media", "concurrency", "reliability"]).toContain(f.group);
+      expect(["downloader", "media", "concurrency", "reliability", "notifications"]).toContain(f.group);
     }
   });
 

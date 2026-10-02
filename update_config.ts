@@ -332,6 +332,26 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || "none"}]: `);
   if (nasPath.trim() !== "") config.secondaryStoragePath = nasPath.trim();
 
+  // Notifications
+  console.log("\n— Notifications —");
+  const hookAns = await ask(
+    `   Webhook URL for notifications (Discord or any JSON endpoint; '-' clears it) [current: ${config.webhookUrl || "none"}]: `,
+  );
+  if (hookAns.trim() === "-") config.webhookUrl = "";
+  else if (hookAns.trim() !== "") config.webhookUrl = hookAns.trim();
+  if (config.webhookUrl) {
+    const evAns = await ask(
+      `   Notify on (comma-separated: failure, pause, resume, complete) [current: ${config.notifyOn.join(", ") || "none"}]: `,
+    );
+    if (evAns.trim() !== "") {
+      const allowed = new Set(["failure", "pause", "resume", "complete"]);
+      config.notifyOn = evAns
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s): s is "failure" | "pause" | "resume" | "complete" => allowed.has(s));
+    }
+  }
+
   // Web UI & Daemon
   console.log("\n— Web UI & Headless Daemon —");
   config.daemonMode = await askYesNo("Headless daemon mode (run forever, add links later from Web UI)?", config.daemonMode);

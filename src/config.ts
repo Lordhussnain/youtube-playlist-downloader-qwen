@@ -108,6 +108,10 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
+    // --- Notifications -------------------------------------------------------
+    // A Discord webhook or any endpoint accepting JSON POSTs. Empty = off.
+    webhookUrl: z.string(),
+    notifyOn: z.array(z.enum(["failure", "pause", "resume", "complete"])),
   })
   // Cross-field sanity: the backoff ceiling must be reachable from the base.
   .refine((c) => c.retryBackoffMaxSeconds >= c.retryBackoffBaseSeconds, {
@@ -190,6 +194,9 @@ export const DEFAULT_CONFIG: Config = {
   rssEnabled: true,
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
+  // Notifications
+  webhookUrl: "",
+  notifyOn: ["failure", "pause"],
 };
 
 // yt-dlp format selectors per quality preset.
