@@ -290,11 +290,11 @@ describe("GET /api/reliability — resume + self-healing state", () => {
     expect(body.resume.staleClaims).toBe(1);
   });
 
-  test("describes all four self-healing sweeps with a pending count", async () => {
+  test("describes all six self-healing sweeps with a pending count", async () => {
     const res = await handleRequest(new Request("http://x/api/reliability"), getConfig());
     const body = await res.json();
     const ids = body.sweeps.map((s: any) => s.id);
-    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed", "orphanPartials"]);
+    expect(ids).toEqual(["crashed", "staleClaims", "missingFiles", "requeueFailed", "retention", "orphanPartials"]);
     for (const s of body.sweeps) {
       expect(s.label.length).toBeGreaterThan(0);
       expect(s.cadence.length).toBeGreaterThan(0);

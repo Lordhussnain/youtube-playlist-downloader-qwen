@@ -125,6 +125,25 @@ minimal file looks like:
 
 Edit these interactively with `bun run config` → **Change Reliability & Resume**.
 
+### Retention policies
+
+```json
+{
+  "runHistoryDays": 0,
+  "mediaRetentionDays": 0,
+  "pruneOrphanSidecars": false
+}
+```
+
+All off by default; the sweep runs at startup and every 6 h, and reports its
+last error on the reliability panel like every other sweep.
+
+| Key | Meaning |
+| --- | --- |
+| `runHistoryDays` | Delete `run_history` rows that ended more than N days ago (the newest 500 are always kept). `0` = keep |
+| `mediaRetentionDays` | Delete finished media files **and their sidecars** whose job has not changed for N days. The job is marked `pruned` (not deleted), so the scanner never re-adds it and the deleted-files sweep never re-fetches it; **Retry job** brings it back. `0` = keep forever |
+| `pruneOrphanSidecars` | Remove subtitle / thumbnail / description / info.json files whose media file is gone — only after a day's grace, and never while *anything* else (a `.part`, an intermediate stream) still shares the file stem |
+
 ### Notifications (webhook)
 
 ```json
@@ -220,7 +239,7 @@ not a static list of settings:
   it cannot advertise a timeout the sweep does not enforce. (Downloads refresh
   their claim timestamp on every progress tick, so a long but healthy transfer
   is never reclaimed from under a live yt-dlp.)
-- **Self-healing sweeps** — the five sweeps with their cadence, a pending
+- **Self-healing sweeps** — the six sweeps with their cadence, a pending
   count, and the sweep's **last error** if its most recent run threw (a red
   `error` pill with the message in the tooltip — a failing sweep is otherwise
   indistinguishable from one with nothing to do). Deleted-files is
@@ -409,7 +428,7 @@ tests/             bun test suite (unit + end-to-end with mocked tools)
 - [x] Download scheduling windows (`downloadWindows`)
 - [x] Chapters + cover art embedded (`embedMetadata`), auto-transcripts as
       subtitle sidecars (`downloadSubtitles` writes `--write-auto-subs` too)
-- [ ] Retention policies
+- [x] Retention policies (`runHistoryDays`, `mediaRetentionDays`, `pruneOrphanSidecars`)
 
 ## Windows 11
 

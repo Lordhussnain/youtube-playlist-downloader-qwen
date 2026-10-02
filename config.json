@@ -58,5 +58,8 @@
   "rescanIntervalHours": 24,
   "webhookUrl": "",
   "notifyOn": ["failure", "pause"],
-  "downloadWindows": []
+  "downloadWindows": [],
+  "runHistoryDays": 0,
+  "mediaRetentionDays": 0,
+  "pruneOrphanSidecars": false
 }

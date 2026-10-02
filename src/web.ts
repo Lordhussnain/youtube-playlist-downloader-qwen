@@ -24,6 +24,7 @@ import { formatBytesPerSec, formatDuration } from "./util";
 import { getStatsSnapshot, invalidateStats } from "./stats";
 import { errorLogPath, logError } from "./logger";
 import { QUALITY_FORMATS, type Config } from "./config";
+import { retentionEnabled } from "./retention";
 
 // --- Web UI auth (optional shared-secret token) ------------------------------
 // When webToken is set, every request must present it — as a cookie (set after
@@ -1000,6 +1001,16 @@ function reliabilityHandler(config: Config): Response {
       detail: "Failed jobs retry after a cooldown; permanent failures never do.",
       pending: resumableFailed,
       error: sweepError("requeueFailed"),
+    },
+    {
+      id: "retention",
+      label: "Retention policies",
+      cadence: retentionEnabled(config) ? "startup + every 6h" : "off",
+      detail: retentionEnabled(config)
+        ? `run_history > ${config.runHistoryDays || "∞"} d, finished media > ${config.mediaRetentionDays || "∞"} d (job marked pruned), orphan sidecars ${config.pruneOrphanSidecars ? "removed" : "kept"}.`
+        : "No retention rule enabled (runHistoryDays, mediaRetentionDays, pruneOrphanSidecars).",
+      pending: null,
+      error: sweepError("retention"),
     },
     {
       id: "orphanPartials",

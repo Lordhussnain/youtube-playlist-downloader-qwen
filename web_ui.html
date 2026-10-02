@@ -233,6 +233,7 @@
     .status-paused { background: var(--warning); color: white; }
     .status-downloaded { background: var(--success); color: white; }
     .status-failed { background: var(--danger); color: white; }
+    .status-pruned { background: var(--bg-secondary); color: var(--text-secondary); border: 1px dashed var(--border); }
     .status-converting { background: #8b5cf6; color: white; }
     .status-done { background: var(--success); color: white; }
     .status-waiting_live { background: #0ea5e9; color: white; }
@@ -947,7 +948,7 @@
       return status;
     }
 
-    const STATUS_ORDER = ['downloading', 'converting', 'paused', 'pending', 'waiting_live', 'failed', 'downloaded', 'done'];
+    const STATUS_ORDER = ['downloading', 'converting', 'paused', 'pending', 'waiting_live', 'failed', 'downloaded', 'done', 'pruned'];
 
     // Column sorting: click a header to sort by it, click again to flip.
     let sortState = { key: null, dir: 1 };

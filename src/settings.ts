@@ -263,6 +263,33 @@ export const EDITABLE_SETTINGS: SettingField[] = [
     group: "reliability",
     help: "Comma-separated local-time ranges like 22:00-07:00 (may wrap past midnight). Outside every window the engine pauses itself and resumes when a window opens. Empty = download any time.",
   },
+  {
+    key: "runHistoryDays",
+    label: "Keep run history (days)",
+    type: "number",
+    min: 0,
+    max: 3650,
+    unit: "days",
+    group: "reliability",
+    help: "Delete run_history rows older than this. 0 keeps them (the newest 500 are always kept regardless).",
+  },
+  {
+    key: "mediaRetentionDays",
+    label: "Media retention (days)",
+    type: "number",
+    min: 0,
+    max: 3650,
+    unit: "days",
+    group: "reliability",
+    help: "Delete finished media files (and their sidecars) untouched for this many days; the job is marked pruned and never re-fetched unless you Retry it. 0 = keep forever.",
+  },
+  {
+    key: "pruneOrphanSidecars",
+    label: "Prune orphan sidecars",
+    type: "boolean",
+    group: "reliability",
+    help: "Remove subtitle / thumbnail / description / info.json files whose media file is gone (after a day's grace).",
+  },
   // --- notifications --------------------------------------------------------
   {
     key: "webhookUrl",

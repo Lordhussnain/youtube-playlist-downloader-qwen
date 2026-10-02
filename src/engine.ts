@@ -33,6 +33,7 @@ import { logError } from "./logger";
 import { everyInterval, getConfig, setConfig } from "./state";
 import { observeQueueState, setNotifyConfigReader } from "./notify";
 import { scheduleTick } from "./schedule";
+import { retentionSweep } from "./retention";
 import { getStatsSnapshot } from "./stats";
 
 // The web server handle, assigned in main() and stopped during shutdown.
@@ -112,6 +113,7 @@ export async function main(): Promise<void> {
   await mkdir(config.outputRoot, { recursive: true });
   // Keep resume-able partials, drop the ones that can never complete.
   await cleanOrphanedFiles(config.outputRoot, config);
+  await retentionSweep(getConfig());
   autoscaler.init(config);
 
   // Establish the cookies baseline, then keep watching for the whole run: a
@@ -154,6 +156,7 @@ export async function main(): Promise<void> {
   // "complete" event fires on the busy → idle edge of the pipeline.
   setNotifyConfigReader(getConfig);
   everyInterval(() => observeQueueState(getConfig(), getStatsSnapshot(getConfig())), 15_000);
+  everyInterval(() => void retentionSweep(getConfig()), 6 * 60 * 60 * 1000);
   // Scheduling windows: pause outside them, resume when one opens (5.6).
   scheduleTick(getConfig());
   everyInterval(() => scheduleTick(getConfig()), 30_000);

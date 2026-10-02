@@ -27,7 +27,7 @@ import type { Config } from "./config";
 // each sweep is kept here and surfaced by GET /api/reliability (sweeps[].error)
 // so an operator can see that, say, the failed-job sweep has not actually run
 // for an hour.
-export type SweepId = "crashed" | "staleClaims" | "missingFiles" | "requeueFailed" | "orphanPartials";
+export type SweepId = "crashed" | "staleClaims" | "missingFiles" | "requeueFailed" | "orphanPartials" | "retention";
 const sweepErrors = new Map<SweepId, { at: string; message: string }>();
 
 export function recordSweepError(id: SweepId, err: unknown): void {

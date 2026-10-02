@@ -108,6 +108,10 @@ export const ConfigSchema = z
     rssEnabled: z.boolean(),
     rssPollIntervalMinutes: z.number().min(1),
     rescanIntervalHours: z.number().min(0),
+    /** Retention (plan 5.5): all off at 0 / false. */
+    runHistoryDays: z.number().int().min(0),
+    mediaRetentionDays: z.number().int().min(0),
+    pruneOrphanSidecars: z.boolean(),
     /** Local-time download windows "HH:MM-HH:MM" (wrap past midnight allowed); empty = always. */
     downloadWindows: z.array(
       z.string().regex(/^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/, 'expected "HH:MM-HH:MM"'),
@@ -199,6 +203,9 @@ export const DEFAULT_CONFIG: Config = {
   rssPollIntervalMinutes: 15,
   rescanIntervalHours: 24,
   downloadWindows: [],
+  runHistoryDays: 0,
+  mediaRetentionDays: 0,
+  pruneOrphanSidecars: false,
   // Notifications
   webhookUrl: "",
   notifyOn: ["failure", "pause"],

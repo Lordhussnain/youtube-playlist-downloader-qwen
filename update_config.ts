@@ -332,6 +332,12 @@ async function changeDownloadSettings(config: Config): Promise<Config> {
   const nasPath = await ask(`   Secondary NAS/Storage path [current: ${config.secondaryStoragePath || "none"}]: `);
   if (nasPath.trim() !== "") config.secondaryStoragePath = nasPath.trim();
 
+  // Retention
+  console.log("\n— Retention (0 = keep forever) —");
+  config.runHistoryDays = await askNumber("Delete run history older than (days)", config.runHistoryDays, 0, 3650);
+  config.mediaRetentionDays = await askNumber("Delete finished media older than (days; job marked pruned)", config.mediaRetentionDays, 0, 3650);
+  config.pruneOrphanSidecars = await askYesNo("Remove orphan sidecar files (subs/thumbs/info.json without media)?", config.pruneOrphanSidecars);
+
   // Scheduling
   console.log("\n— Scheduling —");
   const winAns = await ask(
