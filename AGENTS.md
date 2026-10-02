@@ -765,6 +765,11 @@ stray brace fails the gate instead of showing up as a blank dashboard.
 | Add a worker | `src/workers/<name>.ts` → claim fn in `db.ts` → `supervise()` in `engine.ts` → TUI line in `dashboard.ts` |
 | Support a new site/URL shape | `src/scanner.ts normalizeVideoUrl()` (canonicalization + dedupe) |
 | Probe the OS (disk space, …) | `src/resilience.ts diskUsage()` — statfs + PowerShell fallback + degraded mode in one place; never call `statfs` directly (gotcha 22) |
+| Change a yt-dlp / ffmpeg command line | the **pure planners**: `download-args.ts buildDownloadPlan()`, `workers/metadata.ts buildMetadataArgs()`, `workers/convert.ts planConversion()` — each has a table test (`download-args`, `metadata-args`, `convert` test files); the workers only spawn what the planner returns |
+| Change tool discovery | `tools.ts toolCandidates(env)` (pure: candidate paths from an env snapshot) → `tests/tools.test.ts` |
+| Change worker supervision / restart policy | `lifecycle.ts supervise(opts)` (injectable sleep/log) → `tests/lifecycle.test.ts` |
+| Add a notification event | `src/notify.ts` (`NotifyEvent` union + `notifyOn` enum in `config.ts`) → call `notify(getConfig(), event, …)` at the edge → `tests/notify.test.ts` with the injected transport |
+| Add a per-job override field | `db.ts` (`ensureColumn` + `Job` field) → `web.ts applyJobOverride()` → `JOB_COLUMNS` → drawer form in `web_ui.html renderOverrideSection()` |
 
 ## 12. Definition of done
 
