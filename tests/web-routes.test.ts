@@ -178,5 +178,8 @@ describe("the route table", () => {
     expect(data.stats.total).toBe(0);
     expect(data.runtime.platform).toBe(process.platform);
     expect(Array.isArray(data.workers)).toBe(true);
+    // Cookies are reported live so the dashboard can show a file that was
+    // dropped in after startup (the integration test asserts the flip).
+    expect(data.cookies).toMatchObject({ present: false, size: 0 });
   });
 });

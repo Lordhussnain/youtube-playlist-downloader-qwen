@@ -210,7 +210,7 @@ Bearer`, `X-Web-Token`, or `?token=`).
 | --- | --- |
 | `GET /api/ping` | Liveness probe (also answers `HEAD`). |
 | `GET /api/version` | Engine/runtime info (Bun version, platform, uptime). |
-| `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA. |
+| `GET /api/status` | Stats, aggregate speed, workers, pause state, disk/RAM, ETA, and live `cookies` state (`{present, size}`). |
 | `GET /api/jobs` | The 500 newest jobs. |
 | `GET /api/jobs/:id` | One job, fresh from the DB (what the detail drawer shows). |
 | `POST /api/jobs/:id/retry` | Re-queue with fresh budgets (alias: `POST /api/retry/:id`). |

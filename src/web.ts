@@ -17,7 +17,7 @@ import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS } from "./reconcile";
 import { buildRunReport } from "./report";
 import { isPermanentDownloadError } from "./retry";
-import { aria2cPath } from "./tools";
+import { aria2cPath, cookiesState } from "./tools";
 import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
@@ -303,6 +303,10 @@ const ROUTES: Route[] = [
         known && disk.totalBytes > 0 ? ((disk.freeBytes / disk.totalBytes) * 100).toFixed(0) : "0";
       const diskLabel = known ? `${freeGB} GB / ${totalGB} GB` : "unknown";
 
+      // Read live, not cached: the dashboard (and the integration test) must be
+      // able to see a cookies.txt that was dropped in after startup.
+      const cookies = cookiesState(config);
+
       const memUsage = process.memoryUsage();
       const ramUsedGB = (memUsage.rss / 1024 ** 3).toFixed(2);
       const ramTotalGB = (os.totalmem() / 1024 ** 3).toFixed(2);
@@ -339,6 +343,7 @@ const ROUTES: Route[] = [
         isPaused: isPaused(),
         pauseReason: getPauseReason(),
         diskSpace: { free: diskLabel, percent: parseFloat(diskPercent) },
+        cookies: { present: cookies.present, size: cookies.size },
         system: {
           cpu: "--",
           cpuPercent: 0,

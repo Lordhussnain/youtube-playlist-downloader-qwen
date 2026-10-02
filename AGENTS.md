@@ -464,13 +464,13 @@ re-extract the inline `<script>` and syntax-check it (see section 9.4).
 ### 9.1 Running
 
 ```bash
-bun test                       # everything (~130s — the integration scenarios dominate)
+bun test                       # everything (~150s — the integration scenarios dominate)
 bun test tests/retry.test.ts   # one file
 bun run typecheck              # tsc --noEmit (tsconfig covers *.ts, src/**, tests/**)
 bun run check                  # typecheck + full suite (what CI/the definition of done means)
 ```
 
-279 tests across 20 files. Tests share one process, so any file that touches the
+282 tests across 20 files. Tests share one process, so any file that touches the
 database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 `db` binding is replaced, which is exactly why it is a live ESM binding**.
 
@@ -497,7 +497,7 @@ database calls `initDatabase(":memory:")` in `beforeEach` — **the module-level
 | `tests/settings.test.ts` | the dashboard settings allow-list, type coercion, Zod + cross-field validation, persistence, live-config propagation, and auth |
 | `tests/config-manager.test.ts` | every schema key is reachable from `update_config.ts`; the manager reads the sweep thresholds from `STALE_CLAIM_THRESHOLDS` and counts partials with the engine's predicate |
 | `tests/dashboard.test.ts` | `formatHeaderLine` counters, and the `Res:n` field appearing only when partials are held |
-| `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3) |
+| `tests/integration.test.ts` | **end-to-end engine runs** (see 9.3), incl. cookies.txt reaching yt-dlp as `--cookies`, being picked up when it appears after startup, and an empty file counting as none |
 
 ### 9.3 End-to-end tests with mock tools
 
@@ -542,10 +542,9 @@ download.
 **That watchdog is POSIX-only.** Both mocks detect the death by polling
 `process.ppid`, which changes only because POSIX reparents orphans to PID 1.
 Windows keeps the original parent-PID value, so on win32 neither watcher ever
-fires and an orphaned mock runs to completion — the crash-recovery scenario
-("a hard kill mid-download resumes on restart") is only meaningful on POSIX. To
-make it work on Windows, kill the whole process tree from the harness
-(`taskkill /PID <pid> /T /F`) instead of relying on `process.ppid`.
+fires and an orphaned mock runs to completion. The harness therefore does the
+killing itself: `killTree()` runs `taskkill /PID <pid> /T /F` on win32 and a
+plain `SIGKILL` elsewhere.
 
 The mock yt-dlp also speaks multi-audio: `--dump-single-json` answers with a
 three-track format list (en original + es/hi dubs, quality variants and `-drc`
@@ -677,9 +676,10 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
     win32, and returns `-1/-1` + an `error` string so callers degrade instead
     of failing. `tests/disk.test.ts` is the guard.
 23. **The mocks' orphan watchdogs do not work on Windows** (`process.ppid`
-    never changes there). See 9.3 — crash-recovery scenarios that depend on an
-    orphan abandoning its transfer are POSIX-only until the harness kills the
-    process tree itself.
+    never changes there), so the harness kills the tree itself. Any new
+    hard-kill scenario must call `killTree(proc)`, not `proc.kill("SIGKILL")`,
+    or it passes on Linux and leaves orphaned mocks writing into the run
+    directory on Windows.
 24. **Keep the three claim queries mutually exclusive.** `claimDownloadJob`
     excludes jobs whose `conversion_status` or `metadata_status` is
     `in_progress`; `claimMetadataJob` excludes `conversion_status =
@@ -714,7 +714,7 @@ node --check /tmp/inline.js   # syntax gate before committing UI changes
 
 ## 12. Definition of done
 
-- `bun run check` passes (strict typecheck + the full suite — 279 tests across 20 files).
+- `bun run check` passes (strict typecheck + the full suite — 282 tests across 20 files).
 - New pure logic has unit tests; new engine behavior has an integration scenario.
 - No new import cycles; `state.ts` stays dependency-free.
 - Config changes are backwards compatible (defaults merge + `ensureColumn`).

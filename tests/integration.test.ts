@@ -233,6 +233,27 @@ async function startEngine(
   throw new Error(`engine did not start within 30s\nSTDOUT:\n${out}\nSTDERR:\n${err}`);
 }
 
+/**
+ * Kill a spawned engine and everything it spawned.
+ *
+ * On POSIX a SIGKILL to the engine is enough: the mocks watch their own
+ * `process.ppid` and abandon the transfer when it changes. Windows never
+ * reparents, so those watchdogs are inert there (AGENTS.md gotcha 23) and the
+ * orphaned mocks would keep writing into the run directory — so on win32 the
+ * whole tree goes down with `taskkill /T /F` instead.
+ */
+async function killTree(proc: Subprocess): Promise<void> {
+  if (WIN) {
+    const killer = Bun.spawn(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await killer.exited.catch(() => {});
+    return;
+  }
+  proc.kill("SIGKILL");
+}
+
 async function waitFor(label: string, predicate: () => Promise<boolean>, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -807,8 +828,10 @@ describe("integration: aria2c resume + self-healing", () => {
         return files.some((f) => f.endsWith(".part")) && files.some((f) => f.endsWith(".aria2"));
       });
 
-      // Hard kill: no graceful shutdown, no chance to clean up.
-      engine.proc.kill("SIGKILL");
+      // Hard kill: no graceful shutdown, no chance to clean up. On Windows this
+      // has to take the whole tree, or the orphaned mocks finish the transfer
+      // and the assertions below see a completed file instead of a partial.
+      await killTree(engine.proc);
       await engine.proc.exited;
 
       const leftovers = (await readdir(folder).catch(() => [] as string[])).filter(
@@ -1141,6 +1164,90 @@ describe("integration: aria2c option validation", () => {
       expect(jobs.length).toBeGreaterThan(0);
       for (const j of jobs) {
         expect(j.download_status).not.toBe("failed");
+      }
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// ---------------------------------------------------------------------------
+// cookies.txt — passed to yt-dlp, and noticed when it appears after startup
+// ---------------------------------------------------------------------------
+
+describe("integration: cookies.txt", () => {
+  const COOKIES = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tfake-session\n";
+
+  test("reaches yt-dlp as --cookies when the file exists at startup", async () => {
+    const dir = await makeRunDir();
+    await writeFile(join(dir, "cookies.txt"), COOKIES);
+    const engine = await startEngine(dir, 3971, BASE_CONFIG(3971, { videoQuality: "audio" }));
+    try {
+      await waitForAllJobs(engine, (j) => j.conversion_status === "done");
+
+      // The mock records the argv it actually received on every attempt, so
+      // this proves the flag crossed the process boundary — not just that
+      // cookiesArgs() built it.
+      const folder = join(dir, "downloads", "Mock Playlist");
+      const argFiles = (await readdir(folder)).filter((f) => f.endsWith(".ytdlp-args"));
+      expect(argFiles.length).toBe(3);
+      for (const f of argFiles) {
+        const argv = await Bun.file(join(folder, f)).text();
+        expect(argv).toContain("--cookies");
+        expect(argv).toContain("cookies.txt");
+      }
+
+      const status = await engine.api("/api/status");
+      expect(status.cookies.present).toBe(true);
+      expect(status.cookies.size).toBe(COOKIES.length);
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("is picked up when the file appears after startup", async () => {
+    const dir = await makeRunDir();
+    const engine = await startEngine(dir, 3972, BASE_CONFIG(3972, { videoQuality: "audio" }));
+    try {
+      // No cookies file yet: the engine runs anonymously and says so.
+      await waitFor("engine up with no cookies", async () => {
+        const s = await engine.api("/api/status");
+        return !!s.cookies && s.cookies.present === false;
+      });
+
+      // Drop the file in mid-run. /api/status stats it live, so the dashboard
+      // flips without a restart; the 60s sweep is what logs the transition.
+      await writeFile(join(dir, "cookies.txt"), COOKIES);
+      await waitFor("cookies.txt to be noticed", async () => {
+        const s = await engine.api("/api/status");
+        return !!s.cookies && s.cookies.present === true;
+      });
+
+      const status = await engine.api("/api/status");
+      expect(status.cookies.present).toBe(true);
+      expect(status.cookies.size).toBe(COOKIES.length);
+
+      // And the batch still completes with the file present.
+      await waitForAllJobs(engine, (j) => j.conversion_status === "done");
+    } finally {
+      await engine.stop();
+    }
+  }, TEST_TIMEOUT);
+
+  test("an empty cookies.txt is treated as no cookies", async () => {
+    const dir = await makeRunDir();
+    await writeFile(join(dir, "cookies.txt"), "");
+    const engine = await startEngine(dir, 3973, BASE_CONFIG(3973, { videoQuality: "audio" }));
+    try {
+      await waitFor("engine up with an empty cookies file", async () => {
+        const s = await engine.api("/api/status");
+        return !!s.cookies && s.cookies.present === false && s.cookies.size === 0;
+      });
+      await waitForAllJobs(engine, (j) => j.conversion_status === "done");
+
+      const folder = join(dir, "downloads", "Mock Playlist");
+      for (const f of (await readdir(folder)).filter((x) => x.endsWith(".ytdlp-args"))) {
+        expect(await Bun.file(join(folder, f)).text()).not.toContain("--cookies");
       }
     } finally {
       await engine.stop();
