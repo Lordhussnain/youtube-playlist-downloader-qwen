@@ -81,12 +81,25 @@ async function runMetadataJob(job: Job, config: Config, id: number): Promise<voi
   const timer = setTimeout(() => ctl.abort(), 10 * 60 * 1000);
   const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
   activeMetadataProcs.set(id, proc);
-  // Drain both pipes concurrently to avoid deadlock.
-  const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
-  const stderrPromise = new Response(proc.stderr).text();
-  const [stdoutText, stderrText, code] = await Promise.all([stdoutPromise, stderrPromise, proc.exited]);
-  clearTimeout(timer);
-  activeMetadataProcs.delete(id);
+  let stdoutText: string;
+  let stderrText: string;
+  let code: number;
+  try {
+    // Drain both pipes concurrently to avoid deadlock.
+    const stdoutPromise = new Response(proc.stdout).text().catch(() => "");
+    const stderrPromise = new Response(proc.stderr).text().catch(() => "");
+    [stdoutText, stderrText, code] = await Promise.all([stdoutPromise, stderrPromise, proc.exited]);
+  } finally {
+    // Same contract as the download worker: the child is reaped on every
+    // path out of here, so a throw cannot leave an orphan yt-dlp behind.
+    clearTimeout(timer);
+    activeMetadataProcs.delete(id);
+    if (proc.exitCode === null && !proc.killed) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
+  }
 
   if (isPaused()) {
     db.run(`UPDATE jobs SET metadata_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [job.id]);

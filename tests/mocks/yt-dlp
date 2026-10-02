@@ -14,6 +14,7 @@
 //   FAKE_FAIL_TIMES=2        fail the first N download attempts (leaves a .part)
 //   FAKE_FAIL_MODE=transient|permanent|corrupt   what the failure looks like
 //   FAKE_HANG=1             hang forever (watchdog test)
+//   FAKE_PROGRESS_THEN_HANG=1  write a .part, report progress once, then hang
 //   FAKE_DELAY_MS=250       per-attempt delay (progress parsing)
 
 import { rename } from "node:fs/promises";
@@ -124,6 +125,15 @@ await Bun.write(counterFile, String(attempts));
 if (process.env.FAKE_HANG === "1") {
   // Simulate a wedged download: never exits, ignores the abort signal enough
   // for the watchdog to fire.
+  await new Promise(() => {});
+}
+
+if (process.env.FAKE_PROGRESS_THEN_HANG === "1") {
+  // Mid-transfer stall: a .part is on disk and progress has been reported,
+  // then the process never exits. Used to prove the engine reaps the child
+  // (and keeps the partial) when its own progress loop throws.
+  await Bun.write(partPath, "x".repeat(4096));
+  console.log(`PROGRESS:10.0|1.0MiB|12|10485760|1048576`);
   await new Promise(() => {});
 }
 

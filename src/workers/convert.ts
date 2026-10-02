@@ -25,12 +25,20 @@ export async function runFfmpeg(
 ): Promise<{ code: number; stderr: string; timedOut: boolean }> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  let proc: Bun.Subprocess<"ignore", "ignore", "pipe"> | null = null;
   try {
-    const proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
-    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    proc = Bun.spawn([ffmpeg(), ...args], { stdout: "ignore", stderr: "pipe", signal: ctl.signal });
+    const [stderr, code] = await Promise.all([new Response(proc.stderr).text().catch(() => ""), proc.exited]);
     return { code, stderr, timedOut: ctl.signal.aborted };
   } finally {
     clearTimeout(timer);
+    // A throw between spawn and exit must not leave ffmpeg running on the
+    // source file another stage may claim next.
+    if (proc && proc.exitCode === null && !proc.killed) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
   }
 }
 

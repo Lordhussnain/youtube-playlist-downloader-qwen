@@ -105,69 +105,9 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   const audioTag = audioTracks.length > 0 ? `, ${audioTracks.length} audio track(s)` : "";
 
   updateWorkerLine(id, `⬇️ Starting [${engineTag}${audioTag}]... | ${job.title}`, config);
-  const args = [ytDlp(), ...plan.args];
 
-  let timedOut = false;
-  const downloadCtl = new AbortController();
-  const downloadTimer = setTimeout(() => {
-    timedOut = true;
-    downloadCtl.abort();
-  }, timeoutMs);
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal });
-  activeProcs.set(id, proc);
-  // Drain stderr immediately so a chatty yt-dlp cannot deadlock on a full pipe buffer.
-  const stderrPromise = new Response(proc.stderr).text();
-
-  let buffer = "";
-  let finalFilePath: string | null = null;
-  let lastProgressUpdate = 0;
-
-  const reader = proc.stdout.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += new TextDecoder().decode(value);
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (line.startsWith("PROGRESS:")) {
-        const parts = line.replace("PROGRESS:", "").split("|");
-        const bps = parseSpeedToBytesPerSec(parts[1]);
-        if (bps > 0) autoscaler.recordSpeed(id, bps);
-        const sizeNum = parseInt(parts[3], 10);
-        const dlNum = parseInt(parts[4], 10);
-        let pctNum = parseFloat(parts[0]);
-        if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
-        if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
-          // Backfill file_size from progress so the global ETA has a total to work with.
-          const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
-          // best_progress is the high-water mark of this job's attempts: it is
-          // what lets the retry budget forgive repeated failures at increasing
-          // completion percentages (see handleDownloadFailure).
-          updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
-          const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
-          const etaNum = parseFloat(parts[2]);
-          const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
-          updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
-          lastProgressUpdate = Date.now();
-        }
-      } else {
-        const trimmed = line.trim();
-        if (trimmed && existsSync(trimmed)) {
-          finalFilePath = trimmed;
-        } else {
-          // Capture paths embedded in yt-dlp status lines (merger output, etc.).
-          const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
-          if (m && existsSync(m[1])) finalFilePath = m[1];
-        }
-      }
-    }
-  }
-
-  const [stderrText, code] = await Promise.all([stderrPromise, proc.exited]);
-  clearTimeout(downloadTimer);
-  activeProcs.delete(id);
+  const run = await runSpawnedDownload(id, job, [ytDlp(), ...plan.args], timeoutMs, config);
+  const { code, stderrText, tail: buffer, timedOut } = run;
 
   if (isPaused()) {
     parkPaused(job);
@@ -189,14 +129,12 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
   if (timedOut) throw new Error(`Process timed out (${Math.round(timeoutMs / 60000)}m)`);
 
   if (code === 0) {
-    let filePath =
-      finalFilePath ||
-      buffer
-        .split("\n")
-        .reverse()
-        .find((l) => l.trim() && existsSync(l.trim()))
-        ?.trim() ||
-      "";
+    // Resolve the output path now, once, instead of stat-ing every stdout
+    // line while the transfer was running (see runSpawnedDownload).
+    let filePath = "";
+    for (const candidate of run.pathCandidates) {
+      if (candidate && existsSync(candidate)) filePath = candidate; // last existing wins
+    }
     if (!filePath) filePath = await findDownloadedFile(job.output_directory, baseFilename);
     if (!filePath) {
       logError("download", `${job.id} exited 0 but the output file could not be located: ${job.title}`);
@@ -216,6 +154,122 @@ async function runDownload(id: number, job: Job, config: Config): Promise<void> 
       .slice(-4)
       .join(" ");
     throw new Error(tail || `yt-dlp exited with code ${code}`);
+  }
+}
+
+/** What one yt-dlp run produced, independent of how it is classified. */
+interface SpawnedDownloadResult {
+  code: number;
+  stderrText: string;
+  /** Unconsumed stdout remainder (no trailing newline) — error context. */
+  tail: string;
+  /** Lines that might be the output path, in order seen; resolved after exit. */
+  pathCandidates: string[];
+  timedOut: boolean;
+}
+
+/** Stdout we keep in memory between newlines; a chatty tool cannot grow it unbounded. */
+const MAX_LINE_BUFFER = 64 * 1024;
+/** How many non-progress lines to remember as output-path candidates. */
+const MAX_PATH_CANDIDATES = 32;
+
+/**
+ * Spawn yt-dlp, stream its progress into the job row, and ALWAYS reap it.
+ *
+ * Everything between spawn and exit sits inside one try/finally: the watchdog
+ * timer is cleared, the child is removed from `activeProcs`, and a child that
+ * is somehow still alive is killed — on success, on a classified failure, and
+ * on an unexpected throw (SQLITE_BUSY from the progress UPDATE, a stat on a
+ * vanished directory). Before this, a throw in the loop exited past the
+ * cleanup, the worker's own finally removed the id, and the orphaned yt-dlp
+ * kept writing to a .part another worker could claim — invisible to
+ * killActiveChildren() and alive after shutdown.
+ *
+ * The loop does no filesystem work per line: path-looking lines are collected
+ * and resolved once by the caller after exit (a DASH download prints hundreds
+ * of lines, and a synchronous stat per line stalled the event loop that also
+ * serves /api/status).
+ */
+export async function runSpawnedDownload(
+  id: number,
+  job: Job,
+  args: string[],
+  timeoutMs: number,
+  config: Config,
+): Promise<SpawnedDownloadResult> {
+  let timedOut = false;
+  const downloadCtl = new AbortController();
+  const downloadTimer = setTimeout(() => {
+    timedOut = true;
+    downloadCtl.abort();
+  }, timeoutMs);
+  // `env: process.env` on purpose: Bun's default is a snapshot taken at
+  // startup, so the live environment (what tests and operators mutate) would
+  // never reach yt-dlp.
+  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", signal: downloadCtl.signal, env: process.env });
+  activeProcs.set(id, proc);
+  const decoder = new TextDecoder();
+  const pathCandidates: string[] = [];
+  let buffer = "";
+  try {
+    // Drain stderr immediately so a chatty yt-dlp cannot deadlock on a full pipe buffer.
+    const stderrPromise = new Response(proc.stderr).text().catch(() => "");
+    let lastProgressUpdate = 0;
+    const reader = proc.stdout.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      // A pathological line with no newline must not grow memory forever.
+      if (buffer.length > MAX_LINE_BUFFER) buffer = buffer.slice(-MAX_LINE_BUFFER);
+
+      for (const line of lines) {
+        if (line.startsWith("PROGRESS:")) {
+          const parts = line.slice("PROGRESS:".length).split("|");
+          const bps = parseSpeedToBytesPerSec(parts[1]);
+          if (bps > 0) autoscaler.recordSpeed(id, bps);
+          const sizeNum = parseInt(parts[3], 10);
+          const dlNum = parseInt(parts[4], 10);
+          let pctNum = parseFloat(parts[0]);
+          if (Number.isNaN(pctNum) && dlNum > 0 && sizeNum > 0) pctNum = (dlNum / sizeNum) * 100;
+          if (!Number.isNaN(pctNum) && pctNum >= 0 && Date.now() - lastProgressUpdate > 500) {
+            // Backfill file_size from progress so the global ETA has a total to work with.
+            const totalBytes = Number.isFinite(sizeNum) && sizeNum > 0 ? sizeNum : null;
+            // best_progress is the high-water mark of this job's attempts: it is
+            // what lets the retry budget forgive repeated failures at increasing
+            // completion percentages (see handleDownloadFailure).
+            updateJobProgress(job.id, pctNum, bps, parseFloat(parts[2]) || 0, totalBytes);
+            const speedTxt = bps > 0 ? formatBytesPerSec(bps) : "Calculating...";
+            const etaNum = parseFloat(parts[2]);
+            const etaTxt = Number.isFinite(etaNum) && etaNum > 0 ? `, ETA ${Math.round(etaNum)}s` : "";
+            updateWorkerLine(id, `⬇️ ${pctNum.toFixed(1)}% @ ${speedTxt}${etaTxt} | ${job.title}`, config);
+            lastProgressUpdate = Date.now();
+          }
+        } else {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          // Capture paths embedded in yt-dlp status lines (merger output,
+          // etc.) and the bare `--print after_move:filepath` line.
+          const m = trimmed.match(/Merged formats into "(.+)"$/) || trimmed.match(/Destination: (.+)$/);
+          pathCandidates.push(m ? m[1] : trimmed);
+          if (pathCandidates.length > MAX_PATH_CANDIDATES) pathCandidates.shift();
+        }
+      }
+    }
+    const [stderrText, code] = await Promise.all([stderrPromise, proc.exited]);
+    const trailing = buffer.trim();
+    if (trailing) pathCandidates.push(trailing);
+    return { code, stderrText, tail: buffer, pathCandidates, timedOut };
+  } finally {
+    clearTimeout(downloadTimer);
+    activeProcs.delete(id);
+    if (proc.exitCode === null && !proc.killed) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+    }
   }
 }
 
@@ -253,10 +307,9 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
   // updating yt-dlp, then retry immediately with a clean budget.
   if (lower.includes("signature") || lower.includes("unable to extract")) {
     console.warn("⚠️ Signature challenge failed. Auto-updating yt-dlp...");
-    const updateProc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe" });
-    await updateProc.exited;
+    const outcome = await selfUpdateYtDlp(id);
     resetForRetry(job.id);
-    updateWorkerLine(id, `🔄 Auto-updated yt-dlp, retrying... | ${job.title}`, config);
+    updateWorkerLine(id, `🔄 yt-dlp self-update ${outcome}, retrying... | ${job.title}`, config);
     return;
   }
 
@@ -379,6 +432,65 @@ async function handleDownloadFailure(id: number, job: Job, config: Config, err: 
     notePipelineFailure("dl", config);
   }
   updateWorkerLine(id, `❌ Failed | ${job.title}`, config);
+}
+
+// --- yt-dlp self-update -------------------------------------------------------
+
+/** Hard ceiling on `yt-dlp -U`: a hung updater must never pin a worker. */
+const YTDLP_UPDATE_TIMEOUT_MS = 120_000;
+let ytDlpUpdateInFlight: Promise<string> | null = null;
+
+/**
+ * Run `yt-dlp -U` once, bounded and observable.
+ *
+ * Previously spawned with both pipes unread and no abort: past the pipe buffer
+ * the updater blocked forever, holding the job claim with nothing able to kill
+ * it. Now both pipes are drained, a 120 s timeout aborts it, it is registered
+ * in `activeProcs` under a reserved negative key so killActiveChildren() reaches
+ * it on shutdown, and concurrent workers hitting the same extractor break share
+ * ONE update instead of racing several.
+ */
+async function selfUpdateYtDlp(workerId: number): Promise<string> {
+  if (!ytDlpUpdateInFlight) {
+    ytDlpUpdateInFlight = (async () => {
+      const key = -Math.abs(workerId || 1); // never collides with a worker slot
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), YTDLP_UPDATE_TIMEOUT_MS);
+      let proc: Bun.Subprocess<"ignore", "pipe", "pipe"> | null = null;
+      try {
+        proc = Bun.spawn([ytDlp(), "-U"], { stdout: "pipe", stderr: "pipe", signal: ctl.signal });
+        activeProcs.set(key, proc);
+        const [out, err, code] = await Promise.all([
+          new Response(proc.stdout).text().catch(() => ""),
+          new Response(proc.stderr).text().catch(() => ""),
+          proc.exited,
+        ]);
+        if (ctl.signal.aborted) {
+          logError("download", `yt-dlp -U timed out after ${YTDLP_UPDATE_TIMEOUT_MS / 1000}s`);
+          return "timed out";
+        }
+        const summary = `${out}\n${err}`.split("\n").map((l) => l.trim()).filter(Boolean).slice(-2).join(" ");
+        if (code !== 0) {
+          logError("download", `yt-dlp -U exited ${code}: ${summary.slice(0, 300)}`);
+          return `failed (exit ${code})`;
+        }
+        return "done";
+      } catch (e: any) {
+        logError("download", `yt-dlp -U could not run: ${e?.message || e}`);
+        return "unavailable";
+      } finally {
+        clearTimeout(timer);
+        activeProcs.delete(key);
+        if (proc && proc.exitCode === null && !proc.killed) {
+          try {
+            proc.kill("SIGKILL");
+          } catch {}
+        }
+        ytDlpUpdateInFlight = null;
+      }
+    })();
+  }
+  return ytDlpUpdateInFlight;
 }
 
 // --- small DB helpers --------------------------------------------------------
