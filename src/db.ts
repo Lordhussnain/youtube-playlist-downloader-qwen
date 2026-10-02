@@ -147,6 +147,13 @@ export function initDatabase(path: string = "archive.db"): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_dl_status ON jobs(download_status, created_at)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_cv_status ON jobs(conversion_status, created_at)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_md_status ON jobs(metadata_status, created_at)`);
+  // `partial_file_path IS NOT NULL` runs on every sweep and every reliability
+  // poll; a partial index keeps it off the full table.
+  db.run(
+    `CREATE INDEX IF NOT EXISTS idx_jobs_partial ON jobs(partial_file_path) WHERE partial_file_path IS NOT NULL`,
+  );
+  // Nothing ever deleted from run_history; keep the newest rows only.
+  pruneRunHistory(RUN_HISTORY_KEEP);
 
   // Claim transactions MUST be created here, after `db` is initialized.
   // Defining them at module top-level would evaluate `db.transaction` while
@@ -224,6 +231,18 @@ export function initDatabase(path: string = "archive.db"): void {
   });
 }
 
+/** How many run_history rows survive the startup prune. */
+export const RUN_HISTORY_KEEP = 500;
+
+/** Delete all but the newest `keep` run_history rows. Returns rows removed. */
+export function pruneRunHistory(keep: number = RUN_HISTORY_KEEP): number {
+  const n = Math.max(1, Math.floor(keep));
+  return db.run(
+    `DELETE FROM run_history WHERE id NOT IN (SELECT id FROM run_history ORDER BY id DESC LIMIT ?)`,
+    [n],
+  ).changes;
+}
+
 /** Per-video failure cap: the smaller of the two knobs, so both stay honest. */
 export function perVideoCap(config: Config): number {
   return Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
@@ -231,6 +250,37 @@ export function perVideoCap(config: Config): number {
 
 export function isVideoInDb(videoId: string): boolean {
   return !!db.query("SELECT id FROM jobs WHERE id = ?").get(videoId);
+}
+
+/** Which of `ids` already have a job row (one query per 500 ids). */
+export function existingJobIds(ids: string[]): Set<string> {
+  const found = new Set<string>();
+  const CHUNK = 500; // comfortably under SQLite's bound-parameter limit
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const rows = db
+      .query(`SELECT id FROM jobs WHERE id IN (${slice.map(() => "?").join(",")})`)
+      .all(...slice) as { id: string }[];
+    for (const r of rows) found.add(r.id);
+  }
+  return found;
+}
+
+/** The folder's current index high-water mark (0 when unseen). Read-only. */
+export function peekNextIndex(folder: string): number {
+  const row = db.query("SELECT next_index FROM playlist_state WHERE folder = ?").get(folder) as
+    | { next_index: number }
+    | null;
+  return row?.next_index || 0;
+}
+
+/** Persist a folder's index high-water mark (after a batch insert). */
+export function setNextIndex(folder: string, next: number): void {
+  db.run(
+    `INSERT INTO playlist_state (folder, next_index) VALUES (?, ?)
+     ON CONFLICT(folder) DO UPDATE SET next_index = excluded.next_index`,
+    [folder, next],
+  );
 }
 
 export function getNextIndex(folder: string): number {

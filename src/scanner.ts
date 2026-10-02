@@ -7,7 +7,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { db, getNextIndex, isVideoInDb } from "./db";
+import { db, existingJobIds, peekNextIndex, setNextIndex } from "./db";
 import { cookiesArgs, ytDlp } from "./tools";
 import { sanitizeFolderName } from "./util";
 import { stats } from "./state";
@@ -96,20 +96,27 @@ export async function ingestItems(
   let added = 0;
   let skipped = 0;
   const insertTransaction = db.transaction((batch: ListingItem[]) => {
+    // Prefetch once instead of 3 statements per item inside the write
+    // transaction (a 2,000-video playlist used to issue ~6,000 statements
+    // while holding the write lock): the set of ids already known, and the
+    // folder's index high-water mark.
+    const known = existingJobIds(batch.map((i) => i.id));
+    let nextIndex = peekNextIndex(folder);
     const stmt = db.prepare(
       `INSERT OR IGNORE INTO jobs
          (id, url, title, output_directory, target_format, want_subtitles, want_thumbnail, want_description, folder, "index", duration, download_status, conversion_status, metadata_status)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
     );
+    const requeueLive = db.prepare(
+      `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
+    );
+    const seenInBatch = new Set<string>();
     for (const item of batch) {
-      if (isVideoInDb(item.id)) {
+      if (known.has(item.id) || seenInBatch.has(item.id)) {
         // A job parked as waiting_live (stream was live at download time) may
         // have ended by now — any fresh listing that still contains it requeues
         // it; the !is_live filter drops it again if it is somehow still live.
-        db.run(
-          `UPDATE jobs SET download_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND download_status = 'waiting_live'`,
-          [item.id],
-        );
+        requeueLive.run(item.id);
         skipped++;
         stats.skipped++;
         continue;
@@ -125,8 +132,8 @@ export async function ingestItems(
         stats.skipped++;
         continue;
       }
-      const index = getNextIndex(folder);
-      stmt.run(
+      const index = ++nextIndex;
+      const res = stmt.run(
         item.id,
         normalizeVideoUrl(`https://www.youtube.com/watch?v=${item.id}`),
         item.title,
@@ -141,9 +148,18 @@ export async function ingestItems(
         conversionStatus,
         metadataStatus,
       );
+      seenInBatch.add(item.id);
+      if (res.changes === 0) {
+        // Raced by another ingester (RSS + scan on the same id): not ours.
+        nextIndex--;
+        skipped++;
+        stats.skipped++;
+        continue;
+      }
       added++;
       stats.totalQueued++;
     }
+    if (added > 0) setNextIndex(folder, nextIndex);
   });
   insertTransaction(items);
   return { found: items.length, added, skipped };

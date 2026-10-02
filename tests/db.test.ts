@@ -13,10 +13,14 @@ import {
   claimDownloadJob,
   claimMetadataJob,
   db,
+  existingJobIds,
   getNextIndex,
   initDatabase,
   isVideoInDb,
+  peekNextIndex,
   perVideoCap,
+  pruneRunHistory,
+  RUN_HISTORY_KEEP,
 } from "../src/db";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 import { ingestItems } from "../src/scanner";
@@ -546,6 +550,79 @@ describe("ingestItems", () => {
   });
 });
 
+describe("ingestItems — batched dedup (2.6)", () => {
+  const config = () => testConfig({ outputRoot: "./downloads", videoQuality: "1080p" });
+
+  test("a large playlist ingests with one prefetch and contiguous indexes", async () => {
+    const items = Array.from({ length: 1200 }, (_, i) => ({
+      id: `v${String(i).padStart(5, "0")}`,
+      title: `Video ${i}`,
+      playlist: "Big",
+      duration: 100 + i,
+    }));
+    const r = await ingestItems(items, config());
+    expect(r).toEqual({ found: 1200, added: 1200, skipped: 0 });
+    expect(peekNextIndex("Big")).toBe(1200);
+    expect(getJob("v00000")["index"]).toBe(1);
+    expect(getJob("v01199")["index"]).toBe(1200);
+
+    // A rescan with 3 new videos adds exactly those, continuing the index.
+    const again = await ingestItems(
+      [...items.slice(0, 50), { id: "new1", title: "N", playlist: "Big", duration: 90 }, { id: "new2", title: "N", playlist: "Big", duration: 90 }],
+      config(),
+    );
+    expect(again).toEqual({ found: 52, added: 2, skipped: 50 });
+    expect(getJob("new1")["index"]).toBe(1201);
+    expect(getJob("new2")["index"]).toBe(1202);
+    expect(getNextIndex("Big")).toBe(1203);
+  });
+
+  test("duplicate ids inside one listing are inserted once", async () => {
+    const r = await ingestItems(
+      [
+        { id: "dup", title: "A", playlist: "P", duration: 100 },
+        { id: "dup", title: "A again", playlist: "P", duration: 100 },
+        { id: "other", title: "B", playlist: "P", duration: 100 },
+      ],
+      config(),
+    );
+    expect(r.added).toBe(2);
+    expect(r.skipped).toBe(1);
+    expect(getJob("other")["index"]).toBe(2);
+  });
+
+  test("existingJobIds chunks past the bound-parameter limit", async () => {
+    const ids = Array.from({ length: 1500 }, (_, i) => `x${i}`);
+    await ingestItems(ids.slice(0, 700).map((id) => ({ id, title: id, playlist: "P", duration: 100 })), config());
+    const known = existingJobIds(ids);
+    expect(known.size).toBe(700);
+    expect(known.has("x0")).toBe(true);
+    expect(known.has("x699")).toBe(true);
+    expect(known.has("x700")).toBe(false);
+    expect(existingJobIds([]).size).toBe(0);
+  });
+});
+
+describe("run_history prune (2.7)", () => {
+  test("keeps only the newest rows", () => {
+    for (let i = 0; i < RUN_HISTORY_KEEP + 25; i++) {
+      db.run(`INSERT INTO run_history (started_at, ended_at) VALUES (?, ?)`, [`s${i}`, `e${i}`]);
+    }
+    expect(pruneRunHistory()).toBe(25);
+    const rows = db.query("SELECT started_at FROM run_history ORDER BY id").all() as any[];
+    expect(rows.length).toBe(RUN_HISTORY_KEEP);
+    expect(rows[0].started_at).toBe("s25");
+    // Idempotent, and a fresh initDatabase prunes too.
+    expect(pruneRunHistory()).toBe(0);
+    expect(pruneRunHistory(10)).toBe(RUN_HISTORY_KEEP - 10);
+  });
+
+  test("the partial-path index exists", () => {
+    const idx = db.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_jobs_partial'").get();
+    expect(idx).not.toBeNull();
+  });
+});
+
 describe("archive helpers", () => {
   test("removeFromArchive strips only the matching id", async () => {
     const dir = await makeTmpDir();
@@ -560,6 +637,28 @@ describe("archive helpers", () => {
 
   test("removeFromArchive tolerates a missing file", () => {
     expect(() => removeFromArchive("/nonexistent/archive.txt", "x")).not.toThrow();
+    expect(removeFromArchive("/nonexistent/archive.txt", "x")).toBe(0);
+  });
+
+  test("removeFromArchive scrubs a batch of ids in one pass (2.1)", async () => {
+    const dir = await makeTmpDir();
+    const file = join(dir, "archive.txt");
+    const lines = Array.from({ length: 2000 }, (_, i) => `youtube vid${String(i).padStart(5, "0")}`);
+    await writeFile(file, lines.join("\n") + "\n");
+    const gone = ["vid00001", "vid00500", "vid01999", "not-there"];
+    const removed = removeFromArchive(file, gone);
+    expect(removed).toBe(3);
+    const text = await Bun.file(file).text();
+    expect(text).not.toContain("vid00001");
+    expect(text).not.toContain("vid00500");
+    expect(text).not.toContain("vid01999");
+    expect(text).toContain("vid00000");
+    expect(text).toContain("vid00002");
+    // A second call with nothing to remove does not rewrite the file.
+    expect(removeFromArchive(file, gone)).toBe(0);
+    // Bare-id lines (no extractor prefix) are matched too.
+    await writeFile(file, "aaa111\nyoutube bbb222\n");
+    expect(removeFromArchive(file, new Set(["aaa111", "bbb222"]))).toBe(2);
   });
 });
 

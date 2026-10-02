@@ -4,10 +4,10 @@
 // stats plus one line per worker slot. Falls back to plain logs when stdout is
 // not a TTY or the terminal is too small, so piping output still works.
 
-import { db } from "./db";
 import { autoscaler } from "./autoscale";
 import { formatBytesPerSec } from "./util";
-import { getPauseReason, isPaused, isTty, setTty, workerStatuses } from "./state";
+import { getStatsSnapshot } from "./stats";
+import { getConfig, getPauseReason, isPaused, isTty, setTty, workerStatuses } from "./state";
 import type { Config } from "./config";
 
 // Terminal rows reserved for the dashboard: 2 header lines + one per slot.
@@ -61,21 +61,22 @@ export function renderDashboard(): void {
   if (!isTty()) return;
   const agg = formatBytesPerSec(autoscaler.getAggregateSpeed());
   const cap = autoscaler.maxBandwidthKBps > 0 ? `/${formatBytesPerSec(autoscaler.maxBandwidthKBps * 1024)}` : "";
-  const statsData = db
-    .query(
-      `SELECT
-         SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
-         SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
-         SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
-         SUM(CASE WHEN download_status = 'failed' THEN 1 ELSE 0 END) as failed,
-         COUNT(*) as total,
-         SUM(CASE WHEN partial_file_path IS NOT NULL
-                   AND download_status IN ('pending', 'paused', 'downloading')
-                  THEN 1 ELSE 0 END) as resumable
-       FROM jobs`,
-    )
-    .get() as any;
-  updateAbsoluteLine(1, formatHeaderLine(statsData, agg, cap));
+  // Shared memoised aggregate (stats.ts) — no private full-table scan here.
+  const snap = getStatsSnapshot(getConfig());
+  updateAbsoluteLine(
+    1,
+    formatHeaderLine(
+      {
+        downloading: snap.downloading,
+        downloaded: snap.downloaded,
+        failed: snap.failedDownloads,
+        total: snap.total,
+        resumable: snap.resumablePartials,
+      },
+      agg,
+      cap,
+    ),
+  );
 }
 
 /** The aggregate row: global counters, bandwidth, and pause state. */

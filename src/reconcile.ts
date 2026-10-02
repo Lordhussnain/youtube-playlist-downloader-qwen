@@ -188,26 +188,37 @@ export function reconcileMissingFiles(config: Config): number {
            AND (download_status = 'downloaded' OR conversion_status = 'done')`,
       )
       .all() as any[];
-    for (const row of rows) {
-      if (row.file_path && existsSync(row.file_path)) continue;
-      removeFromArchive(config.archiveFile, row.id);
-      db.run(
-        `UPDATE jobs SET
-           download_status = 'pending', pause_reason = NULL,
-           retry_count = 0, resume_count = 0, best_progress = 0, progress = 0,
-           file_path = NULL, file_size = 0, integrity = NULL, partial_file_path = NULL,
-           conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
-           metadata_status = CASE
-             WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
-             ELSE metadata_status END,
-           download_claimed_by = NULL, conversion_claimed_by = NULL,
-           last_error = 'file missing on startup — re-queued',
-           updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [row.id],
+    // Collect first, then act: one archive rewrite and one transaction for
+    // every missing file, instead of a full read/filter/write of the archive
+    // plus an implicit transaction per row.
+    const missing = rows.filter((row) => !(row.file_path && existsSync(row.file_path)));
+    if (missing.length > 0) {
+      removeFromArchive(
+        config.archiveFile,
+        missing.map((r) => r.id as string),
       );
-      fixed++;
-      logError("reconcile", `${row.id}: file gone (${row.file_path}) — re-queued`);
+      const requeue = db.transaction((batch: any[]) => {
+        const stmt = db.prepare(
+          `UPDATE jobs SET
+             download_status = 'pending', pause_reason = NULL,
+             retry_count = 0, resume_count = 0, best_progress = 0, progress = 0,
+             file_path = NULL, file_size = 0, integrity = NULL, partial_file_path = NULL,
+             conversion_status = CASE WHEN conversion_status = 'not_needed' THEN 'not_needed' ELSE 'pending' END,
+             metadata_status = CASE
+               WHEN COALESCE(want_subtitles,0) + COALESCE(want_thumbnail,0) + COALESCE(want_description,0) > 0 THEN 'pending'
+               ELSE metadata_status END,
+             download_claimed_by = NULL, conversion_claimed_by = NULL,
+             last_error = 'file missing on startup — re-queued',
+             updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+        );
+        for (const row of batch) {
+          stmt.run(row.id);
+          logError("reconcile", `${row.id}: file gone (${row.file_path}) — re-queued`);
+        }
+      });
+      requeue(missing);
+      fixed = missing.length;
     }
     if (fixed > 0) {
       console.log(`🔍 Startup check: ${fixed} downloaded file(s) missing — re-queued for download.`);
@@ -294,6 +305,10 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
   const modifier = ignoreCooldown ? "" : `AND updated_at < datetime('now', '-${Math.floor(config.requeueFailedAfterMinutes)} minutes')`;
 
   try {
+    // One transaction for the whole sweep: every 60 s this used to issue N
+    // implicit transactions against a 5 s busy timeout while the workers
+    // were writing progress.
+    const sweep = db.transaction(() => {
     // --- Downloads -----------------------------------------------------------
     const failedDownloads = db
       .query(
@@ -344,6 +359,8 @@ export function requeueFailedJobs(config: Config, opts: { ignoreCooldown?: boole
       );
       result.metadata++;
     }
+    });
+    sweep();
 
     const total = result.downloads + result.conversions + result.metadata;
     if (total > 0) {
@@ -571,47 +588,46 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
       }
     }
 
-    const files = await readdir(rootDir, { recursive: true });
+    const now = Date.now();
+    const DAY = 24 * 60 * 60 * 1000;
     let removed = 0;
-    for (const file of files) {
-      if (!file.endsWith(".part") && !file.endsWith(".ytdl")) continue;
-      const fullPath = join(rootDir, file);
+    // Lazy walk, one directory at a time, filtering on the suffix BEFORE any
+    // stat: `readdir(recursive)` materialised every path in the archive and
+    // then stat-ed each one twice, which on a large resident set stalled
+    // startup for minutes before the dashboard came up. Partials and control
+    // files are decided in the same pass.
+    for await (const fullPath of walkPartials(rootDir)) {
+      if (fullPath.endsWith(ARIA2_CONTROL_SUFFIX)) {
+        // Control file whose data file is gone (hand-deleted .part, an
+        // interrupted cleanup, a partial removed by an older build). A
+        // stranded control file is litter, and actively harmful: aria2c sees
+        // it, cannot resume, and with --allow-overwrite=false will not start
+        // over. Its data file still being there means live resume state.
+        if (existsSync(fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length))) continue;
+        const s2 = await stat(fullPath).catch(() => null);
+        if (!s2) continue;
+        if (now - s2.mtimeMs < DAY) continue; // may just have started writing
+        await unlink(fullPath).catch(() => {});
+        removed++;
+        continue;
+      }
       const s = await stat(fullPath).catch(() => null);
       if (!s) continue;
-      const ageMs = Date.now() - s.mtimeMs;
+      const ageMs = now - s.mtimeMs;
       const owner = owners.get(fullPath);
       if (owner) {
         const exhausted = owner.status === "failed" && cap > 0 && owner.retries >= cap;
-        const ancient = ageMs > 7 * 24 * 60 * 60 * 1000;
+        const ancient = ageMs > 7 * DAY;
         if (exhausted || ancient) {
           // Take the aria2c control file with it, or the next attempt wedges.
           await removePartialFiles(fullPath);
           removed++;
         }
-      } else if (ageMs > 24 * 60 * 60 * 1000) {
+      } else if (ageMs > DAY) {
         // Orphan: no job claims it — safe to clean once it is clearly stale.
         await removePartialFiles(fullPath);
         removed++;
       }
-    }
-
-    // Control files whose data file is gone (hand-deleted .part, an interrupted
-    // cleanup, a partial removed by an older build). Note a stranded control
-    // file is still named "<name>.part.aria2" — the suffix alone says nothing,
-    // so the data-file check below is what decides. Pure litter now, and
-    // actively harmful: aria2c sees a control file, cannot resume, and with
-    // --allow-overwrite=false will not start over.
-    for (const file of files) {
-      if (!file.endsWith(ARIA2_CONTROL_SUFFIX)) continue;
-      const fullPath = join(rootDir, file);
-      const s2 = await stat(fullPath).catch(() => null);
-      if (!s2) continue;
-      // Young enough that a download may just have started writing it.
-      if (Date.now() - s2.mtimeMs < 24 * 60 * 60 * 1000) continue;
-      // Its data file is still there — this is live resume state, keep it.
-      if (existsSync(fullPath.slice(0, -ARIA2_CONTROL_SUFFIX.length))) continue;
-      await unlink(fullPath).catch(() => {});
-      removed++;
     }
 
     if (removed > 0) console.log(`🧹 Cleaned ${removed} stale partial file(s).`);
@@ -620,5 +636,37 @@ export async function cleanOrphanedFiles(rootDir: string, config?: Config): Prom
     // An unreadable output root (unmounted NAS, permissions) used to vanish
     // here; now it is in error.log and on the reliability panel.
     recordSweepError("orphanPartials", e);
+  }
+}
+
+/**
+ * Yield every `.part` / `.ytdl` / `.aria2` path under `root`, directory by
+ * directory, without materialising the whole tree. Unreadable subdirectories
+ * are skipped (logged once per sweep by the caller through the sweep error
+ * only when the root itself is unreadable).
+ */
+export async function* walkPartials(root: string): AsyncGenerator<string> {
+  const pending: string[] = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (e) {
+      if (dir === root) throw e; // the root being unreadable is the sweep's error
+      continue;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(full);
+      } else if (
+        entry.name.endsWith(".part") ||
+        entry.name.endsWith(".ytdl") ||
+        entry.name.endsWith(ARIA2_CONTROL_SUFFIX)
+      ) {
+        yield full;
+      }
+    }
   }
 }

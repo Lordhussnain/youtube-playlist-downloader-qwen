@@ -21,6 +21,8 @@ import {
   recordPartialPaths,
   reapStaleClaims,
   STALE_CLAIM_THRESHOLDS,
+  sweepError,
+  walkPartials,
 } from "../src/reconcile";
 import { DEFAULT_CONFIG, type Config } from "../src/config";
 
@@ -194,6 +196,37 @@ describe("recordPartialPaths", () => {
     );
     expect(recordPartialPaths()).toBe(0);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("walkPartials (2.4 lazy walk)", () => {
+  test("yields only partial/control files, recursing lazily", async () => {
+    const dir = await makeDir();
+    await mkdir(join(dir, "a", "deep"), { recursive: true });
+    await writeFile(join(dir, "final.mp4"), "x");
+    await writeFile(join(dir, "a", "one.part"), "x");
+    await writeFile(join(dir, "a", "deep", "two.ytdl"), "x");
+    await writeFile(join(dir, "a", "deep", "two.ytdl.aria2"), "x");
+    await writeFile(join(dir, "a", "deep", "keep.jpg"), "x");
+    const found: string[] = [];
+    for await (const p of walkPartials(dir)) found.push(p.slice(dir.length + 1));
+    expect(found.sort()).toEqual(["a/deep/two.ytdl", "a/deep/two.ytdl.aria2", "a/one.part"]);
+  });
+
+  test("an unreadable root is the sweep's error and lands on the reliability panel", async () => {
+    const missing = join(await makeDir(), "not-mounted");
+    await expect((async () => {
+      for await (const _ of walkPartials(missing)) {
+        /* drain */
+      }
+    })()).rejects.toThrow();
+    await cleanOrphanedFiles(missing, testConfig());
+    const err = sweepError("orphanPartials");
+    expect(err).not.toBeNull();
+    expect(err!.message).toContain("ENOENT");
+    // A clean run clears it.
+    await cleanOrphanedFiles(await makeDir(), testConfig());
+    expect(sweepError("orphanPartials")).toBeNull();
   });
 });
 

@@ -16,12 +16,12 @@ import { scanAndIngest } from "./scanner";
 import { diskUsage, triggerPause, triggerResume } from "./resilience";
 import { requeueFailedJobs, STALE_CLAIM_THRESHOLDS, sweepError } from "./reconcile";
 import { buildRunReport } from "./report";
-import { isPermanentDownloadError } from "./retry";
 import { aria2cPath } from "./tools";
 import { applySettings, readSettings } from "./settings";
 import { resolveDownloaderEngine } from "./download-args";
 import { parseSelectionJson, parseTracksJson, probeAudioTracks } from "./audio-tracks";
 import { formatBytesPerSec, formatDuration } from "./util";
+import { getStatsSnapshot, invalidateStats } from "./stats";
 import { errorLogPath, logError } from "./logger";
 import type { Config } from "./config";
 
@@ -265,6 +265,7 @@ function retryRoute(id: string): Response {
   if (jobsInProgress([id]).length > 0) return conflictInProgress([id]);
   const changed = retryJobById(id);
   if (changed === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+  invalidateStats();
   return Response.json({ ok: true });
 }
 
@@ -291,6 +292,7 @@ async function deleteJobsBulk(req: Request): Promise<Response> {
     `DELETE FROM jobs WHERE id IN (${placeholders}) AND NOT ${JOB_IN_PROGRESS_SQL}`,
     ids,
   );
+  invalidateStats();
   return Response.json({ ok: true, deleted: result.changes });
 }
 
@@ -363,20 +365,8 @@ const ROUTES: Route[] = [
     methods: ["GET"],
     pattern: "/api/status",
     handler: async ({ config }) => {
-      const statsData = db
-        .query(
-          `SELECT
-          SUM(CASE WHEN download_status IN ('pending', 'paused', 'downloading') THEN 1 ELSE 0 END) as queued,
-          SUM(CASE WHEN download_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
-          SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END) as downloaded,
-          SUM(CASE WHEN download_status = 'failed' OR conversion_status = 'failed' OR metadata_status = 'failed' THEN 1 ELSE 0 END) as failed,
-          SUM(CASE WHEN metadata_status IN ('pending', 'in_progress') THEN 1 ELSE 0 END) as metadata_pending,
-          SUM(CASE WHEN conversion_status IN ('pending', 'in_progress') THEN 1 ELSE 0 END) as converting,
-          SUM(CASE WHEN download_status = 'waiting_live' THEN 1 ELSE 0 END) as waiting_live,
-          COUNT(*) as total
-        FROM jobs`,
-        )
-        .get() as any;
+      // One memoised aggregate shared with /api/reliability and the TUI.
+      const snap = getStatsSnapshot(config);
       const workers: { id: string; type: string; status: string }[] = [];
       for (let i = 1; i <= config.maxDownloadWorkers; i++) {
         workers.push({ id: `DL${i}`, type: "download", status: workerStatuses.get(`DL${i}`) || "Idle" });
@@ -405,27 +395,22 @@ const ROUTES: Route[] = [
       const uptime = formatDuration(process.uptime());
 
       const avgSpeed = autoscaler.getAggregateSpeed();
-      const remaining = db
-        .query(
-          `SELECT SUM(file_size * (1 - COALESCE(progress, 0) / 100)) as remaining FROM jobs WHERE download_status = 'downloading'`,
-        )
-        .get() as any;
-      const secondsRemaining = avgSpeed > 0 && remaining.remaining ? remaining.remaining / avgSpeed : 0;
+      const secondsRemaining = avgSpeed > 0 && snap.remainingBytes > 0 ? snap.remainingBytes / avgSpeed : 0;
       const globalETA = secondsRemaining > 0 ? formatDuration(secondsRemaining) : "--";
 
       return Response.json({
         ok: true,
         stats: {
-          totalQueued: statsData.queued || 0,
-          downloading: statsData.downloading || 0,
-          downloaded: statsData.downloaded || 0,
-          failed: statsData.failed || 0,
-          metadataPending: statsData.metadata_pending || 0,
-          converting: statsData.converting || 0,
-          waitingLive: statsData.waiting_live || 0,
-          total: statsData.total || 0,
+          totalQueued: snap.queued,
+          downloading: snap.downloading,
+          downloaded: snap.downloaded,
+          failed: snap.failedAny,
+          metadataPending: snap.metadataPending,
+          converting: snap.converting,
+          waitingLive: snap.waitingLive,
+          total: snap.total,
         },
-        queuePosition: statsData.queued || 0,
+        queuePosition: snap.queued,
         speed: avgSpeed,
         aggregateSpeed: formatBytesPerSec(avgSpeed),
         activeWorkers: activeDlSlots.size,
@@ -542,6 +527,7 @@ const ROUTES: Route[] = [
       if (jobsInProgress([params.id]).length > 0) return conflictInProgress([params.id]);
       const result = db.run(`DELETE FROM jobs WHERE id = ? AND NOT ${JOB_IN_PROGRESS_SQL}`, [params.id]);
       if (result.changes === 0) return Response.json({ ok: false, error: "Job not found" }, { status: 404 });
+      invalidateStats();
       return Response.json({ ok: true, deleted: result.changes });
     },
   },
@@ -556,7 +542,9 @@ const ROUTES: Route[] = [
         ? body.ids.filter((x: any) => typeof x === "string" && x.length > 0).slice(0, 500)
         : [];
       if (ids.length === 0) return Response.json({ ok: false, error: "No job ids provided" }, { status: 400 });
-      return Response.json(pauseJobsByUser(ids));
+      const outcome = pauseJobsByUser(ids);
+      invalidateStats();
+      return Response.json(outcome);
     },
   },
   {
@@ -592,6 +580,7 @@ const ROUTES: Route[] = [
       if (!scanUrl) return Response.json({ ok: false, error: "URL required" }, { status: 400 });
       try {
         const result = await scanAndIngest(scanUrl, getConfig(), folder);
+        invalidateStats();
         const message =
           result.found === 0
             ? `No videos found at ${scanUrl} (check the URL, network, or cookies)`
@@ -616,6 +605,7 @@ const ROUTES: Route[] = [
             AND download_claimed_by IS NULL
             AND NOT ${JOB_IN_PROGRESS_SQL}`,
       );
+      invalidateStats();
       return Response.json({ ok: true, deleted: result.changes });
     },
   },
@@ -632,6 +622,7 @@ const ROUTES: Route[] = [
     pattern: "/api/resume",
     handler: () => {
       triggerResume();
+      invalidateStats();
       return Response.json({ ok: true, success: true, paused: false });
     },
   },
@@ -658,6 +649,7 @@ const ROUTES: Route[] = [
       // Re-queue every failed job that is eligible (transient errors, retry
       // budget remaining) immediately, ignoring the cooldown.
       const result = requeueFailedJobs(config, { ignoreCooldown: true });
+      invalidateStats();
       return Response.json({ ok: true, requeued: result });
     },
   },
@@ -773,61 +765,17 @@ function methodNotAllowed(method: string, pathname: string, allow: string[]): Re
 // --- Larger handlers, kept out of the table for readability -------------------
 
 function reliabilityHandler(config: Config): Response {
-  const partials = db
-    .query(
-      `SELECT COUNT(*) as count, COALESCE(SUM(file_size), 0) as bytes FROM jobs WHERE partial_file_path IS NOT NULL`,
-    )
-    .get() as any;
-  // Same eligibility rules as the sweep itself: retry budget remaining and a
-  // non-permanent last error. Uses the shared classifier so the dashboard and
-  // the sweep can never disagree about what is retryable.
-  const cap = Math.min(config.maxRetryAttempts, config.maxFailuresPerVideo);
-  const failedDownloads = db
-    .query(
-      `SELECT retry_count, last_error FROM jobs WHERE download_status = 'failed'`,
-    )
-    .all() as any[];
-  const resumableFailed = failedDownloads.filter(
-    (r) => (r.retry_count || 0) < cap && !isPermanentDownloadError(r.last_error),
-  ).length;
-  const waitingLive = db
-    .query(`SELECT COUNT(*) as count FROM jobs WHERE download_status = 'waiting_live'`)
-    .get() as any;
-
-  // --- Resume + self-healing state ---------------------------------------
-  // What will actually pick up where it left off. A partial only matters
-  // while its job is still in play: a failed job's partial may be discarded
-  // once the resume budget is spent, so it is not counted here.
-  const resumablePartials = db
-    .query(
-      `SELECT COUNT(*) as count FROM jobs
-        WHERE partial_file_path IS NOT NULL
-          AND download_status IN ('pending', 'paused', 'downloading')`,
-    )
-    .get() as any;
-  // Crashed jobs: parked as paused/interrupted so they are re-claimed and
-  // resume from their partial rather than restarting.
-  const interrupted = db
-    .query(
-      `SELECT COUNT(*) as count FROM jobs
-        WHERE download_status = 'paused' AND pause_reason = 'interrupted'`,
-    )
-    .get() as any;
-  // What the stale-claim reaper would reclaim right now — same thresholds the
-  // sweep enforces (imported, so they cannot drift apart).
+  // Every count below comes from the shared memoised snapshot (stats.ts):
+  // this handler used to run seven queries of its own, one of them an
+  // unbounded `.all()` over every failed row, on every poll.
+  const snap = getStatsSnapshot(config);
   const t = STALE_CLAIM_THRESHOLDS(config);
-  const staleClaims = db
-    .query(
-      `SELECT
-         (SELECT COUNT(*) FROM jobs WHERE download_status = 'downloading'
-            AND (download_claimed_at IS NULL OR download_claimed_at < datetime('now', '${t.download}')))
-       + (SELECT COUNT(*) FROM jobs WHERE conversion_status = 'in_progress'
-            AND (conversion_claimed_at IS NULL OR conversion_claimed_at < datetime('now', '${t.conversion}')))
-       + (SELECT COUNT(*) FROM jobs WHERE metadata_status = 'in_progress'
-            AND updated_at < datetime('now', '${t.metadata}'))
-       AS count`,
-    )
-    .get() as any;
+  const resumableFailed = snap.resumableFailed;
+  const partials = { count: snap.partialCount, bytes: snap.partialBytes };
+  const waitingLive = { count: snap.waitingLive };
+  const resumablePartials = { count: snap.resumablePartials };
+  const interrupted = { count: snap.interrupted };
+  const staleClaims = { count: snap.staleClaims };
 
   // The four self-healing sweeps, with what each currently has in scope.
   // `pending: null` means "not counted here" — the missing-files sweep has to
